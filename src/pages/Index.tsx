@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { Zap } from "lucide-react";
 import { InitialSearch } from "@/components/InitialSearch";
 import { PreviewStage } from "@/components/PreviewStage";
@@ -48,16 +48,17 @@ const Index = () => {
     setShowNewSearch(false);
   };
 
-  const handleStartSearch = () => {
+  const handleStartSearch = useCallback(() => {
     if (!activeThread) return;
-    // Simulate transitioning to results with mock data
-    updateThread(activeThread.id, {
-      phase: "complete",
-      results: (await import("@/lib/mock-data")).mockResults,
-      agentSteps: mockAgentSteps,
+    import("@/lib/mock-data").then(({ mockResults }) => {
+      updateThread(activeThread.id, {
+        phase: "complete",
+        results: mockResults,
+        agentSteps: mockAgentSteps,
+      });
+      toast.success("Search complete", { description: `Found ${mockResults.length} results` });
     });
-    toast.success("Search complete", { description: `Found ${6} results` });
-  };
+  }, [activeThread, updateThread]);
 
   const handleAddEnrichment = (name: string) => {
     if (!activeThread) return;

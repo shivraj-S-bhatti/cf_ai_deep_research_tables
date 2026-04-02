@@ -1,29 +1,34 @@
 import { Loader2, Check, X } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import type { SearchStatus } from "@/lib/mock-data";
+import type { SearchStatus } from "@/lib/types";
 
 export function StatusBadge({ status }: { status: SearchStatus }) {
   switch (status) {
     case "match":
       return (
-        <Badge className="bg-success/15 text-success border-success/20 hover:bg-success/20 gap-1 font-medium text-xs">
+        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-success">
           <Check className="h-3 w-3" />
           Match
-        </Badge>
+        </span>
       );
     case "miss":
       return (
-        <Badge className="bg-destructive/15 text-destructive border-destructive/20 hover:bg-destructive/20 gap-1 font-medium text-xs">
+        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-destructive">
           <X className="h-3 w-3" />
           Miss
-        </Badge>
+        </span>
       );
     case "verifying":
       return (
-        <Badge variant="outline" className="gap-1 font-medium text-xs text-muted-foreground">
+        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
           <Loader2 className="h-3 w-3 animate-spin" />
-          Verifying…
-        </Badge>
+          Verifying
+        </span>
+      );
+    case "queued":
+      return (
+        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+          Queued
+        </span>
       );
   }
 }

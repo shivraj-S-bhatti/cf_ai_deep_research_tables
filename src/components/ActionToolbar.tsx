@@ -3,9 +3,7 @@ import { Filter, Download, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
+  Popover, PopoverContent, PopoverTrigger,
 } from "@/components/ui/popover";
 
 interface ActionToolbarProps {
@@ -14,14 +12,11 @@ interface ActionToolbarProps {
   onAddEnrichment: (name: string) => void;
   onFilterMatches: () => void;
   onExportCsv: () => void;
+  filterActive: boolean;
 }
 
 export function ActionToolbar({
-  matchCount,
-  totalCount,
-  onAddEnrichment,
-  onFilterMatches,
-  onExportCsv,
+  matchCount, totalCount, onAddEnrichment, onFilterMatches, onExportCsv, filterActive,
 }: ActionToolbarProps) {
   const [newCol, setNewCol] = useState("");
   const [open, setOpen] = useState(false);
@@ -37,41 +32,42 @@ export function ActionToolbar({
   return (
     <div className="flex items-center justify-between">
       <div className="flex items-center gap-2">
-        <span className="text-sm text-muted-foreground">
-          {matchCount} matches / {totalCount} results
+        <span className="text-[11px] text-muted-foreground font-mono">
+          {matchCount}/{totalCount} matches
         </span>
       </div>
-      <div className="flex items-center gap-2">
-        <Button variant="outline" size="sm" onClick={onFilterMatches} className="gap-1.5">
-          <Filter className="h-3.5 w-3.5" />
-          Filter Matches
+      <div className="flex items-center gap-1.5">
+        <Button
+          variant={filterActive ? "secondary" : "outline"}
+          size="sm"
+          onClick={onFilterMatches}
+          className="gap-1 text-[11px] h-7"
+        >
+          <Filter className="h-3 w-3" />
+          Matches only
         </Button>
-        <Button variant="outline" size="sm" onClick={onExportCsv} className="gap-1.5">
-          <Download className="h-3.5 w-3.5" />
-          Export CSV
+        <Button variant="outline" size="sm" onClick={onExportCsv} className="gap-1 text-[11px] h-7">
+          <Download className="h-3 w-3" />
+          CSV
         </Button>
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
-            <Button size="sm" className="gap-1.5">
-              <Plus className="h-3.5 w-3.5" />
-              Add Enrichment
+            <Button size="sm" className="gap-1 text-[11px] h-7">
+              <Plus className="h-3 w-3" />
+              Enrichment
             </Button>
           </PopoverTrigger>
-          <PopoverContent className="w-72" align="end">
-            <div className="space-y-3">
-              <div>
-                <p className="text-sm font-medium">New Enrichment Column</p>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  Add a custom column to extract from the web
-                </p>
-              </div>
+          <PopoverContent className="w-64 p-3" align="end">
+            <div className="space-y-2">
+              <p className="text-[11px] font-medium">Add enrichment column</p>
               <Input
-                placeholder='e.g. "GitHub Link", "Email"'
+                placeholder='e.g. "GitHub Link"'
                 value={newCol}
                 onChange={(e) => setNewCol(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleExtract()}
+                className="text-xs h-8"
               />
-              <Button size="sm" className="w-full" onClick={handleExtract}>
+              <Button size="sm" className="w-full h-7 text-xs" onClick={handleExtract}>
                 Extract
               </Button>
             </div>

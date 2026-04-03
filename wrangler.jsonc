@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "agentic-search",
+  "account_id": "cb20223b79c21aaf28b9728e6fdeea64",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-04-02",
   "compatibility_flags": ["nodejs_compat_v2"],

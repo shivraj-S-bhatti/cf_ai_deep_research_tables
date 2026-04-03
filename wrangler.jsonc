@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "agentic-search",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-04-02",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    "APP_ENV": "development",
+    "AGENTIC_RUNTIME_MODE": "hybrid",
+    "SEARCH_PROVIDER_PRIMARY": "brave",
+    "LLM_PROVIDER_PRIMARY": "gemini",
+    "GEMINI_BACKEND": "google_ai",
+    "GEMINI_PLANNER_MODEL": "gemini-2.5-flash",
+    "GEMINI_EXTRACTOR_MODEL": "gemini-2.5-flash-lite",
+    "GEMINI_VERIFIER_MODEL": "gemini-2.5-flash",
+    "VERTEX_PLANNER_MODEL": "",
+    "VERTEX_EXTRACTOR_MODEL": "",
+    "VERTEX_VERIFIER_MODEL": "",
+    "SEARCH_RESULTS_PER_QUERY": "4",
+    "MAX_SOURCES_PER_RUN": "12",
+    "MAX_SOURCES_PER_ROW": "2",
+    "MAX_LLM_EXTRACTIONS_PER_RUN": "6",
+    "MAX_VERIFICATIONS_PER_RUN": "3",
+    "FETCH_TEXT_CHAR_LIMIT": "9000",
+    "PROVIDER_TIMEOUT_MS": "20000"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

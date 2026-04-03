@@ -1,0 +1,2 @@
+-- Agentic Search v0.1 bootstrap migration.
+-- Copy or sync cloudflare/schema.sql into the D1 migration pipeline as needed.

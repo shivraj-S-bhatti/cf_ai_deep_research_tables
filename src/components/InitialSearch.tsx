@@ -29,7 +29,7 @@ export function InitialSearch({ onSearch }: InitialSearchProps) {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
-            placeholder="e.g. AI engineers in New York with design experience at post Series-A startups"
+            placeholder="e.g. YC W24 healthcare startups"
             className="pl-10 h-12 text-sm"
           />
         </div>
@@ -41,9 +41,9 @@ export function InitialSearch({ onSearch }: InitialSearchProps) {
         </div>
         <div className="flex flex-wrap gap-2 justify-center">
           {[
-            "AI engineers in NY with design experience",
             "YC W24 healthcare startups",
             "Open source LLM projects with >1k stars",
+            "Top pizza places in Brooklyn",
           ].map((suggestion) => (
             <button
               key={suggestion}

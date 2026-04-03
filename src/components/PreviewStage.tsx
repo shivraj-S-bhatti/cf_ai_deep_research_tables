@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { X, Plus, Play, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,11 +36,16 @@ export function PreviewStage({
   const [editingQuery, setEditingQuery] = useState(false);
   const [queryDraft, setQueryDraft] = useState(thread.query);
 
+  useEffect(() => {
+    setQueryDraft(thread.query);
+  }, [thread.id, thread.query]);
+
   const handleAddCriterion = () => {
     if (!newCriterion.trim()) return;
     onAddCriterion({
       id: `c${Date.now()}`,
-      text: newCriterion.trim(),
+      label: newCriterion.trim(),
+      kind: "hard_filter",
       color: COLORS[thread.criteria.length % COLORS.length],
     });
     setNewCriterion("");
@@ -48,7 +53,19 @@ export function PreviewStage({
 
   const handleAddEnrichment = () => {
     if (!newEnrichment.trim()) return;
-    onAddEnrichment({ id: `e${Date.now()}`, name: newEnrichment.trim() });
+    const label = newEnrichment.trim();
+    onAddEnrichment({
+      id: `e${Date.now()}`,
+      key: label.toLowerCase().replace(/[^a-z0-9]+/g, "_"),
+      label,
+      kind: "enrichment",
+      valueType: "string",
+      preferredSources: ["official"],
+      requiresVerification: true,
+      allowInference: false,
+      nullPolicy: "dash",
+      orderIndex: thread.columns.length,
+    });
     setNewEnrichment("");
   };
 
@@ -91,7 +108,7 @@ export function PreviewStage({
         {/* Criteria */}
         <div className="space-y-2">
           <label className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-            Search Criteria ({thread.criteria.length})
+            Criteria ({thread.criteria.length})
           </label>
           <div className="space-y-1.5">
             {thread.criteria.map((c) => (
@@ -100,7 +117,7 @@ export function PreviewStage({
                 className="flex items-center gap-2 text-sm px-2.5 py-1.5 rounded-md border group"
                 style={{ borderLeftColor: c.color, borderLeftWidth: 3 }}
               >
-                <span className="flex-1">{c.text}</span>
+                <span className="flex-1">{c.label}</span>
                 <button
                   onClick={() => onRemoveCriterion(c.id)}
                   className="opacity-0 group-hover:opacity-100 transition-opacity"
@@ -128,12 +145,12 @@ export function PreviewStage({
         {/* Enrichments */}
         <div className="space-y-2">
           <label className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-            Enrichments (extra columns)
+            Output Columns
           </label>
           <div className="flex flex-wrap gap-1.5">
-            {thread.enrichments.map((e) => (
+            {thread.columns.map((e) => (
               <Badge key={e.id} variant="secondary" className="gap-1 text-xs">
-                {e.name}
+                {e.label}
                 <button onClick={() => onRemoveEnrichment(e.id)}>
                   <X className="h-2.5 w-2.5 hover:text-destructive" />
                 </button>
@@ -145,7 +162,7 @@ export function PreviewStage({
               value={newEnrichment}
               onChange={(e) => setNewEnrichment(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAddEnrichment()}
-              placeholder='e.g. "GitHub Link", "Email"'
+              placeholder='e.g. "Website", "License", "Location"'
               className="text-xs h-8"
             />
             <Button size="sm" variant="outline" className="h-8 gap-1 text-xs shrink-0" onClick={handleAddEnrichment}>

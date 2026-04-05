@@ -62,4 +62,15 @@ describe("describeDataGridEmptyState", () => {
       message: "Research stopped before any rows were produced.",
     });
   });
+
+  it("describes zero-row complete runs as an empty grounded result set", () => {
+    expect(describeDataGridEmptyState({
+      visibleCount: 0,
+      totalCount: 0,
+      phase: "complete",
+    })).toEqual({
+      kind: "empty",
+      message: "No grounded results were found from the fetched sources.",
+    });
+  });
 });

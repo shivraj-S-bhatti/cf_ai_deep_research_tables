@@ -83,7 +83,7 @@ export type EvidenceKind =
 
 export type ProviderKind = "search" | "llm" | "fetch" | "cache";
 
-export type ProviderName = "brave" | "gemini" | "http_fetch" | "kv_cache" | "fixture";
+export type ProviderName = "brave" | "gemini" | "groq" | "github" | "http_fetch" | "kv_cache" | "fixture";
 
 export type SearchQuery = {
   id: string;

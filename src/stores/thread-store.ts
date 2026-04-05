@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { apiClient } from "@/lib/api-client";
 import { toast } from "sonner";
+import { normalizeQueryKey } from "@/lib/query-normalization";
 import type {
   ColumnSpec,
   Criterion,
@@ -102,6 +103,34 @@ function clampTargetResults(value: number): number {
   return Math.max(1, Math.min(25, Math.round(value)));
 }
 
+function collapsePreviewDrafts(threads: Thread[], activeThreadId: string | null): Thread[] {
+  const collapsed = new Map<string, Thread>();
+  const ordered: Thread[] = [];
+
+  for (const thread of threads) {
+    const isPreviewDraft = thread.phase === "preview" && thread.latestRunId === null;
+    const key = isPreviewDraft ? `preview:${normalizeQueryKey(thread.query)}` : `thread:${thread.id}`;
+    const existing = collapsed.get(key);
+    if (!existing) {
+      collapsed.set(key, thread);
+      ordered.push(thread);
+      continue;
+    }
+    const preferred = thread.id === activeThreadId
+      ? thread
+      : existing.id === activeThreadId
+        ? existing
+        : thread.updatedAt > existing.updatedAt
+          ? thread
+          : existing;
+    collapsed.set(key, preferred);
+    const index = ordered.findIndex((entry) => entry.id === existing.id || entry.id === thread.id);
+    if (index >= 0) ordered[index] = preferred;
+  }
+
+  return ordered;
+}
+
 export function useThreadStore() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadsLoaded, setThreadsLoaded] = useState(false);
@@ -126,7 +155,10 @@ export function useThreadStore() {
   const upsertThread = useCallback((thread: Thread) => {
     setThreads((previous) => {
       const next = previous.filter((entry) => entry.id !== thread.id);
-      return [thread, ...next].sort((left, right) => right.updatedAt - left.updatedAt);
+      return collapsePreviewDrafts(
+        [thread, ...next].sort((left, right) => right.updatedAt - left.updatedAt),
+        activeThreadIdRef.current,
+      );
     });
   }, []);
 
@@ -194,7 +226,7 @@ export function useThreadStore() {
             merged.sort((a, b) => b.updatedAt - a.updatedAt);
           }
         }
-        return merged;
+        return collapsePreviewDrafts(merged, currentActiveId);
       });
     } finally {
       if (seq === listReloadSeqRef.current) {
@@ -262,6 +294,24 @@ export function useThreadStore() {
     async (query: string) => {
       setCreatingPreviewThread(true);
       try {
+        const normalizedQuery = normalizeQueryKey(query);
+        const existingDraft = threadsRef.current.find((thread) =>
+          thread.phase === "preview"
+          && thread.latestRunId === null
+          && normalizeQueryKey(thread.query) === normalizedQuery,
+        );
+        if (existingDraft) {
+          if (existingDraft.criteria.length === 0 && existingDraft.columns.length === 0) {
+            void refreshQueryPlan(existingDraft.id, query).catch((error) => {
+              toast.error("Could not build preview", {
+                description: error instanceof Error ? error.message : "Unexpected planner failure",
+              });
+            });
+          }
+          void hydrateThread(existingDraft.id);
+          return existingDraft.id;
+        }
+
         const response = await apiClient.createThread({
           query,
           targetResults: 10,

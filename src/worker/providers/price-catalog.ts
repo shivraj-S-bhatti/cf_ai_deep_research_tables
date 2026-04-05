@@ -10,6 +10,13 @@ const PRICE_CATALOG: Record<ProviderName, Record<string, number>> = {
     verify_candidate: 0.001,
     extract_candidate: 0.001,
   },
+  groq: {
+    plan_query: 0.0008,
+  },
+  github: {
+    search_repo: 0.0002,
+    extract_repo_metadata: 0.0002,
+  },
   http_fetch: {
     fetch_source: 0.0002,
   },

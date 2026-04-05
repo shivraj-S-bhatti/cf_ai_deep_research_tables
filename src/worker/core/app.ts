@@ -1,5 +1,6 @@
 import type {
   CreateThreadRequest,
+  ThreadSnapshot,
   PreviewRequest,
   UpdateThreadConfigRequest,
 } from "../../lib/contracts";
@@ -7,6 +8,7 @@ import type { WorkerEnv, WorkerExecutionContext, DurableObjectStubLike } from ".
 import { getRuntime } from "./runtime";
 import { makeId } from "../utils/ids";
 import { emptyResponse, errorResponse, jsonResponse, readJson, textResponse } from "../utils/http";
+import { normalizeQueryKey } from "../../lib/query-normalization";
 
 function getPathname(request: Request): string {
   return new URL(request.url).pathname;
@@ -59,6 +61,24 @@ async function resolveThreadOwner(env: WorkerEnv & { THREAD_REGISTRY: NonNullabl
   if (!response.ok) return null;
   const payload = (await response.json()) as { threadId: string | null };
   return payload.threadId;
+}
+
+function findReusablePreviewThread(snapshots: ThreadSnapshot[], query: string): ThreadSnapshot | null {
+  const normalizedQuery = normalizeQueryKey(query);
+  for (const snapshot of snapshots) {
+    if (
+      snapshot.thread.phase === "preview"
+      && snapshot.thread.latestRunId === null
+      && normalizeQueryKey(snapshot.thread.queryRaw) === normalizedQuery
+    ) {
+      return snapshot;
+    }
+  }
+  return null;
+}
+
+function shouldReusePreviewThread(body: CreateThreadRequest): boolean {
+  return !body.preview && !body.criteria && !body.columns;
 }
 
 async function handleApiRequestDurable(
@@ -118,6 +138,24 @@ async function handleApiRequestDurable(
 
   if (request.method === "POST" && getPathname(request) === "/api/v1/threads") {
     const body = await readJson<CreateThreadRequest>(request);
+    if (shouldReusePreviewThread(body)) {
+      const existingThreadsResponse = await registry.fetch(buildForwardRequest("/internal/threads", "GET"));
+      if (existingThreadsResponse.ok) {
+        const payload = (await existingThreadsResponse.json()) as { threads?: ThreadSnapshot[] };
+        const reusable = findReusablePreviewThread(payload.threads ?? [], body.query);
+        if (reusable) {
+          return jsonResponse(
+            {
+              threadId: reusable.thread.id,
+              runId: null,
+              phase: reusable.thread.phase,
+            },
+            200,
+            { "x-request-id": requestId },
+          );
+        }
+      }
+    }
     const threadId = makeId("thr");
     const stub = env.THREAD_RUNTIME.getByName(threadId);
     const created = await forwardJson(stub, "/internal/bootstrap", "POST", {
@@ -233,6 +271,20 @@ async function handleApiRequestLegacy(
 
   if (request.method === "POST" && getPathname(request) === "/api/v1/threads") {
     const body = await readJson<CreateThreadRequest>(request);
+    if (shouldReusePreviewThread(body)) {
+      const reusable = findReusablePreviewThread(runtime.listThreads().threads, body.query);
+      if (reusable) {
+        return jsonResponse(
+          {
+            threadId: reusable.thread.id,
+            runId: null,
+            phase: reusable.thread.phase,
+          },
+          200,
+          { "x-request-id": requestId },
+        );
+      }
+    }
     return jsonResponse(runtime.createThread(body), 200, { "x-request-id": requestId });
   }
 

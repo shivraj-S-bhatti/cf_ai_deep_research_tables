@@ -56,6 +56,13 @@ export function describeDataGridEmptyState(input: {
     };
   }
 
+  if (phase === "complete") {
+    return {
+      kind: "empty",
+      message: "No grounded results were found from the fetched sources.",
+    };
+  }
+
   return {
     kind: "empty",
     message: "No rows are available for this research thread yet.",

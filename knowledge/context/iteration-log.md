@@ -181,6 +181,101 @@ This does not shorten provider latency directly, but it makes the latency legibl
   - much tighter latency tolerance
 - The right tradeoff is to let preview fail fast and retry cheaply, while the main run keeps its heavier provider policy.
 
+## Devlog Entry — 2026-04-05 (Project/repo retrieval: wider search, narrower fetch)
+
+### Symptom
+
+- Queries like `Open source LLM projects with >1k stars` could finish quickly but still produce zero rows.
+- The runtime spent most of its critical path extracting leaderboard, roundup, and comparison pages that either timed out or yielded no grounded entities.
+- GitHub result diversity was being lost because host-level dedupe treated all `github.com/*` results as one family.
+
+### Root cause
+
+- Project/repo queries were using the same discovery/fetch policy as general entity queries.
+- Search breadth was too narrow for repo discovery, while fetch selection was still too permissive.
+- Host-level dedupe hid distinct repositories behind a single `github.com` bucket, so one weak GitHub page could crowd out stronger repo pages.
+
+### Change
+
+- Added a dedicated `project_repo` discovery intent.
+- For that intent, the live loop now:
+  - expands search queries with GitHub-first variants
+  - seeds discovery with a small GitHub repository search before Brave-only selection
+  - widens Brave depth per query
+  - dedupes shortlisted results by **repo family** instead of raw hostname
+  - prefers repo-like URLs before leaderboard/list pages
+  - uses a smaller initial fetch batch so the loop can pivot earlier instead of paying a long zero-yield critical path
+- Source classification for repo hosts is also stricter:
+  - concrete GitHub/GitLab repository pages are treated as `entity_page`
+  - concrete Hugging Face model/repo pages are treated as `entity_page`
+  - topic/list/awesome pages stay `roundup`
+- Weak pages still exist as fallback discovery inputs, but they no longer dominate the first fetch wave when stronger repo pages are available.
+
+### Result
+
+- The retrieval DAG is now closer to:
+  - search wide
+  - shortlist by repo family / source value
+  - fetch a small high-value batch
+  - iterate only if that batch fails to ground results
+- This reduces wasted extraction time and gives the loop more opportunities to recover from bad first results without increasing LLM fan-out.
+
+## Devlog Entry — 2026-04-05 (Duplicate preview drafts in thread list)
+
+### Symptom
+
+- Repeated preview attempts for the same query could produce a long stack of visually identical `Preview` threads in the left rail.
+
+### Root cause
+
+- Preview bootstrap was cheap and route-driven, but repeated attempts could still create or preserve multiple draft preview threads for the same normalized query.
+- The thread list rendered all of them independently.
+
+### Change
+
+- Client-side preview creation now reuses an existing draft preview thread when the normalized query matches and the thread has not started a run.
+- The thread list also visually collapses duplicate preview drafts by normalized query, preferring the active one when duplicates exist.
+
+### Result
+
+- Repeated attempts for the same preview query no longer produce a long stack of nearly identical draft threads in the left rail.
+
+## Devlog Entry — 2026-04-05 (Greedy repo retrieval + deterministic GitHub extraction)
+
+### Symptom
+
+- Project/repository runs were spending most of their critical path on extraction timeouts against leaderboard, roundup, or generic repo pages.
+- Even when the right repositories were already in the discovered set, refinement kept fetching more low-yield candidates after the first grounded rows existed.
+
+### Root cause
+
+- The live loop still treated concrete GitHub repository pages like generic web documents that needed LLM extraction.
+- Refinement had no no-yield stop condition once a repo query already had grounded rows, so it kept consuming extraction budget on weaker candidates.
+
+### Change
+
+- Added a deterministic GitHub repository metadata path:
+  - parse concrete `github.com/<owner>/<repo>` URLs
+  - fetch repository metadata from the GitHub API
+  - map stars, repo URL, homepage, license, description, and last push date directly into row cells
+  - derive hard-filter evidence from structured repository metadata before falling back to generic extraction
+- Tightened repo-query refinement:
+  - fetch one new discovery candidate at a time after grounded rows exist
+  - stop after a no-yield discovery iteration once grounded rows already exist and no anchors are waiting for corroboration
+  - keep weak-page extraction timeouts short for repo-like queries
+
+### Result
+
+- The repo-query DAG now behaves more like:
+  - search wide
+  - pick the strongest repo families
+  - ground rows deterministically where possible
+  - stop once additional exploration is not paying off
+- This cuts zero-yield critical paths without adding more late-stage heuristics.
+
+- Repeated preview attempts stop polluting the left rail.
+- The UI still preserves concrete historical runs, but duplicate drafts no longer dominate navigation.
+
 ## Devlog Entry — 2026-04-05 (Client thread store: `listThreads` vs `activeThreadId`)
 
 ### Symptom

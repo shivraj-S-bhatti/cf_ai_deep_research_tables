@@ -228,6 +228,27 @@ describe("Worker API vertical slice", () => {
     });
   });
 
+  it("reuses an existing preview thread for the same normalized query", async () => {
+    const first = await apiJson<{
+      threadId: string;
+      phase: string;
+    }>("POST", "/api/v1/threads", {
+      query: "Open source LLM projects with >1k stars",
+      targetResults: 10,
+    });
+
+    const second = await apiJson<{
+      threadId: string;
+      phase: string;
+    }>("POST", "/api/v1/threads", {
+      query: "  open   source llm projects with >1k stars ",
+      targetResults: 10,
+    });
+
+    expect(first.phase).toBe("preview");
+    expect(second.threadId).toBe(first.threadId);
+  });
+
   it("exposes isolate and run diagnostics for operator verification", async () => {
     const health = await apiJson<{
       ok: boolean;

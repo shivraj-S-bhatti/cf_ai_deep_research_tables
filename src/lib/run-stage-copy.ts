@@ -128,6 +128,24 @@ export function runLoadingHeadline(input: {
   }
 
   if (phase === "running" || (stage && stage !== "idle")) {
+    if (phase === "complete") {
+      return {
+        headline: "Research complete",
+        subline: summary || undefined,
+      };
+    }
+    if (phase === "failed") {
+      return {
+        headline: "Research failed",
+        subline: summary || undefined,
+      };
+    }
+    if (phase === "canceled") {
+      return {
+        headline: "Research canceled",
+        subline: summary || undefined,
+      };
+    }
     return {
       headline: stageActivityTitle(stage),
       subline: summary || undefined,

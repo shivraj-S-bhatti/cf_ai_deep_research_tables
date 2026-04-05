@@ -1,5 +1,6 @@
 import { Plus, Search, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { normalizeQueryKey } from "@/lib/query-normalization";
 import { cn } from "@/lib/utils";
 import type { Thread } from "@/lib/types";
 
@@ -31,6 +32,29 @@ export function ThreadList({
   onDeleteThread,
   className,
 }: ThreadListProps) {
+  const visibleThreads = (() => {
+    const grouped = new Map<string, Thread>();
+    const ordered: Thread[] = [];
+
+    for (const thread of threads) {
+      const isReusablePreview = thread.phase === "preview" && thread.latestRunId === null;
+      const key = isReusablePreview ? `preview:${normalizeQueryKey(thread.query)}` : `thread:${thread.id}`;
+      const existing = grouped.get(key);
+      if (!existing) {
+        grouped.set(key, thread);
+        ordered.push(thread);
+        continue;
+      }
+      if (thread.id === activeThreadId) {
+        grouped.set(key, thread);
+        const index = ordered.findIndex((entry) => entry.id === existing.id);
+        if (index >= 0) ordered[index] = thread;
+      }
+    }
+
+    return ordered;
+  })();
+
   return (
     <div
       className={cn(
@@ -46,7 +70,7 @@ export function ThreadList({
       </div>
       <div className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden">
         <ul className="p-1.5 space-y-0.5 w-full max-w-full min-w-0 list-none">
-          {threads.map((t) => {
+          {visibleThreads.map((t) => {
             const isActive = t.id === activeThreadId;
             const run = t.latestRun;
             const canStop =

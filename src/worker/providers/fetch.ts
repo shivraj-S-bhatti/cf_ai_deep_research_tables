@@ -99,6 +99,23 @@ function hasDomain(hostname: string, domains: Set<string>): boolean {
   return false;
 }
 
+function isGitHubRepoPath(path: string): boolean {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length !== 2) return false;
+  return !["topics", "collections", "orgs", "search", "marketplace", "features", "trending"].includes(segments[0]!);
+}
+
+function isGitLabRepoPath(path: string): boolean {
+  const segments = path.split("/").filter(Boolean);
+  return segments.length === 2;
+}
+
+function isHuggingFaceEntityPath(path: string): boolean {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length < 2) return false;
+  return !["spaces", "collections", "docs", "learn", "blog", "open-llm-leaderboard"].includes(segments[0]!);
+}
+
 function isInterstitial(doc: Pick<ParsedDocument, "title" | "text">): boolean {
   const hay = `${doc.title}\n${doc.text.slice(0, 1200)}`.toLowerCase();
   const markers = [
@@ -145,6 +162,7 @@ export function classifySource(doc: Pick<ParsedDocument, "finalUrl" | "title" | 
   const textLower = (doc.text || "").slice(0, 4000).toLowerCase();
 
   if (domain.includes("github.com")) {
+    if (isGitHubRepoPath(path)) return "entity_page";
     const githubListy =
       path.includes("/topics/")
       || path.includes("awesome")
@@ -153,6 +171,14 @@ export function classifySource(doc: Pick<ParsedDocument, "finalUrl" | "title" | 
       || titleLower.includes("best ")
       || titleLower.includes("leaderboard");
     if (githubListy) return "roundup";
+  }
+
+  if (domain.includes("gitlab.com") && isGitLabRepoPath(path)) {
+    return "entity_page";
+  }
+
+  if (domain.includes("huggingface.co") && isHuggingFaceEntityPath(path)) {
+    return "entity_page";
   }
 
   const hasListTitle = /\b(\d+\s+\w*\s*(?:best|top|greatest)|best\s+\d+|top\s+\d+)\b/.test(titleLower)

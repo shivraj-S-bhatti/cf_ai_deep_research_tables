@@ -94,4 +94,16 @@
   - small search concurrency
   - small fetch concurrency
   - small extraction concurrency
+- For project/repository discovery, search wider but fetch more selectively:
+  - widen Brave result depth
+  - seed discovery with a small GitHub repository search when the query is repo-like
+  - dedupe by repo family instead of raw hostname
+  - prefer repo-like URLs before leaderboard/list pages
+  - keep the initial fetch batch smaller so the loop can pivot quickly after the first grounded evidence
+- For project/repository queries, treat concrete GitHub repository pages as deterministic entity sources:
+  - fetch repo metadata directly from the GitHub API
+  - map repository metadata into cells and hard-filter evidence before falling back to generic page extraction
+  - avoid spending LLM extraction budget on repository pages when structured metadata is already available
+- In the default live loop, stop greedy exploration after a no-yield discovery iteration once grounded rows already exist; do not keep burning refinement budget on lower-confidence repo candidates that add no new grounded rows.
 - Client thread list synchronization: guard overlapping `listThreads` results with a generation counter; avoid tying full-list refetch to every `activeThreadId` change when hydration and mutations already update `threads`; after `createThread`, hydrate (upsert) the new thread **before** setting `activeThreadId` so repair logic cannot repoint to an unrelated thread. Details: [ARCHITECTURE.md](../../ARCHITECTURE.md).
+- Preview threads are idempotent by normalized query in the client and collapsed at the store/list level to avoid duplicate drafts from repeated attempts.

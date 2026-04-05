@@ -35,10 +35,15 @@ import {
 import {
   buildCorroborationQueries,
   collectFollowUpUrls,
+  classifyDiscoveryIntent,
   computeFetchBatchSize,
+  discoverySearchResultLimit,
+  expandDiscoveryQueries,
+  extractionTimeoutMsForIntent,
   isCandidateOnlySourceClass,
   isGroundingSourceClass,
   selectDiscoveryBatch,
+  shouldStopGreedyRefinement,
   shouldStopExploration,
 } from "./live-run-policy";
 import {
@@ -50,6 +55,11 @@ import {
   type RuntimeEnvLike,
 } from "./config";
 import { searchBraveWeb, type BraveWebResult } from "../providers/brave";
+import {
+  fetchGitHubRepositoryMetadata,
+  parseGitHubRepositoryUrl,
+  searchGitHubRepositories,
+} from "../providers/github";
 import {
   extractDocumentWithGemini,
   planWithGemini,
@@ -1133,16 +1143,25 @@ export class AgenticSearchRuntime {
     const queuedCorroborationUrls = new Map<string, string>();
     const extractionBudget = createExtractionBudget(this.config.maxLlmExtractionsPerRun);
     const rowIdByName = new Map<string, string>();
+    const criteriaLabels = thread.criteria.map((criterion) => criterion.label);
+    const discoveryIntent = classifyDiscoveryIntent({
+      query: thread.thread.queryRaw,
+      entityType: thread.plan.entityType,
+      criteriaLabels,
+    });
+    const activeSearchQueries = expandDiscoveryQueries({
+      query: thread.thread.queryRaw,
+      entityType: thread.plan.entityType,
+      plannedQueries: thread.plan.searchQueries,
+      criteriaLabels,
+    });
 
     const compactSourcePayload = (payload: Record<string, unknown>) => payload;
     const searchConcurrency = 3;
     const fetchConcurrency = 3;
     const extractionConcurrency = 2;
     const extractionTimeoutForSourceClass = (sourceClass: FetchedDoc["parsed"]["sourceClass"]): number => {
-      if (sourceClass === "entity_page" || sourceClass === "official_site") {
-        return Math.min(this.config.requestTimeoutMs, 12_000);
-      }
-      return Math.min(this.config.requestTimeoutMs, 8_000);
+      return extractionTimeoutMsForIntent(sourceClass, discoveryIntent, this.config.requestTimeoutMs);
     };
     const visibleGroundedRows = (): ResultRow[] =>
       this.store.listRows(runId).filter(
@@ -1157,6 +1176,166 @@ export class AgenticSearchRuntime {
       if (sourceClass === "entity_page" || sourceClass === "directory") return "primary_structured" as const;
       if (sourceClass === "forum") return "weak_discovery" as const;
       return "reputable_secondary" as const;
+    };
+    const extractStarThreshold = (label: string): number | null => {
+      const lower = label.toLowerCase();
+      const direct = /stars?\s*(?:>|>=)\s*(\d[\d,]*)/i.exec(lower)?.[1];
+      if (direct) return Number(direct.replace(/,/g, ""));
+      const verbal = /(?:over|more than|greater than)\s+(\d[\d,]*)/i.exec(lower)?.[1];
+      if (verbal) return Number(verbal.replace(/,/g, ""));
+      const shorthand = />\s*(\d+)\s*k\b/i.exec(lower);
+      if (shorthand) return Number(shorthand[1]) * 1000;
+      return null;
+    };
+    const buildDeterministicGitHubRow = async (entry: FetchedDoc) => {
+      if (discoveryIntent !== "project_repo") return null;
+      if (entry.parsed.sourceClass !== "entity_page") return null;
+      const repoRef = parseGitHubRepositoryUrl(entry.parsed.finalUrl);
+      if (!repoRef) return null;
+
+      const metadata = await fetchGitHubRepositoryMetadata(
+        entry.parsed.finalUrl,
+        executionControl.requestControl(Math.min(this.config.requestTimeoutMs, 5_000)),
+      );
+      const metadataText = [
+        metadata.fullName,
+        metadata.description,
+        metadata.language,
+        metadata.license,
+        metadata.topics.join(" "),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+
+      const repoUrl = metadata.htmlUrl;
+      const homepage = metadata.homepage;
+      const makeCell = (
+        valueText: string | null,
+        confidence: number,
+        evidenceText?: string | null,
+      ): ExtractedEntityRow["cells"][number] => ({
+        key: "",
+        valueText,
+        state: valueText ? "filled" : "not_found",
+        confidence: valueText ? confidence : 0.2,
+        reasonCode: valueText ? null : "github_metadata_missing",
+        evidenceText: evidenceText ?? valueText,
+      });
+      const cells = thread.columns.map((column) => {
+        const lowerKey = column.key.toLowerCase();
+        const lowerLabel = column.label.toLowerCase();
+        let next = makeCell(null, 0.2);
+
+        if (lowerKey === "name" || lowerLabel.includes("name")) {
+          next = makeCell(metadata.fullName, 0.98, metadata.fullName);
+        } else if (lowerKey.includes("star") || lowerLabel.includes("star")) {
+          next = makeCell(String(metadata.stars), 0.99, `Stars: ${metadata.stars}`);
+        } else if (lowerKey.includes("repo") || lowerLabel.includes("repo")) {
+          next = makeCell(repoUrl, 0.99, repoUrl);
+        } else if (lowerKey === "url") {
+          next = makeCell(repoUrl, 0.99, repoUrl);
+        } else if (lowerKey.includes("website") || lowerKey.includes("homepage") || lowerLabel.includes("website")) {
+          next = makeCell(homepage, homepage ? 0.9 : 0.2, homepage);
+        } else if (lowerKey.includes("description") || lowerLabel.includes("description")) {
+          next = makeCell(metadata.description, metadata.description ? 0.92 : 0.2, metadata.description);
+        } else if (lowerKey.includes("license") || lowerLabel.includes("license")) {
+          next = makeCell(metadata.license, metadata.license ? 0.97 : 0.2, metadata.license);
+        } else if (lowerKey.includes("commit") || lowerLabel.includes("commit")) {
+          next = makeCell(metadata.pushedAt, metadata.pushedAt ? 0.92 : 0.2, metadata.pushedAt);
+        } else if (lowerKey.includes("language") || lowerLabel.includes("language")) {
+          next = makeCell(metadata.language, metadata.language ? 0.88 : 0.2, metadata.language);
+        }
+
+        return {
+          ...next,
+          key: column.key,
+        };
+      });
+
+      const criteria = thread.criteria.map((criterion) => {
+        const label = criterion.label.toLowerCase();
+        if (label.includes("open source") || /\boss\b/.test(label)) {
+          if (metadata.license) {
+            return {
+              label: criterion.label,
+              verdict: "pass" as const,
+              summary: `Repository declares license ${metadata.license}.`,
+              confidence: 0.95,
+              evidenceText: metadata.license,
+            };
+          }
+          return {
+            label: criterion.label,
+            verdict: "uncertain" as const,
+            summary: "Repository is public, but metadata did not expose an explicit license.",
+            confidence: 0.45,
+            evidenceText: repoUrl,
+          };
+        }
+        if (label.includes("llm") || label.includes("language model")) {
+          const looksLikeLlm = /\b(llm|large language model|language model|transformer|inference|rag|model)\b/.test(metadataText);
+          return {
+            label: criterion.label,
+            verdict: looksLikeLlm ? "pass" as const : "uncertain" as const,
+            summary: looksLikeLlm
+              ? "Repository metadata references LLM/model-related terms."
+              : "Repository metadata does not make the LLM focus explicit.",
+            confidence: looksLikeLlm ? 0.82 : 0.42,
+            evidenceText: metadata.description || metadata.topics.join(", ") || metadata.fullName,
+          };
+        }
+        if (label.includes("star")) {
+          const threshold = extractStarThreshold(criterion.label) ?? 1000;
+          const passes = metadata.stars > threshold;
+          return {
+            label: criterion.label,
+            verdict: passes ? "pass" as const : "fail" as const,
+            summary: `Repository has ${metadata.stars} stars.`,
+            confidence: 0.99,
+            evidenceText: `Stars: ${metadata.stars}`,
+          };
+        }
+        return {
+          label: criterion.label,
+          verdict: "uncertain" as const,
+          summary: "Criterion requires corroboration beyond GitHub repository metadata.",
+          confidence: 0.35,
+          evidenceText: metadata.description || repoUrl,
+        };
+      });
+
+      const hardCriteria = criteria
+        .filter((criterion) => (criteriaByLabel.get(criterion.label)?.kind ?? "hard_filter") === "hard_filter");
+      const allHardPass = hardCriteria.length > 0 && hardCriteria.every((criterion) => criterion.verdict === "pass");
+      const score = Math.max(
+        0.65,
+        Math.min(
+          0.98,
+          0.68
+            + Math.min(0.18, Math.log10(Math.max(1, metadata.stars)) / 10)
+            + (allHardPass ? 0.08 : 0),
+        ),
+      );
+
+      const row: ExtractedEntityRow = {
+        canonicalName: metadata.fullName,
+        canonicalUrl: repoUrl,
+        candidateWebsite: homepage,
+        rowStatus: allHardPass ? "accepted" : "uncertain",
+        score,
+        rowSummary: metadata.description || `GitHub repository ${metadata.fullName}.`,
+        sourceUrl: entry.parsed.finalUrl,
+        sourceClass: entry.parsed.sourceClass,
+        followUpUrls: homepage ? [homepage] : [],
+        cells,
+        criteria,
+      };
+
+      return {
+        metadata,
+        row,
+      };
     };
     const registerDiscoveredResult = (candidate: BraveWebResult): string | null => {
       const normalizedUrl = this.normalizeUrl(candidate.url);
@@ -1173,14 +1352,18 @@ export class AgenticSearchRuntime {
     const selectNextDiscoveryUrls = (limit: number): string[] => {
       if (limit <= 0) return [];
       return selectDiscoveryBatch(
-        thread.thread.queryRaw,
-        discovered.filter((candidate) => {
-          const normalizedUrl = this.normalizeUrl(candidate.url);
-          return !prunedSourceUrls.has(normalizedUrl)
-            && !failedUrls.has(normalizedUrl)
-            && !fetchedUrls.has(normalizedUrl);
-        }),
-        limit,
+        {
+          query: thread.thread.queryRaw,
+          entityType: thread.plan.entityType,
+          criteriaLabels,
+          candidates: discovered.filter((candidate) => {
+            const normalizedUrl = this.normalizeUrl(candidate.url);
+            return !prunedSourceUrls.has(normalizedUrl)
+              && !failedUrls.has(normalizedUrl)
+              && !fetchedUrls.has(normalizedUrl);
+          }),
+          limit,
+        },
       ).map((candidate) => this.normalizeUrl(candidate.url));
     };
     const queueCorroborationUrl = (rawUrl: string | null | undefined, anchorKey: string): void => {
@@ -1249,7 +1432,7 @@ export class AgenticSearchRuntime {
           const results = await searchBraveWeb(
             this.config.braveApiKey!,
             searchQuery,
-            Math.min(this.config.searchResultsPerQuery, 4),
+            Math.min(discoverySearchResultLimit(this.config.searchResultsPerQuery, discoveryIntent), 6),
             executionControl.requestControl(),
           );
           this.assertRunActive(runId);
@@ -1260,14 +1443,18 @@ export class AgenticSearchRuntime {
           });
           this.store.addUsage(runId, usage);
           const selected = selectDiscoveryBatch(
-            queryText,
-            results.filter((result) => {
-              const normalizedUrl = this.normalizeUrl(result.url);
-              return !failedUrls.has(normalizedUrl)
-                && !prunedSourceUrls.has(normalizedUrl)
-                && !fetchedUrls.has(normalizedUrl);
-            }),
-            Math.min(2, this.config.maxSourcesPerRow),
+            {
+              query: queryText,
+              entityType: thread.plan.entityType,
+              criteriaLabels,
+              candidates: results.filter((result) => {
+                const normalizedUrl = this.normalizeUrl(result.url);
+                return !failedUrls.has(normalizedUrl)
+                  && !prunedSourceUrls.has(normalizedUrl)
+                  && !fetchedUrls.has(normalizedUrl);
+              }),
+              limit: Math.min(2, this.config.maxSourcesPerRow),
+            },
           );
           for (const result of selected) {
             registerDiscoveredResult(result);
@@ -1738,39 +1925,68 @@ export class AgenticSearchRuntime {
           ),
         );
         try {
-          const providerResult = await extractDocumentWithGemini(
-            this.config,
-            {
-              query: thread.thread.queryRaw,
-              entityType: thread.plan.entityType,
-              criteria: thread.criteria.map((criterion) => ({
-                label: criterion.label,
-                kind: criterion.kind,
-              })),
-              columns: thread.columns.map((column) => ({
-                key: column.key,
-                label: column.label,
-                kind: column.kind,
-                valueType: column.valueType,
-              })),
-              url: entry.parsed.finalUrl,
-              title: entry.parsed.title || entry.result.title,
-              snippet: entry.parsed.description || entry.result.description,
-              bodyText: entry.parsed.text,
-            },
-            entry.parsed.sourceClass,
-            executionControl.requestControl(extractionTimeoutForSourceClass(entry.parsed.sourceClass)),
-          );
-          this.assertRunActive(runId);
-          const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
-            backend: providerResult.meta.backend,
-            model: providerResult.meta.model,
-            sourceClass: entry.parsed.sourceClass,
-            url: entry.parsed.finalUrl,
-          });
-          this.store.addUsage(runId, usage);
+          let kept: ExtractedEntityRow[] = [];
+          let usage: UsageRecord;
+          let traceOutput: unknown;
 
-          const kept = providerResult.data.filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl));
+          const deterministic = await buildDeterministicGitHubRow(entry);
+          if (deterministic) {
+            this.assertRunActive(runId);
+            kept = [deterministic.row];
+            usage = usageRecord(runId, "fetch", "github", "extract_repo_metadata", 1, now() - startedAt, false, 0, 0, {
+              url: entry.parsed.finalUrl,
+              sourceClass: entry.parsed.sourceClass,
+              repo: deterministic.metadata.fullName,
+            });
+            traceOutput = {
+              canonicalName: deterministic.row.canonicalName,
+              repoUrl: deterministic.metadata.htmlUrl,
+              homepage: deterministic.metadata.homepage,
+              stars: deterministic.metadata.stars,
+              license: deterministic.metadata.license,
+            };
+          } else {
+            const providerResult = await extractDocumentWithGemini(
+              this.config,
+              {
+                query: thread.thread.queryRaw,
+                entityType: thread.plan.entityType,
+                criteria: thread.criteria.map((criterion) => ({
+                  label: criterion.label,
+                  kind: criterion.kind,
+                })),
+                columns: thread.columns.map((column) => ({
+                  key: column.key,
+                  label: column.label,
+                  kind: column.kind,
+                  valueType: column.valueType,
+                })),
+                url: entry.parsed.finalUrl,
+                title: entry.parsed.title || entry.result.title,
+                snippet: entry.parsed.description || entry.result.description,
+                bodyText: entry.parsed.text,
+              },
+              entry.parsed.sourceClass,
+              executionControl.requestControl(extractionTimeoutForSourceClass(entry.parsed.sourceClass)),
+            );
+            this.assertRunActive(runId);
+            usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
+              backend: providerResult.meta.backend,
+              model: providerResult.meta.model,
+              sourceClass: entry.parsed.sourceClass,
+              url: entry.parsed.finalUrl,
+            });
+            kept = providerResult.data.filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl));
+            traceOutput = kept.map((row) => ({
+              canonicalName: row.canonicalName,
+              candidateWebsite: row.candidateWebsite,
+              followUpUrls: row.followUpUrls,
+              cellCount: row.cells.length,
+              criteriaCount: row.criteria.length,
+            }));
+          }
+
+          this.store.addUsage(runId, usage);
           for (const row of kept) {
             extracted.push({
               ...row,
@@ -1802,15 +2018,7 @@ export class AgenticSearchRuntime {
                       sourceClass: entry.parsed.sourceClass,
                       title: entry.parsed.title || entry.result.title,
                     }),
-                    output: this.stringifyForTrace(
-                      kept.map((row) => ({
-                        canonicalName: row.canonicalName,
-                        candidateWebsite: row.candidateWebsite,
-                        followUpUrls: row.followUpUrls,
-                        cellCount: row.cells.length,
-                        criteriaCount: row.criteria.length,
-                      })),
-                    ),
+                    output: this.stringifyForTrace(traceOutput),
                   }),
                 ],
               }),
@@ -1818,6 +2026,13 @@ export class AgenticSearchRuntime {
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : "Structured extraction failed.";
+          const failedUsage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
+            sourceClass: entry.parsed.sourceClass,
+            url: entry.parsed.finalUrl,
+            failed: true,
+            error: message,
+          });
+          this.store.addUsage(runId, failedUsage);
           if (this.shouldStop(runId)) {
             throw error;
           }
@@ -1876,7 +2091,7 @@ export class AgenticSearchRuntime {
         startedAt: current.startedAt ?? now(),
         progress: {
           ...current.progress,
-          totalQueries: thread.plan.searchQueries.length,
+          totalQueries: activeSearchQueries.length,
           totalRows: 0,
         },
       }));
@@ -1887,7 +2102,8 @@ export class AgenticSearchRuntime {
           title: "Planning query",
           checkpoint: "plan persisted",
           entityType: thread.plan.entityType,
-          searchQueries: thread.plan.searchQueries.length,
+          searchQueries: activeSearchQueries.length,
+          discoveryIntent,
         }),
       );
       await sleep(25);
@@ -1895,7 +2111,72 @@ export class AgenticSearchRuntime {
     if (this.shouldStop(runId)) return;
 
     await this.runStage(runId, "discovery", executionControl, async () => {
-      await mapConcurrent(thread.plan.searchQueries, searchConcurrency, async (query) => {
+      if (discoveryIntent === "project_repo" && activeSearchQueries.length > 0) {
+        const githubSeedQuery = activeSearchQueries[0]!.text;
+        const startedAt = now();
+        try {
+          const githubResults = await searchGitHubRepositories(
+            githubSeedQuery,
+            Math.min(6, discoverySearchResultLimit(this.config.searchResultsPerQuery, discoveryIntent)),
+            executionControl.requestControl(),
+          );
+          this.assertRunActive(runId);
+          const githubUsage = usageRecord(runId, "search", "github", "search_repo", 1, now() - startedAt, false, 0, 0, {
+            query: githubSeedQuery,
+            resultCount: githubResults.length,
+          });
+          this.store.addUsage(runId, githubUsage);
+          this.store.updateRun(runId, (current) => ({
+            ...current,
+            stage: "discovery",
+            metrics: {
+              ...current.metrics,
+              elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
+            },
+          }));
+          this.store.addActivity(
+            runId,
+            stageEvent(runId, "discovery", "completed", `Issued GitHub repo search: ${githubSeedQuery}`, {
+              actor: actorForStage("discovery"),
+              title: "Discovering candidates",
+              query: githubSeedQuery,
+              provider: "github",
+              results: githubResults.length,
+              toolCalls: [
+                this.toolCallFromUsage(githubUsage, "Search GitHub repositories for repo-like sources.", {
+                  input: githubSeedQuery,
+                  output: this.stringifyForTrace({
+                    resultCount: githubResults.length,
+                    topUrls: githubResults.slice(0, 5).map((entry) => this.normalizeUrl(entry.url)),
+                  }),
+                }),
+              ],
+            }),
+          );
+
+          for (const result of githubResults) {
+            registerDiscoveredResult(result);
+          }
+        } catch (error) {
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "discovery",
+              "failed",
+              error instanceof Error ? error.message : "GitHub repository search failed.",
+              {
+                actor: actorForStage("discovery"),
+                title: "GitHub repository search failed",
+                query: githubSeedQuery,
+                provider: "github",
+              },
+            ),
+          );
+        }
+      }
+
+      await mapConcurrent(activeSearchQueries, searchConcurrency, async (query) => {
         this.assertRunActive(runId);
         const cacheKey = `search:${query.text}`;
         const cachedResults = this.cache.search.get(cacheKey) as BraveWebResult[] | undefined;
@@ -1909,7 +2190,7 @@ export class AgenticSearchRuntime {
           ?? await searchBraveWeb(
             this.config.braveApiKey!,
             query,
-            this.config.searchResultsPerQuery,
+            discoverySearchResultLimit(this.config.searchResultsPerQuery, discoveryIntent),
             executionControl.requestControl(),
           );
         this.assertRunActive(runId);
@@ -1975,6 +2256,7 @@ export class AgenticSearchRuntime {
         currentRows: visibleGroundedRows().length,
         remainingExtractionCalls: extractionBudget.remainingCalls,
         maxSourcesPerRun: this.config.maxSourcesPerRun,
+        intent: discoveryIntent,
       });
       const fetched = await fetchByUrls(selectNextDiscoveryUrls(initialFetchLimit), "discovery");
       fetchedDocs.push(...fetched);
@@ -2021,14 +2303,47 @@ export class AgenticSearchRuntime {
 
     await this.runStage(runId, "refinement", executionControl, async () => {
       let iteration = 1;
+      let consecutiveNoGroundingIterations = 0;
+      let broadDiscoveryMisses = 0;
       while (!this.shouldStop(runId) && hasExtractionBudgetRemaining(extractionBudget)) {
         if (executionControl.failIfWallClockExceeded()) return;
         const groundedCount = visibleGroundedRows().length;
-        if (shouldStopExploration(groundedCount, thread.thread.targetResults)) {
+        const pendingAnchors = [...anchorCandidates.values()].filter((anchor) => anchorNeedsCorroboration(anchor));
+        const shouldGreedyStop = shouldStopGreedyRefinement({
+          intent: discoveryIntent,
+          groundedRows: groundedCount,
+          targetResults: thread.thread.targetResults,
+          pendingAnchors: pendingAnchors.length,
+          consecutiveNoGroundingIterations,
+          broadDiscoveryMisses,
+        });
+        if (shouldGreedyStop) {
+          const stopReason = shouldStopExploration(groundedCount, thread.thread.targetResults)
+            ? "grounded target reached"
+            : discoveryIntent === "project_repo" && groundedCount > 0 && pendingAnchors.length === 0 && broadDiscoveryMisses >= 1
+              ? "greedy stop after a no-yield discovery iteration"
+              : "no new grounded rows after repeated refinement iterations";
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "refinement",
+              "completed",
+              `Refinement stopped: ${stopReason}.`,
+              compactSourcePayload({
+                actor: "corroboration",
+                title: "Refinement stop",
+                groundedRows: groundedCount,
+                pendingAnchors: pendingAnchors.length,
+                consecutiveNoGroundingIterations,
+                broadDiscoveryMisses,
+                reason: stopReason,
+              }),
+            ),
+          );
           break;
         }
 
-        const pendingAnchors = [...anchorCandidates.values()].filter((anchor) => anchorNeedsCorroboration(anchor));
         const fetchLimit = computeFetchBatchSize({
           iteration,
           targetResults: thread.thread.targetResults,
@@ -2037,6 +2352,7 @@ export class AgenticSearchRuntime {
           maxSourcesPerRun: this.config.maxSourcesPerRun,
           pendingAnchors: pendingAnchors.length,
           preferFollowUps: pendingAnchors.length > 0,
+          intent: discoveryIntent,
         });
         let targetUrls = selectedCorroborationUrls(fetchLimit);
         let mode: "discovery" | "corroboration" = "corroboration";
@@ -2057,12 +2373,28 @@ export class AgenticSearchRuntime {
 
         const newFetched = await fetchByUrls(targetUrls, mode);
         if (newFetched.length === 0) {
+          if (mode === "discovery") {
+            broadDiscoveryMisses += 1;
+          }
+          consecutiveNoGroundingIterations += 1;
           iteration += 1;
           continue;
         }
         fetchedDocs.push(...newFetched);
+        const groundedBefore = groundedCount;
         const extracted = await extractWithinBudget(newFetched, `${mode} iteration ${iteration}`);
         processExtractedRows(extracted, newFetched);
+        const groundedAfter = visibleGroundedRows().length;
+        const gainedGroundedRows = Math.max(0, groundedAfter - groundedBefore);
+        if (gainedGroundedRows > 0) {
+          consecutiveNoGroundingIterations = 0;
+          broadDiscoveryMisses = 0;
+        } else {
+          consecutiveNoGroundingIterations += 1;
+          if (mode === "discovery") {
+            broadDiscoveryMisses += 1;
+          }
+        }
         iteration += 1;
       }
 

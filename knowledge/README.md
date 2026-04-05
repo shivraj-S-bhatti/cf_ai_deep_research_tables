@@ -1,6 +1,14 @@
-# Docs System
+# Knowledge System
 
-This repo uses a lightweight document versioning and authority system so we can tell which docs are current, binding, historical, or just narrative/contextual.
+This repo uses a lightweight knowledge versioning and authority system so we can tell which artifacts are current, binding, historical, or just narrative/contextual. The `knowledge/` area is meant to hold both durable docs and hands-on investigation artifacts such as notebooks.
+
+## Layout
+
+- `grounding/`: source requirements and challenge text
+- `context/`: decisions, board state, iteration logs, and historical analysis
+- `notebooks/`: executable investigation artifacts and baseline logic mirrors
+- `submission/`: draft content for the repo submission package
+- `blog/`: longer-form public writeups and retrospective posts
 
 ## Required Metadata
 
@@ -38,4 +46,4 @@ Each durable doc should start with a `Document Metadata` section containing:
 
 ## Registry
 
-The current document inventory lives in [docs/registry.md](./registry.md).
+The current knowledge inventory lives in [knowledge/registry.md](./registry.md).

@@ -1,15 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { apiClient } from "@/lib/api-client";
 import type {
   ColumnSpec,
   Criterion,
+  PreviewResponse,
   RowDetailsResponse,
   RunResultsResponse,
   ThreadDetailsResponse,
 } from "@/lib/contracts";
 import {
-  mapActivityEventToAgentStep,
-  sourceFromDocument,
   type Enrichment,
   type SearchCell,
   type SearchResult,
@@ -25,30 +24,12 @@ function slugify(value: string): string {
     .slice(0, 48);
 }
 
-function buildSourceLookups(detail: RowDetailsResponse) {
-  const sourcesById = new Map(detail.sources.map((source) => [source.id, sourceFromDocument(source)]));
-  const evidenceById = new Map(detail.evidence.map((evidence) => [evidence.id, evidence]));
-  return { sourcesById, evidenceById };
-}
-
-function sourcesForEvidence(detail: RowDetailsResponse, evidenceId: string | null) {
-  if (!evidenceId) return [];
-  const { sourcesById, evidenceById } = buildSourceLookups(detail);
-  const evidence = evidenceById.get(evidenceId);
-  if (!evidence) return [];
-  const source = sourcesById.get(evidence.sourceDocumentId);
-  return source ? [source] : [];
-}
-
-function composeResult(
-  rowDetail: RowDetailsResponse,
-  results: RunResultsResponse,
-): SearchResult {
-  const cells = Object.fromEntries(
+function buildRowCells(rowId: string, results: RunResultsResponse): Record<string, SearchCell> {
+  return Object.fromEntries(
     results.columns.map((column) => {
-      const cell = rowDetail.cells.find((entry) => entry.columnKey === column.key) ?? {
-        id: `${rowDetail.row.id}:${column.key}`,
-        rowId: rowDetail.row.id,
+      const cell = results.cells.find((entry) => entry.rowId === rowId && entry.columnKey === column.key) ?? {
+        id: `${rowId}:${column.key}`,
+        rowId,
         columnKey: column.key,
         valueText: null,
         valueJson: null,
@@ -57,41 +38,34 @@ function composeResult(
         reasonCode: null,
         primaryEvidenceId: null,
       };
-      const mapped: SearchCell = {
-        ...cell,
-        label: column.label,
-        sources: sourcesForEvidence(rowDetail, cell.primaryEvidenceId),
-      };
-      return [column.key, mapped];
+
+      return [
+        column.key,
+        {
+          ...cell,
+          label: column.label,
+          sources: [],
+        } satisfies SearchCell,
+      ];
     }),
   );
+}
 
+function composeResultSummary(rowId: string, results: RunResultsResponse): SearchResult | null {
+  const row = results.rows.find((entry) => entry.id === rowId);
+  if (!row) return null;
   return {
-    ...rowDetail.row,
-    name: rowDetail.row.canonicalName,
-    url: rowDetail.row.canonicalUrl.replace(/^https?:\/\//, ""),
-    evaluations: rowDetail.evaluations.map((evaluation) => ({
-      criterionId: evaluation.criterionId,
-      rule:
-        rowDetail.criteria.find((criterion) => criterion.id === evaluation.criterionId)?.label ??
-        "Criterion",
-      verdict: evaluation.verdict,
-      summary: evaluation.summary,
-      confidence: evaluation.confidence,
-      primaryEvidenceId: evaluation.primaryEvidenceId,
-      sources: sourcesForEvidence(rowDetail, evaluation.primaryEvidenceId),
-    })),
-    cells,
-    sourcesVisited: rowDetail.sources.map((source) => sourceFromDocument(source)),
-    matchScore: Math.round(rowDetail.row.score * 100),
+    ...row,
+    name: row.canonicalName,
+    url: row.canonicalUrl.replace(/^https?:\/\//, ""),
+    evaluations: [],
+    cells: buildRowCells(row.id, results),
+    sourcesVisited: [],
+    matchScore: Math.round(row.score * 100),
   };
 }
 
-function composeThread(
-  snapshot: ThreadDetailsResponse,
-  results: SearchResult[],
-  steps: Thread["agentSteps"],
-): Thread {
+function composeThread(snapshot: ThreadDetailsResponse, results: SearchResult[]): Thread {
   return {
     id: snapshot.thread.id,
     query: snapshot.thread.queryRaw,
@@ -100,7 +74,6 @@ function composeThread(
     criteria: snapshot.criteria,
     columns: snapshot.columns,
     results,
-    agentSteps: steps,
     targetResults: snapshot.thread.targetResults,
     createdAt: snapshot.thread.createdAt,
     updatedAt: snapshot.thread.updatedAt,
@@ -112,12 +85,39 @@ function composeThread(
 }
 
 function summaryThread(snapshot: ThreadDetailsResponse): Thread {
-  return composeThread(snapshot, [], []);
+  return composeThread(snapshot, []);
+}
+
+function pollDelayMs(thread: Thread | null): number {
+  if (!thread?.latestRun) return 2000;
+  const elapsed = thread.latestRun.metrics.elapsedMs ?? 0;
+  if (elapsed > 30000) return 5000;
+  if (elapsed > 15000) return 3500;
+  return 2000;
+}
+
+function clampTargetResults(value: number): number {
+  if (!Number.isFinite(value)) return 10;
+  return Math.max(1, Math.min(25, Math.round(value)));
 }
 
 export function useThreadStore() {
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const threadsRef = useRef<Thread[]>(threads);
+  const activeThreadIdRef = useRef<string | null>(null);
+  const hydrateAbortRef = useRef<AbortController | null>(null);
+  const hydrateTargetRef = useRef<string | null>(null);
+  const listReloadSeqRef = useRef(0);
+
+  useLayoutEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+
+  useLayoutEffect(() => {
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
 
   const upsertThread = useCallback((thread: Thread) => {
     setThreads((previous) => {
@@ -128,79 +128,133 @@ export function useThreadStore() {
 
   const hydrateThread = useCallback(
     async (threadId: string): Promise<Thread | null> => {
-      const snapshot = await apiClient.getThread(threadId);
-      if (!snapshot.latestRun) {
-        const thread = summaryThread(snapshot);
-        upsertThread(thread);
-        return thread;
+      if (hydrateTargetRef.current === threadId && hydrateAbortRef.current) {
+        return null;
       }
 
-      const results = await apiClient.getRunResults(snapshot.latestRun.id, true);
-      const rowDetails = await Promise.all(
-        results.rows.map((row) => apiClient.getRowDetails(results.run.id, row.id)),
-      );
-      const events = await apiClient.getRunEvents(results.run.id);
-      const thread = composeThread(
-        {
-          ...snapshot,
-          latestRun: results.run,
-        },
-        rowDetails.map((detail) => composeResult(detail, results)),
-        events.events.map(mapActivityEventToAgentStep),
-      );
-      upsertThread(thread);
-      return thread;
+      hydrateAbortRef.current?.abort();
+      const controller = new AbortController();
+      hydrateAbortRef.current = controller;
+      hydrateTargetRef.current = threadId;
+
+      try {
+        const snapshot = await apiClient.getThread(threadId);
+        if (!snapshot.latestRun) {
+          const thread = summaryThread(snapshot);
+          upsertThread(thread);
+          return thread;
+        }
+
+        const results = await apiClient.getRunResults(snapshot.latestRun.id, true, controller.signal);
+        const rows = results.rows
+          .map((row) => composeResultSummary(row.id, results))
+          .filter((row): row is SearchResult => Boolean(row));
+        const thread = composeThread(
+          {
+            ...snapshot,
+            latestRun: results.run,
+          },
+          rows,
+        );
+        upsertThread(thread);
+        return thread;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return null;
+        }
+        throw error;
+      } finally {
+        if (hydrateTargetRef.current === threadId) {
+          hydrateTargetRef.current = null;
+        }
+      }
     },
     [upsertThread],
   );
 
   const reloadThreadSummaries = useCallback(async () => {
-    const list = await apiClient.listThreads();
-    setThreads((previous) => {
-      const previousById = new Map(previous.map((thread) => [thread.id, thread]));
-      return list.threads.map((snapshot) => previousById.get(snapshot.thread.id) ?? summaryThread(snapshot));
-    });
-    if (!activeThreadId && list.threads[0]) {
-      setActiveThreadId(list.threads[0].thread.id);
+    const seq = ++listReloadSeqRef.current;
+    try {
+      const list = await apiClient.listThreads();
+      if (seq !== listReloadSeqRef.current) return;
+      setThreads((previous) => {
+        const previousById = new Map(previous.map((thread) => [thread.id, thread]));
+        const merged = list.threads.map((snapshot) =>
+          previousById.get(snapshot.thread.id) ?? summaryThread(snapshot),
+        );
+        const currentActiveId = activeThreadIdRef.current;
+        if (currentActiveId && !merged.some((t) => t.id === currentActiveId)) {
+          const kept = previous.find((t) => t.id === currentActiveId);
+          if (kept) {
+            merged.push(kept);
+            merged.sort((a, b) => b.updatedAt - a.updatedAt);
+          }
+        }
+        return merged;
+      });
+      if (!activeThreadIdRef.current && list.threads[0]) {
+        setActiveThreadId(list.threads[0].thread.id);
+      }
+    } finally {
+      if (seq === listReloadSeqRef.current) {
+        setThreadsLoaded(true);
+      }
     }
-  }, [activeThreadId]);
+  }, []);
 
   useEffect(() => {
-    void reloadThreadSummaries();
+    void reloadThreadSummaries().catch(() => undefined);
   }, [reloadThreadSummaries]);
+
+  useEffect(() => {
+    if (!activeThreadId) return;
+    if (!threads.some((t) => t.id === activeThreadId)) {
+      setActiveThreadId(threads[0]?.id ?? null);
+    }
+  }, [threads, activeThreadId]);
 
   useEffect(() => {
     if (!activeThreadId) return;
     void hydrateThread(activeThreadId);
   }, [activeThreadId, hydrateThread]);
 
-  const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
+  const activeThread = useMemo(
+    () => threads.find((thread) => thread.id === activeThreadId) ?? null,
+    [threads, activeThreadId],
+  );
 
   useEffect(() => {
     if (!activeThread?.latestRun || !["queued", "running"].includes(activeThread.latestRun.status)) {
       return;
     }
-    const interval = window.setInterval(() => {
+    const timeout = window.setTimeout(() => {
       void hydrateThread(activeThread.id);
-    }, 700);
-    return () => window.clearInterval(interval);
+    }, pollDelayMs(activeThread));
+    return () => window.clearTimeout(timeout);
   }, [activeThread, hydrateThread]);
 
   const createThread = useCallback(
     async (query: string) => {
-      const preview = await apiClient.previewQuery({
-        query,
-        targetResults: 25,
-      });
+      let preview: PreviewResponse;
+      try {
+        preview = await apiClient.previewQuery({
+          query,
+          targetResults: 10,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "planner failed";
+        throw new Error(`Could not generate criteria from planner: ${message}`);
+      }
       const response = await apiClient.createThread({
         query,
-        targetResults: 25,
+        targetResults: 10,
         criteria: preview.criteria,
         columns: preview.columns,
         preview,
       });
+      const thread = await hydrateThread(response.threadId);
       setActiveThreadId(response.threadId);
-      return hydrateThread(response.threadId);
+      return thread;
     },
     [hydrateThread],
   );
@@ -208,11 +262,17 @@ export function useThreadStore() {
   const refreshQueryPlan = useCallback(
     async (threadId: string, query: string) => {
       const thread = threads.find((entry) => entry.id === threadId);
-      const targetResults = thread?.targetResults ?? 25;
-      const preview = await apiClient.previewQuery({
-        query,
-        targetResults,
-      });
+      const targetResults = clampTargetResults(thread?.targetResults ?? 10);
+      let preview: PreviewResponse;
+      try {
+        preview = await apiClient.previewQuery({
+          query,
+          targetResults,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "planner failed";
+        throw new Error(`Could not refresh criteria from planner: ${message}`);
+      }
       await apiClient.updateThreadConfig(threadId, {
         query,
         targetResults,
@@ -243,11 +303,25 @@ export function useThreadStore() {
 
   const updateTarget = useCallback(
     async (threadId: string, targetResults: number) => {
-      await apiClient.updateThreadConfig(threadId, { targetResults });
+      await apiClient.updateThreadConfig(threadId, { targetResults: clampTargetResults(targetResults) });
       return hydrateThread(threadId);
     },
     [hydrateThread],
   );
+
+  const cancelRun = useCallback(
+    async (runId: string) => {
+      await apiClient.cancelRun(runId);
+    },
+    [],
+  );
+
+  const deleteThread = useCallback(async (threadId: string) => {
+    await apiClient.deleteThread(threadId);
+    const next = threadsRef.current.filter((t) => t.id !== threadId);
+    setThreads(next);
+    setActiveThreadId((cur) => (cur === threadId ? next[0]?.id ?? null : cur));
+  }, []);
 
   const startRun = useCallback(
     async (threadId: string) => {
@@ -323,18 +397,42 @@ export function useThreadStore() {
     [replaceColumns, threads],
   );
 
+  const fetchRowDetails = useCallback(
+    async (runId: string, rowId: string, signal?: AbortSignal): Promise<RowDetailsResponse> => {
+      return apiClient.getRowDetails(runId, rowId, signal);
+    },
+    [],
+  );
+
+  const activeRun = useMemo(() => {
+    for (const thread of threads) {
+      if (
+        thread.latestRun &&
+        (thread.latestRun.status === "running" || thread.latestRun.status === "queued")
+      ) {
+        return { threadId: thread.id, runId: thread.latestRun.id, query: thread.query };
+      }
+    }
+    return null;
+  }, [threads]);
+
   return {
     threads,
+    threadsLoaded,
     activeThread,
     activeThreadId,
+    activeRun,
     setActiveThreadId,
     createThread,
     hydrateThread,
+    fetchRowDetails,
     refreshQueryPlan,
     replaceCriteria,
     replaceColumns,
     updateTarget,
     startRun,
+    cancelRun,
+    deleteThread,
     addCriterion,
     removeCriterion,
     addEnrichment,

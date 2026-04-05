@@ -93,7 +93,7 @@ Checkpoint: vertical slice is stable enough for iterative provider swap-in.
 - Workstream C: planner, providers, budget ledger, and observability rollups
 - Workstream D: orchestrator and API routes
 - Workstream E: frontend store and UI contract wiring
-- Workstream F: tests, smoke fixtures, and docs/runbooks
+- Workstream F: tests, smoke fixtures, and knowledge artifacts/runbooks
 
 ## Current Notes
 

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:live": "AGENTIC_RUNTIME_MODE=live vite",
     "dev:worker": "wrangler dev",
     "build": "vite build",
     "build:dev": "vite build --mode development",

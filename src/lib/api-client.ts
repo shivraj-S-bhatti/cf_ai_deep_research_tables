@@ -5,8 +5,10 @@ import type {
   PreviewRequest,
   PreviewResponse,
   RowDetailsResponse,
+  RunDebugSummary,
   RunEventsResponse,
   RunResultsResponse,
+  RunTraceResponse,
   ResearchRun,
   ThreadDetailsResponse,
   ThreadsListResponse,
@@ -38,6 +40,17 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+async function getRunTracePage(
+  runId: string,
+  page = 1,
+  pageSize = 50,
+  signal?: AbortSignal,
+): Promise<RunTraceResponse> {
+  return requestJson(`/api/v1/runs/${runId}/debug/trace?page=${page}&page_size=${pageSize}`, {
+    signal,
+  });
 }
 
 export const apiClient = {
@@ -72,6 +85,10 @@ export const apiClient = {
     return requestJson(`/api/v1/threads/${threadId}`);
   },
 
+  deleteThread(threadId: string): Promise<{ deleted: boolean }> {
+    return requestJson(`/api/v1/threads/${threadId}`, { method: "DELETE" });
+  },
+
   updateThreadConfig(
     threadId: string,
     input: UpdateThreadConfigRequest,
@@ -96,12 +113,54 @@ export const apiClient = {
     return requestJson(`/api/v1/runs/${runId}/events`);
   },
 
-  getRunResults(runId: string, includeRejected = false): Promise<RunResultsResponse> {
-    return requestJson(`/api/v1/runs/${runId}/results?include_rejected=${includeRejected}`);
+  getRunResults(
+    runId: string,
+    includeRejected = false,
+    signal?: AbortSignal,
+  ): Promise<RunResultsResponse> {
+    return requestJson(`/api/v1/runs/${runId}/results?include_rejected=${includeRejected}`, {
+      signal,
+    });
   },
 
-  getRowDetails(runId: string, rowId: string): Promise<RowDetailsResponse> {
-    return requestJson(`/api/v1/runs/${runId}/results/${rowId}`);
+  getRowDetails(runId: string, rowId: string, signal?: AbortSignal): Promise<RowDetailsResponse> {
+    return requestJson(`/api/v1/runs/${runId}/results/${rowId}`, { signal });
+  },
+
+  getRunDebug(runId: string, signal?: AbortSignal): Promise<RunDebugSummary> {
+    return requestJson(`/api/v1/runs/${runId}/debug`, { signal });
+  },
+
+  getRunTrace(
+    runId: string,
+    page = 1,
+    pageSize = 50,
+    signal?: AbortSignal,
+  ): Promise<RunTraceResponse> {
+    return getRunTracePage(runId, page, pageSize, signal);
+  },
+
+  async getFullRunTrace(
+    runId: string,
+    signal?: AbortSignal,
+    pageSize = 100,
+  ): Promise<RunTraceResponse> {
+    const firstPage = await getRunTracePage(runId, 1, pageSize, signal);
+    if (firstPage.total <= firstPage.events.length) {
+      return firstPage;
+    }
+
+    const pageCount = Math.ceil(firstPage.total / pageSize);
+    const remainingPages = await Promise.all(
+      Array.from({ length: pageCount - 1 }, (_, index) => getRunTracePage(runId, index + 2, pageSize, signal)),
+    );
+
+    return {
+      ...firstPage,
+      events: [firstPage.events, ...remainingPages.map((page) => page.events)].flat(),
+      page: 1,
+      pageSize: Math.max(firstPage.pageSize, firstPage.total),
+    };
   },
 
   cancelRun(runId: string): Promise<ResearchRun> {

@@ -1,75 +1,79 @@
-# Agentic Insights Dashboard
+# Deep Research Datasets
 
-Execution workspace and Worker-style backend for the Agentic Search Challenge.
+Deep Research Datasets is an evidence-backed entity discovery system built for the Agentic Search Challenge. Given a topic query such as `best pizza places in Brooklyn`, `open source database tools`, or `YC W24 healthcare startups`, it is intended to search the web, extract candidate entities from source documents, merge them into a structured table, and keep each populated value traceable to supporting evidence.
 
-The current UI shell remains intentionally stable while we build out the real search, extraction, provenance, and observability pipeline behind it. The repo now supports both a fixture-backed mode for deterministic tests and a live Brave + Gemini path for local development.
+## What The System Does
 
-## Grounding Docs
+The product flow is straightforward. A user enters a topic query, the system turns that query into a structured research plan, searches the web for relevant sources, fetches and parses those pages, extracts entity candidates and their attributes, merges repeated mentions across sources, and returns a table where filled cells can be inspected back to the text that justified them. The UI is designed around that workflow: query, plan, results, row details, sources, and evidence.
 
-- Docs system: [docs/README.md](docs/README.md)
-- Docs registry: [docs/registry.md](docs/registry.md)
-- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
-- API contract: [OPENAPI.yaml](OPENAPI.yaml)
-- D1 schema: [cloudflare/schema.sql](cloudflare/schema.sql)
-- Challenge brief: [docs/grounding/agentic-search-challenge.md](docs/grounding/agentic-search-challenge.md)
-- Current decisions: [docs/context/current-decisions.md](docs/context/current-decisions.md)
-- Development board: [docs/context/development-board.md](docs/context/development-board.md)
-- Context and iteration notes: [docs/context/iteration-log.md](docs/context/iteration-log.md)
+## Approach
 
-## Stack
+The backend is organized as a retrieval and extraction pipeline rather than a generic chat loop. It plans the query, generates search variants, gathers web results, parses the resulting documents, extracts entity information, deduplicates repeated mentions, verifies ambiguous claims, and ranks the resulting rows.
 
-- Vite
-- React 18
-- TypeScript
-- Tailwind CSS
-- shadcn/ui primitives
-- Vitest
-- Playwright
+The key modeling distinction is between three different objects:
 
-## Getting Started
+- **Source documents**: pages such as guides, directories, official sites, review pages, or forum threads.
+- **Entity mentions**: one or more candidate entities extracted from those documents.
+- **Final rows**: merged entities that survive filtering, verification, and ranking.
+
+That separation matters because the challenge is not to return URLs. It is to return entities with grounded attributes. A page may mention many entities, and many pages may refer to the same entity.
+
+## Design Tradeoffs And What We Learned
+
+The theoretically stronger design is document-first: classify the source, extract all matching entities from it, merge those mentions across sources, and only then rank the final rows. Our first serious implementation drifted toward a page-first pipeline, where search results became provisional rows too early. That turned out to be the core quality problem.
+
+The most important lessons from the build were:
+
+- Query reconstruction matters more than naive lexical variants. Appending words like `official` or `source` to a query does not create genuinely better coverage; better rewritten queries target missing evidence and different source types.
+- Document classification matters before extraction. A roundup page, an official site, a directory, and a forum thread should not be treated the same way.
+- Roundup pages should expand into many candidates, not one row. A “10 best pizza places” article is valuable because it names entities, not because the article itself is the entity.
+- Retrieval and ranking heuristics are only useful after row semantics are correct. If the row is actually a guide page, no ranking formula will save the result.
+- Progressive UI and explicit debug surfaces were useful, but over-instrumentation in the main product path made the app harder to reason about.
+- The biggest practical performance gains came from reducing request fan-out, lazy-loading row details, and separating normal product polling from debug polling.
+
+## Current Implementation
+
+The current repo includes a working frontend shell, a Worker-style `/api/v1/*` runtime, live Brave search integration, and Gemini-based planning, extraction, and verification paths. The product surface supports query entry, editable criteria and columns, progressive result rendering, row details, source inspection, and export.
+
+At the same time, the runtime is still in transition. Local execution still relies more on in-memory state than the intended persistent Cloudflare architecture. The live path is real, but the deterministic test path still uses fixture-backed behavior so tests can run without burning provider quota. In other words, the repo demonstrates the right product shape and several real integrations, but the search and extraction logic is still being hardened.
+
+## Setup
+
+Install dependencies and start the local app:
 
 ```bash
 npm install
 npm run dev
 ```
 
-The app runs on `http://localhost:8080` by default.
+The app runs on `http://localhost:8080`.
 
-### Local Runtime Modes
+To run with live providers, copy [.env.local.example](.env.local.example) to `.env.local` and fill in the provider keys. If you want the same configuration for Wrangler local development, copy [.dev.vars.example](.dev.vars.example) to `.dev.vars`.
 
-- `fixture`: deterministic smoke/test mode
-- `hybrid`: use live providers when secrets are available, otherwise fall back to fixtures
-- `live`: force live Brave + Gemini providers
-
-For local live runs:
-
-- copy [.env.local.example](.env.local.example) to `.env.local`
-- copy [.dev.vars.example](.dev.vars.example) to `.dev.vars` if you want the same settings for Wrangler local dev later
-- keep Cloudflare account auth outside app runtime secrets; use `CLOUDFLARE_API_TOKEN` only for Wrangler/account operations
-- the live path now guards free-tier budgets by capping candidate fan-out, extraction calls, and verification passes per run
-- if you want to use Vertex as a fallback or primary backend, set `GEMINI_BACKEND=vertex_express` and provide explicit `VERTEX_*_MODEL` values that match your account
-
-## Scripts
+Useful scripts:
 
 ```bash
 npm run dev
+npm run dev:live
 npm run build
 npm run lint
 npm run test
 npm run test:e2e
+npm run cf:deploy
 ```
-
-## Current Direction
-
-- Keep the existing UI shell stable while backend and data contracts evolve.
-- Prioritize challenge scoring dimensions: output quality, design choices, code structure, documentation, and implementation depth.
-- Re-center future functionality around generic entity discovery with evidence-backed cells, not people-search-specific behavior.
-- Use a Worker-style `/api/v1/*` runtime locally, with live Brave + Gemini when configured and fixtures as the deterministic fallback.
 
 ## Known Limitations
 
-- Live local development uses Brave search plus Gemini planning/extraction/verification when secrets are present.
-- Free-tier runs should stay on conservative budgets; the runtime now falls back to heuristic row compaction instead of crashing when LLM budget or provider availability gets tight.
-- Tests still run against the fixture-backed Worker path for determinism and cost control.
-- D1, KV, and Cloudflare Queue bindings are specified and modeled, but the active local path uses an in-memory truth store.
-- Cloudflare resource IDs, Wrangler setup, and paid-tier tuning are still needed before final demo hardening and deployment.
+- Entity/document separation is still the hardest correctness problem in the runtime.
+- Roundup and multi-entity extraction remain the main quality and latency bottlenecks, especially on long pages.
+- Canonicalization across sources is still weaker than it should be for local business and review-heavy queries.
+- Cost tracking is currently estimated telemetry, not exact provider billing.
+- The local runtime is not yet the full D1/KV/Queue target architecture described in the deeper docs.
+
+## Further Reading
+
+- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
+- API contract: [OPENAPI.yaml](OPENAPI.yaml)
+- Submission draft: [knowledge/submission/assignment-submission-draft.md](knowledge/submission/assignment-submission-draft.md)
+- Retrospective writeup: [knowledge/blog/pages-are-not-entities-draft.md](knowledge/blog/pages-are-not-entities-draft.md)
+- Investigation notebooks: [knowledge/notebooks](knowledge/notebooks)

@@ -9,12 +9,12 @@
 
 ## Repo Reality (Important)
 
-- The repo is in a high-churn, pre-commit state with broad in-flight changes across frontend, Worker runtime, contracts, docs, and tests.
+- The repo is in a high-churn, pre-commit state with broad in-flight changes across frontend, Worker runtime, contracts, knowledge artifacts, and tests.
 - Core architecture and API docs now exist and are intended to be authoritative:
   - `ARCHITECTURE.md`
   - `OPENAPI.yaml`
-  - `docs/context/current-decisions.md`
-  - `docs/context/development-board.md`
+  - `knowledge/context/current-decisions.md`
+  - `knowledge/context/development-board.md`
 
 ## Product Goal (Current)
 
@@ -63,7 +63,7 @@ Runtime orchestration:
 
 Storage:
 - `src/worker/storage/memory-store.ts` is active source of truth locally
-- D1/KV/Queue modeled in docs/contracts, not active in local truth path
+- D1/KV/Queue modeled in architecture and API contract docs, not active in local truth path
 
 ## Shared Contracts (Primary Integration Surface)
 
@@ -131,7 +131,7 @@ These are the safest extension points without broad breakage:
   - planner/provider
   - runtime/store
   - ui wiring
-  - docs/contracts
+  - architecture/contracts
 - Validate with at least:
   - `npm run test`
   - `npm run build`
@@ -146,6 +146,5 @@ These are the safest extension points without broad breakage:
 - `src/worker/storage/memory-store.ts`
 - `src/lib/api-client.ts`
 - `src/pages/Index.tsx`
-- `docs/context/current-decisions.md`
-- `docs/context/development-board.md`
-
+- `knowledge/context/current-decisions.md`
+- `knowledge/context/development-board.md`

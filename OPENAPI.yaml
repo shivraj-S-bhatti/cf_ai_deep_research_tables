@@ -107,7 +107,7 @@ paths:
           description: Run details
   /runs/{runId}/events:
     get:
-      summary: Get run activity events
+      summary: Get legacy run activity events
       parameters:
         - in: path
           name: runId
@@ -116,7 +116,39 @@ paths:
             type: string
       responses:
         "200":
-          description: Run events
+          description: Legacy run events
+  /runs/{runId}/debug:
+    get:
+      summary: Get debug summary, checkpoints, and provider ledger
+      parameters:
+        - in: path
+          name: runId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Debug summary
+  /runs/{runId}/debug/trace:
+    get:
+      summary: Get paginated execution trace events
+      parameters:
+        - in: path
+          name: runId
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: page
+          schema:
+            type: integer
+        - in: query
+          name: page_size
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated trace events
   /runs/{runId}/results:
     get:
       summary: Get result rows and partial cell states

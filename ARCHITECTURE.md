@@ -3,261 +3,236 @@
 ## Document Metadata
 
 - `Doc ID`: `architecture.v0`
-- `Version`: `1.1.0`
+- `Version`: `2.0.1`
 - `Status`: `authoritative`
 - `Kind`: `architecture`
-- `Last Updated`: `2026-04-02`
-- `Authority`: This is the current source of truth for the v0.1 runtime architecture and implementation boundaries.
-- `Supersedes`: `none`
+- `Last Updated`: `2026-04-05`
+- `Authority`: This is the current source of truth for the actual runtime shape, known failure modes, and target refactor direction.
+- `Supersedes`: `architecture.v0@1.1.0`
 
-## Goal
+## Overview
 
-Build a generic, evidence-backed entity discovery system that accepts a natural-language query and returns a progressively rendered table of entities, attributes, and traceable cell-level evidence.
+Agentic Search is a generic entity-discovery system for the Agentic Search Challenge. It accepts a natural-language query, generates a plan, discovers candidate entities from the web, fills a structured table, and keeps each filled cell traceable to evidence.
 
-This system is optimized for the Agentic Search Challenge, not for chat, CRM workflows, or people-search as the primary demo path.
+Two things are true at once right now:
 
-## Product Rules
+- the app already demonstrates the correct product skeleton:
+  - query
+  - plan preview
+  - progressive result table
+  - row details
+  - evidence and sources
+- the current implementation is still in transition:
+  - local and deployed runtime state is more in-memory than the earlier architecture implied
+  - the product and debug surfaces were over-coupled
+  - request fan-out and trace volume grew before the entity-quality baseline was locked
 
-- The current visible UI shell remains visually stable during v0.1.
-- Rows appear as soon as the system has a canonical candidate identity.
-- Cells render loaders while their value is still pending.
-- A dash is shown only for explicit terminal blank states:
-  - `not_found`
-  - `unsupported`
-- Weak terminal states are rendered as explicit warning states, not blanks:
+This document therefore describes both:
+
+- the current architecture as it really exists today
+- the target architecture we are actively refactoring toward
+
+## Current Architecture
+
+### Runtime Path Today
+
+- A single Cloudflare Worker serves static assets and `/api/v1/*`.
+- The Worker runtime supports fixture, hybrid, and live provider modes.
+- The current truth model in actual runtime behavior is still dominated by an in-memory store, not a real D1-backed production state machine.
+- Live provider execution currently uses:
+  - Brave for search
+  - direct fetch/parse for source retrieval
+  - Gemini for planning, extraction, and verification
+
+### Current Frontend Data Flow
+
+- The main route renders:
+  - initial query screen
+  - preview stage
+  - results workspace
+- The results workspace now uses a summary/detail split:
+  - active polling loads thread summary + run summary + compact result rows/cells
+  - row detail is fetched lazily only when the user selects a row
+  - debug trace is no longer loaded as part of normal workspace hydration
+- A dedicated debug route exists for full execution inspection.
+
+#### Thread list and `activeThreadId` (client store)
+
+The React thread store (`src/stores/thread-store.ts`) keeps `threads` and `activeThreadId` in sync with `GET /api/v1/threads`, per-thread hydration, and mutations. Two patterns caused real bugs (fixed 2026-04-05):
+
+1. **Overlapping `listThreads()` responses** — If `reloadThreadSummaries` is triggered often (e.g. its callback depended on `activeThreadId`), multiple requests could complete out of order; an older response replaced `threads` with a snapshot that omitted a newly created thread, so the repair effect reset `activeThreadId` to `threads[0]` and the UI jumped to an unrelated thread.
+2. **`setActiveThreadId` before hydration** — Calling `setActiveThreadId(newId)` before the new thread was present in `threads` (i.e. before `hydrateThread` finished and `upsertThread` ran) triggered the same repair path and cleared or repointed the active id.
+
+Mitigations in code: a monotonic sequence guard so superseded list responses are ignored; a stable `reloadThreadSummaries` (mount-only) with `activeThreadId` read from a ref for the “pick first thread if none active” branch; optional re-merge of the current active thread from previous state when the server list is briefly stale; **`createThread` awaits `hydrateThread` then sets `activeThreadId`.**
+
+### Current Provider Path
+
+- Preview can come from fixtures or Gemini-backed planning depending on runtime mode and keys.
+- Discovery uses Brave in live mode and fixtures otherwise.
+- Fetch uses direct HTTP fetch + parse.
+- Extraction and verification use Gemini in live mode and fixtures otherwise.
+
+### Where The App Was Stalling
+
+The previous main stall pattern came from the client hydration loop:
+
+- active runs polled every `700ms`
+- each cycle fetched:
+  - thread snapshot
+  - run results
+  - run events
+  - row detail for every visible row
+- this created `O(R)` request fan-out per poll cycle, where `R` is row count
+- over 30–90 second runs, that caused excessive repeated transfer and UI churn
+
+This refactor changed the product path to:
+
+- poll every `2s` initially, with backoff to `3.5s` and `5s`
+- fetch only:
+  - thread/run summary
+  - compact results
+- fetch row detail only on selection
+- fetch debug trace only in the debug workspace
+
+## Current Failure Modes
+
+### 1. Polling Fan-out
+
+This was the most concrete performance bug and is the first one addressed by the current refactor.
+
+Remaining risk:
+- thread snapshot fetches are still separate from results fetches
+- the store is still local/in-memory and not yet optimized for real queue-backed concurrency
+
+### 2. Over-instrumented Product UI
+
+We previously mixed three surfaces together:
+
+- product experience
+- debug/trace explorer
+- evaluation/ops dashboard
+
+This made the main app noisy, repetitive, and less credible. The product path now defaults to:
+
+- Search
+- Details
+- Sources
+- Run
+
+with the full internals moved to a separate debug workspace.
+
+### 3. Document-vs-Entity Confusion
+
+This remains one of the hardest correctness risks.
+
+Failure mode:
+- discovery returns pages
+- extraction/ranking sometimes preserves those pages as final rows instead of canonical entities
+
+Current mitigation:
+- rows now carry lineage
+- ranking rejects rows that still look like roundup pages, directories, or article titles instead of entities
+
+This is a guardrail, not a complete solution.
+
+### 4. Trace/Event Bloat
+
+The runtime still emits a lot of trace data, especially in live mode.
+
+What changed:
+- product UI no longer drags that trace through normal polling
+- debug trace is now loaded separately
+- debug UI groups adjacent similar events by default
+
+What remains:
+- event generation itself is still verbose
+- raw payload duplication remains a cost in the debug path
+
+### 5. Row/State Inconsistencies
+
+Known risk areas:
+
+- row status vs processing state drift
+- stage summary vs row state timing mismatches
+- heuristic fallback rows degrading into ambiguous states
+
+The model is now explicitly:
+
+- row semantic state:
+  - `accepted`
+  - `rejected`
   - `uncertain`
   - `conflict`
-- Rejected rows are rendered in a separate unmatched partition at the bottom of the table so judges can see the system's selectivity work.
-- Every filled cell must have at least one evidence record.
-- Compact table rendering may collapse both `not_found` and `unsupported` to a dash, but detail views must explain them differently.
-- The UI should intentionally expose internals during this phase:
-  - actor/stage trace
-  - tool calls
-  - reasoning summaries
-  - durable checkpoints
-  - provider usage ledger
-  - reward-style runtime proxies
-- The main result set is generic across entity types:
-  - companies
-  - projects
-  - websites
-  - businesses
-  - news items
+- row processing state:
+  - `pending`
+  - `verifying`
+  - `finalized`
+  - `failed`
 
-## v0.1 Scope
+### 6. Client thread list vs active selection (addressed)
 
-### Included
+Symptom: after “new thread” and starting from preview, the UI sometimes showed an older thread’s query/results.
 
-- Single Cloudflare Worker codebase
-- Static asset serving plus `/api/v1/*`
-- Preview, thread, run, results, row-detail, cancel, and export APIs
-- Async run orchestration
-- Progressive partial row/cell persistence
-- Cell-level evidence and source linkage
-- Deep in-app observability
-- Explicit budget tracking and provider usage ledger
-- Fixture-backed provider/runtime path for local development and tests
-- D1 schema and repository contracts
+Cause: stale or reordered `listThreads()` merges dropped the new thread from `threads` while `activeThreadId` still pointed at it (or pointed at it before it existed), triggering a guard that set `activeThreadId` to the first list entry.
 
-### Deferred
+Status: mitigated in the client store as described under **Thread list and `activeThreadId` (client store)** above.
 
-- OpenRouter fallback
-- Tavily fallback
-- Browser-rendered crawling
-- R2 raw snapshot storage
-- Auth and multi-tenant isolation
-- Browser-time SSE requirement
-- ORM adoption
-- People search as the hero workflow
+## Target Architecture
 
-## System Shape
+### Product View
 
-### Runtime
+The product-facing workflow should stay restrained and demoable:
 
-- One Worker serves both the frontend assets and backend API routes.
-- Runs execute asynchronously through a queue-backed stage machine in production.
-- Local development uses the same orchestration contract, with an in-memory adapter and fixture-backed execution so the frontend can be developed without external credentials.
+- query
+- human-readable plan
+- progressive result table
+- unmatched partition for rejected rows
+- row detail
+- cell evidence
+- sources
+- small execution summary
 
-### Storage Roles
-
-- D1 is the source of truth for:
-  - threads
-  - plans
-  - runs
-  - rows
-  - cells
-  - criteria evaluations
-  - source documents
-  - evidence
-  - activity events
-  - usage ledger
-  - exports
-- KV is cache-only for:
-  - query plans
-  - search responses
-  - fetched pages
-  - parsed artifacts
-  - short-lived exports
-
-### Observability
-
-- Every provider call writes a `usage_ledger` record.
-- Every stage writes coarse activity events, not per-microstep spam.
-- `GET /api/v1/runs/:id` exposes:
-  - stage
-  - progress counts
-  - cache stats
-  - provider usage
-  - estimated cost
-  - budget burn
-  - stage timing rollups
-
-Product-critical in-app metrics for v0.1 are:
+Only these metrics belong in the main experience:
 
 - stage
+- elapsed
 - rows discovered
 - rows accepted
-- cells resolved
-- sources fetched
 - search calls
 - fetch calls
 - llm calls
 - cache hit rate
 - estimated cost
-- elapsed time
 
-## Domain Model
+### Debug View
 
-The system is row/cell/evidence centric.
+The separate debug workspace is intentionally engineer-facing and can remain rich:
 
-### Thread
+- grouped execution trace
+- provider ledger
+- tool/function calls
+- raw payloads
+- checkpoint timeline
+- reasoning summaries
+- advanced eval/debug metrics
 
-The user-visible research container:
+This surface is allowed to be noisy because it is now isolated from the main product story.
 
-- raw query
-- normalized query
-- entity type
-- phase
-- latest run
+### Runtime Stages
 
-### Query Plan
+The runtime remains stage-driven:
 
-The structured interpretation of the user query:
+- planning
+- discovery
+- fetch
+- extraction
+- evaluation
+- canonicalization
+- verification
+- ranking
+- export
 
-- hard filters
-- soft signals
-- output columns
-- planned search queries
-- budgets
-
-### Result Row
-
-A canonical candidate entity with:
-
-- terminal semantic status
-- processing state
-- rank
-- score
-- source count
-
-### Result Cell
-
-A value or abstention for a specific row/column pair with:
-
-- explicit state
-- confidence
-- primary evidence
-- reason code
-
-### Evidence
-
-A grounded span, field, or summary tied back to a fetched source.
-
-## API Design
-
-The public contract is documented in [OPENAPI.yaml](/Users/apple/Projects/agentic-insights-dashboard/OPENAPI.yaml).
-
-Key route groups:
-
-- `POST /api/v1/query-plans/preview`
-- `POST /api/v1/threads`
-- `PATCH /api/v1/threads/:threadId/config`
-- `POST /api/v1/threads/:threadId/runs`
-- `GET /api/v1/threads`
-- `GET /api/v1/threads/:threadId`
-- `GET /api/v1/runs/:runId`
-- `GET /api/v1/runs/:runId/events`
-- `GET /api/v1/runs/:runId/results`
-- `GET /api/v1/runs/:runId/results/:rowId`
-- `POST /api/v1/runs/:runId/cancel`
-- `GET /api/v1/runs/:runId/export`
-
-## Execution Pipeline
-
-### 1. Preview
-
-Parse the raw query into:
-
-- entity type
-- hard filters
-- soft signals
-- columns
-- planned search queries
-- conservative budgets
-
-### 2. Kickoff
-
-- persist thread and plan
-- create run
-- enqueue run
-
-### 3. Discovery
-
-- execute planned searches
-- identify candidate entities
-- create provisional rows immediately
-
-### 4. Fetch
-
-- fetch and parse supporting sources
-- persist source documents
-- update fetch metrics and cache stats
-
-### 5. Extraction
-
-- resolve identity and enrichment cells
-- persist each cell as it lands
-- keep unresolved cells as `pending`
-
-### 6. Evaluation
-
-- evaluate each criterion against each row
-- persist verdicts and evidence
-
-### 7. Canonicalization
-
-- merge duplicates
-- recompute source counts
-- mark duplicate rows
-
-### 8. Verification
-
-- verify ambiguous or high-value fields
-- downgrade weak claims into `uncertain`, `conflict`, or explicit blanks
-
-### 9. Ranking
-
-- assign row score and rank
-- finalize terminal row status
-
-### 10. Export
-
-- generate accepted-row CSV/JSON
-- persist export metadata
-
-## Durable Checkpoints
-
-These are the retry/resume-safe boundaries that matter in v0.1:
+The durable checkpoint boundaries that matter are:
 
 - `plan persisted`
 - `candidate rows created`
@@ -266,90 +241,151 @@ These are the retry/resume-safe boundaries that matter in v0.1:
 - `criteria evaluated`
 - `final ranking committed`
 
-## Progressive Rendering Contract
+### Entity-first Contracts
 
-This is binding for both backend and frontend:
+The backend must distinguish:
 
-- `ResultRow.processingState = "pending"` means the row may still gain cells or even change status.
-- `ResultRow.processingState = "verifying"` means the row is in a deliberate second-pass validation step.
-- `ResultRow.processingState = "finalized"` means the row is terminal for the current run.
-- `ResultRow.processingState = "failed"` means the row was left incomplete because the run failed before finishing its pipeline.
-- `ResultCell.state = "pending"` renders a loader.
-- `ResultCell.state = "filled"` renders the value.
-- `ResultCell.state = "not_found"` renders a dash with inspectable provenance context.
-- `ResultCell.state = "unsupported"` renders a dash with inspectable reason.
-- `ResultCell.state = "uncertain"` renders a warning state.
-- `ResultCell.state = "conflict"` renders a warning/conflict state.
+- candidate document
+- candidate entity
+- accepted entity row
 
-The backend must return partial rows and partial cells during execution. The frontend must not wait for the run to finish before rendering them.
+Rows now carry lineage:
 
-## Eval And Reward Proxies
+- `suggestedBySourceIds`
+- `groundedBySourceIds`
+- `sourceOriginClass`
 
-The UI may show reward-style runtime proxies, but they are not the same as offline judged metrics.
+This is the minimum contract needed to keep source pages from silently becoming final entities.
 
-- True precision / recall / F1 require labeled evaluation sets.
-- In-product proxies are allowed for demo/debugging:
-  - grounded cell rate
-  - abstention rate
-  - weak-state rate
-  - target coverage
-  - selectivity
-  - unresolved share
+### Lighter Polling And Detail Loading
 
-## Provider Strategy
+The target API separation is:
 
-### Primary v0.1 Providers
+- `GET /api/v1/runs/:runId`
+  - authoritative run summary
+- `GET /api/v1/runs/:runId/results`
+  - compact row and cell summaries
+- `GET /api/v1/runs/:runId/results/:rowId`
+  - full row detail with evaluations, sources, and evidence
+- `GET /api/v1/runs/:runId/debug`
+  - debug summary and checkpoint state
+- `GET /api/v1/runs/:runId/debug/trace`
+  - paginated full trace
 
-- Search: Brave
-- LLM: Gemini direct
-- Fetch: direct HTTP fetch + parse
+## API Contracts
 
-### Local And Test Strategy
+The public contract is documented in [OPENAPI.yaml](/Users/apple/Projects/agentic-insights-dashboard/OPENAPI.yaml).
 
-Until real credentials and Cloudflare resources are available, v0.1 development uses fixture-backed adapters implementing the same internal interfaces as the real providers.
+Current important routes:
 
-That lets us:
+- `POST /api/v1/query-plans/preview`
+- `POST /api/v1/threads`
+- `PATCH /api/v1/threads/:threadId/config`
+- `POST /api/v1/threads/:threadId/runs`
+- `GET /api/v1/threads`
+- `GET /api/v1/threads/:threadId`
+- `GET /api/v1/runs/:runId`
+- `GET /api/v1/runs/:runId/results`
+- `GET /api/v1/runs/:runId/results/:rowId`
+- `GET /api/v1/runs/:runId/debug`
+- `GET /api/v1/runs/:runId/debug/trace`
+- `POST /api/v1/runs/:runId/cancel`
+- `GET /api/v1/runs/:runId/export`
 
-- build the full contract now
-- test progressive rendering now
-- validate ranking and provenance behavior now
-- swap in real providers later without rewriting the UI contract
+Legacy route still present for backward compatibility during transition:
 
-## Code Organization
+- `GET /api/v1/runs/:runId/events`
 
-```text
-src/
-  lib/
-    contracts.ts
-    types.ts
-    api-client.ts
-  worker/
-    core/
-    domain/
-    fixtures/
-    providers/
-    queue/
-    storage/
-    utils/
-```
+## Performance Notes
 
-Guiding principle: domain contracts live in shared TypeScript, but the Worker owns orchestration, storage, and provider logic.
+### Current Complexity
 
-## Engineering Critique And Guardrails
+At a high level the runtime is still:
 
-- Do not treat KV as a source of truth for live run state.
-- Do not over-model queues in v0.1; one run-level job is simpler and easier to debug than per-row fan-out.
-- Do not ship fake “agent theater” as the system’s core story. The activity surface should read like an execution trace.
-- Do not over-index on single-domain demos like recruiting or LinkedIn-style search.
-- Do not fill cells without evidence simply to make the table look complete.
-- Do not collapse uncertainty into blanks; ambiguity is part of the product.
+- planning: `O(1)`
+- discovery: `O(Q + candidate_docs)`
+- fetch: `O(S)`
+- extraction: `O(R * C)`
+- evaluation and verification: `O(R * K)`
 
-## Next Upgrade Points
+where:
 
-When credentials and Cloudflare resources are available, the planned next upgrades are:
+- `Q` = search queries
+- `S` = fetched sources
+- `R` = candidate rows
+- `C` = output columns
+- `K` = criteria
 
-- swap memory store for D1 repositories
-- swap fixture providers for Brave and Gemini
-- swap local async execution for Cloudflare Queues
-- add SSE on top of the existing events contract
-- optionally add KV-backed caches and R2-backed raw source storage
+### What Actually Hurt
+
+The main problem was not asymptotic class. It was constant-factor blowup:
+
+- per-row detail polling
+- repeated full-event transfers
+- raw payload duplication
+- product UI reading trace-heavy structures it did not need
+
+### Expected Post-refactor Request Shape
+
+For an active run in the product workspace:
+
+- `1 x thread summary`
+- `1 x run results`
+- `0 x row detail` unless a row is selected
+- `0 x debug trace` unless debug workspace is open
+
+That makes the active polling shape effectively constant with respect to row count.
+
+### Latency And Cost Hotspots
+
+The main live cost/latency hotspots remain:
+
+- Brave query count and retries
+- fetch latency for slow pages
+- Gemini extraction and verification calls
+- heuristic fallback when free-tier or trial budgets are exhausted
+
+## Deferred Items
+
+These are still target-state items, not completed implementation facts:
+
+- D1-backed run truth and recovery
+- KV-backed cache discipline
+- Queue-backed production orchestration
+- richer observability backend beyond in-memory trace capture
+- provider fallbacks
+- browser-rendered fetch path
+
+## Migration Plan
+
+### Step 1: Product/Debug Split
+
+Completed in this pass:
+
+- main product view simplified
+- debug workspace moved to a separate route
+- row detail is now lazy-loaded
+
+### Step 2: Entity Quality Baseline
+
+Current priority:
+
+- reduce page-as-entity leakage
+- preserve lineage
+- keep human-readable criteria in product mode
+
+### Step 3: Runtime Compression
+
+Next:
+
+- reduce event verbosity
+- compress repeated operations at write-time, not only read-time
+- remove remaining raw payload duplication where not needed
+
+### Step 4: Infra Truth Model
+
+After the entity-quality and product-flow baseline is stable:
+
+- move durable run truth to D1
+- use KV only for cache
+- restore the original queue-backed production intent with a simpler API surface

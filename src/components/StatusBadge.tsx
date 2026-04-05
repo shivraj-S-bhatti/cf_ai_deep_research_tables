@@ -15,7 +15,34 @@ export function StatusBadge({
     return (
       <span className={`${baseClass} border-border bg-muted/50 text-muted-foreground`}>
         <Loader2 className="h-3 w-3 animate-spin" />
-        Gathering
+        Queued
+      </span>
+    );
+  }
+
+  if (processingState === "fetching") {
+    return (
+      <span className={`${baseClass} border-sky-200 bg-sky-50 text-sky-700`}>
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Fetching
+      </span>
+    );
+  }
+
+  if (processingState === "extracting") {
+    return (
+      <span className={`${baseClass} border-violet-200 bg-violet-50 text-violet-700`}>
+        <Loader2 className="h-3 w-3 animate-spin" />
+        Extracting
+      </span>
+    );
+  }
+
+  if (processingState === "refining") {
+    return (
+      <span className={`${baseClass} border-emerald-200 bg-emerald-50 text-emerald-800`}>
+        <Loader2 className="h-3 w-3 animate-spin opacity-60" />
+        Refining
       </span>
     );
   }

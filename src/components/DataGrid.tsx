@@ -13,16 +13,25 @@ import {
   isWeakTerminalCell,
   type ColumnDefinition,
   type SearchResult,
+  type ThreadLifecyclePhase,
 } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { describeDataGridEmptyState } from "./data-grid-state";
 
 interface DataGridProps {
   results: SearchResult[];
+  totalResultsCount: number;
+  phase: ThreadLifecyclePhase;
   columns: ColumnDefinition[];
   selectedId: string | null;
   onSelect: (id: string) => void;
 }
 
 const LONG_TEXT_LABEL = /(description|reasoning|summary|notes|snippet|about)/i;
+
+function isLongTextColumn(column: ColumnDefinition): boolean {
+  return LONG_TEXT_LABEL.test(column.label) || LONG_TEXT_LABEL.test(column.key);
+}
 
 function partitionRows(results: SearchResult[]) {
   const primary: SearchResult[] = [];
@@ -87,10 +96,22 @@ function renderCellBase(row: SearchResult, column: ColumnDefinition) {
   return <span className="text-[13px] leading-5">{cell?.valueText ?? "—"}</span>;
 }
 
-export function DataGrid({ results, columns, selectedId, onSelect }: DataGridProps) {
+export function DataGrid({
+  results,
+  totalResultsCount,
+  phase,
+  columns,
+  selectedId,
+  onSelect,
+}: DataGridProps) {
   const { primary, unmatched } = partitionRows(results);
   const totalColumns = columns.length + 5;
   const [expanded, setExpanded] = useState<{ rowId: string; columnKey: string } | null>(null);
+  const emptyState = describeDataGridEmptyState({
+    visibleCount: primary.length + unmatched.length,
+    totalCount: totalResultsCount,
+    phase,
+  });
 
   const expandedPayload = useMemo(() => {
     if (!expanded) return null;
@@ -139,18 +160,36 @@ export function DataGrid({ results, columns, selectedId, onSelect }: DataGridPro
             {row.sourceCount}
           </span>
         </TableCell>
-        {columns.map((col) => (
-          <TableCell key={col.id} className={`text-[13px] py-2 ${muted ? "text-foreground/75" : ""}`}>
-            {(() => {
-              const cell = row.cells[col.key];
-              const value = cell?.valueText ?? "";
-              const expandable = cell && shouldAllowExpand(col, value);
+        {columns.map((col) => {
+          const cell = row.cells[col.key];
+          const value = cell?.valueText ?? "";
+          const expandable = Boolean(cell && shouldAllowExpand(col, value));
 
-              if (!expandable) return renderCellBase(row, col);
-
-              return (
-                <div className="flex items-start gap-1.5 min-w-0">
-                  <span className="truncate leading-5">{value || "—"}</span>
+          return (
+            <TableCell
+              key={col.id}
+              className={cn(
+                "py-2 text-[13px]",
+                muted && "text-foreground/75",
+                expandable &&
+                  cn(
+                    "min-w-0 overflow-hidden",
+                    isLongTextColumn(col) ? "w-[220px] max-w-[220px]" : "max-w-[16rem]",
+                  ),
+              )}
+            >
+              {!expandable ? (
+                renderCellBase(row, col)
+              ) : (
+                <div className="flex w-full min-w-0 max-w-full items-start gap-1.5">
+                  <div className="min-w-0 flex-1 basis-0 overflow-hidden">
+                    <span
+                      className="block w-full truncate text-[13px] leading-5"
+                      title={value || undefined}
+                    >
+                      {value || "—"}
+                    </span>
+                  </div>
                   <button
                     type="button"
                     className="shrink-0 rounded border border-border p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted"
@@ -164,10 +203,10 @@ export function DataGrid({ results, columns, selectedId, onSelect }: DataGridPro
                     <Expand className="h-3 w-3" />
                   </button>
                 </div>
-              );
-            })()}
-          </TableCell>
-        ))}
+              )}
+            </TableCell>
+          );
+        })}
       </TableRow>
     );
   };
@@ -186,13 +225,29 @@ export function DataGrid({ results, columns, selectedId, onSelect }: DataGridPro
               Srcs
             </TableHead>
             {columns.map((col) => (
-              <TableHead key={col.id} className="text-[11px] font-semibold text-muted-foreground uppercase tracking-[0.08em] min-w-[140px]">
-                {col.label}
+              <TableHead
+                key={col.id}
+                className={cn(
+                  "text-[11px] font-semibold text-muted-foreground uppercase tracking-[0.08em]",
+                  isLongTextColumn(col) ? "w-[220px] max-w-[220px] min-w-0" : "min-w-[140px]",
+                )}
+              >
+                <span className="block truncate">{col.label}</span>
               </TableHead>
             ))}
           </TableRow>
         </TableHeader>
         <TableBody>
+          {emptyState && (
+            <TableRow>
+              <TableCell colSpan={totalColumns} className="py-10 text-center">
+                <div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+                  {emptyState.kind === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                  {emptyState.message}
+                </div>
+              </TableCell>
+            </TableRow>
+          )}
           {primary.map((row, index) => renderRow(row, String(index + 1)))}
           {unmatched.length > 0 && (
             <>

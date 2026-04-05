@@ -3,16 +3,155 @@
 ## Document Metadata
 
 - `Doc ID`: `context.iteration-log`
-- `Version`: `1.0.0`
+- `Version`: `1.0.1`
 - `Status`: `working`
 - `Kind`: `iteration-log`
-- `Last Updated`: `2026-04-02`
-- `Authority`: Useful context and synthesis, but not the binding source of truth. Use [docs/context/current-decisions.md](./current-decisions.md) for current authoritative project decisions.
+- `Last Updated`: `2026-04-05`
+- `Authority`: Useful context and synthesis, but not the binding source of truth. Use [knowledge/context/current-decisions.md](./current-decisions.md) for current authoritative project decisions.
 - `Supersedes`: `none`
 
 ## Scope
 
 This file keeps non-binding project context, external critique, and iteration notes that we want to preserve for later reporting and analysis.
+
+## Devlog Entry — 2026-04-05 (Client thread store: `listThreads` vs `activeThreadId`)
+
+### Symptom
+
+From the home flow (e.g. new thread → sample query → preview → Run Search), the UI sometimes jumped to an **older** thread: wrong topic in the sidebar, preview/results out of sync with what the user had just started.
+
+### Root cause
+
+Two interacting issues in [`src/stores/thread-store.ts`](../../src/stores/thread-store.ts):
+
+1. **`reloadThreadSummaries` was recreated whenever `activeThreadId` changed**, so the mount `useEffect` re-ran and issued **multiple overlapping `GET /api/v1/threads` requests**. Whichever response completed **last** won. An **older** payload could omit a thread that was created after that request started; the merge path only keeps IDs present in that response, so the new thread disappeared from client `threads`.
+
+2. A **repair `useEffect`** runs when `activeThreadId` is set but that id is **not** in `threads`: it sets `activeThreadId` to `threads[0]` (or `null`). That is correct for “thread was deleted,” but it **fires incorrectly** when the list is briefly inconsistent.
+
+3. **`createThread` called `setActiveThreadId` before `await hydrateThread(...)`**, so React could render with an active id pointing at a thread that was **not yet** in `threads` (hydration still in flight). The same repair effect then cleared or repointed the active id—Playwright then failed waiting for preview copy like `Criteria (3)` because the app never landed on the new thread’s preview.
+
+### What we changed (mitigations)
+
+- **Sequence guard**: increment a ref before each list fetch; after `await`, skip applying the result if a newer fetch started (drop superseded responses).
+- **Stable list reload**: `reloadThreadSummaries` uses `[]` deps and reads `activeThreadId` from a ref for the “if no active, select first thread” branch so the effect does **not** refetch on every thread switch; create/update/delete already go through `upsertThread` / `deleteThread`.
+- **Merge safety**: when applying the list, if the ref’d active id exists in **previous** `threads` but is missing from the server array, **re-insert** that thread and re-sort by `updatedAt` (covers a narrow stale-list edge).
+- **Ordering**: `createThread` **awaits `hydrateThread`** (which `upsertThread`s) **then** calls `setActiveThreadId`, so the repair effect never sees “active but not in list” for a brand-new thread.
+
+### Lessons
+
+- **Any “replace state from HTTP” path needs either** single-flight / last-write-wins-by-design **or** explicit **generation** (or abort) so older responses cannot clobber newer reality.
+- **`activeThreadId` and the list that contains that thread must become consistent in one coherent order** (insert thread in client state, then select it)—not the reverse.
+- **Guard effects that “fix” invalid selection are sharp**: they will misfire if list and id are updated in the wrong order; tests that assume preview appears immediately after create are good regressions for this.
+
+Authoritative write-up: [ARCHITECTURE.md](../../ARCHITECTURE.md) (Current Frontend Data Flow → thread list subsection; Current Failure Modes §6).
+
+## Devlog Entry — 2026-04-05 (Runtime Stabilization + State Machine Corrections)
+
+### Context
+
+We completed a full pass on live runtime correctness after a major agentic refactor (multi-entity extraction, supervisor loop, fallback chains, source classification, dedup, and progressive UI updates). The main user-facing symptom was that the system appeared active but did not behave predictably under real load.
+
+### Problems Observed
+
+1. **Concurrent runs were possible**
+   - Users could initiate overlapping research threads/runs.
+   - Result: duplicated provider calls, throughput collapse, and confusing UI state.
+
+2. **Rows looked stuck in `Queued` even when data had landed**
+   - Cells/evaluations were being populated while `processingState` remained `pending`.
+   - Result: users perceived no progress despite backend work.
+
+3. **Run stage appeared stuck in `discovery` for long durations**
+   - Supervisor refinement work was effectively represented as discovery-heavy flow.
+   - Result: operators could not tell where time was actually going.
+
+4. **Supervisor loop consumed extra iterations after logical completion**
+   - “Done” did not sufficiently stop downstream loop behavior in all practical paths.
+   - Result: avoidable LLM calls and longer elapsed runtime.
+
+5. **Over-aggressive rejection logic**
+   - Rows were rejected too early on weak signals.
+   - Document-like heuristics could push rows to rejected even when confidence was low.
+   - Result: false negatives and poor result quality.
+
+6. **Source lineage problem (parent/child contamination)**
+   - Wrong parent pages (example: wrong cohort/year) still fanned out child entities.
+   - Result: many children got evaluated/rejected from out-of-scope provenance.
+
+7. **No hard wall-clock expectation in UX**
+   - Users lacked a clear time budget and remaining-time expectation.
+   - Result: long waits felt like hangs rather than bounded execution.
+
+### Root Causes
+
+- State transitions were not strict enough between fetch/extract/refine/verify/finalize.
+- Rejection decisions mixed hard decisions with weak heuristics.
+- Source-scope checks were late (post-fanout) rather than early (at parent fetch/classification).
+- Supervisor budget allocation lacked strong “do not revisit pruned families” controls.
+- UX progress indicators did not map 1:1 with backend execution semantics.
+
+### Fixes Implemented
+
+1. **Single active run guard + explicit termination UX**
+   - Starting a new query now prompts termination of the active run first.
+   - Existing run is canceled before new run starts.
+   - Cache is preserved.
+
+2. **State machine improvements**
+   - Added explicit transient states (`fetching`, `extracting`, `refining`) and rendered them in status badges.
+   - Progressive row state updates now reflect actual work-in-progress.
+
+3. **Supervisor/runtime control fixes**
+   - Supervisor stage represented as refinement.
+   - Added/kept wall-clock guard (`MAX_RUN_WALL_CLOCK_MS`, default 8 minutes).
+   - Runtime now records wall-clock exceeded as explicit failure condition.
+
+4. **Conservative final status policy**
+   - Rejection is confidence-gated.
+   - Weak hard-filter signals now remain uncertain instead of rejected.
+   - Document-like heuristic downgraded to uncertainty signal, not auto-reject.
+
+5. **Early source pruning and child cascade prevention**
+   - Parent source scope gate added in fetch path.
+   - Out-of-scope hard parents are pruned before extraction fanout.
+   - Pruned source families/domains are filtered out of discovery/supervisor follow-up targets.
+
+6. **Code bloat cleanup**
+   - Removed dead fallback helpers that no longer participated in the active live path.
+   - Consolidated decisions into runtime status derivation and source-scope gating functions.
+
+7. **UX runtime clarity**
+   - Added elapsed/remaining-time hints aligned with server hard cap.
+   - Run panel now communicates stage + budget expectations more clearly.
+
+### What We Learned
+
+1. **Correctness beats parallelism in early systems**
+   - Concurrency without strict admission control can destroy both quality and cost profile.
+
+2. **State machine truthfulness is a product feature**
+   - If UI state diverges from actual runtime state, users lose trust even when extraction works.
+
+3. **Do not reject on weak evidence**
+   - `uncertain` is a first-class outcome, not a failure.
+   - Aggressive rejection creates silent quality loss and bad demos.
+
+4. **Lineage-aware pruning must happen upstream**
+   - If parent provenance is wrong, fanout must stop immediately.
+   - Post-hoc rejection of children is wasteful and noisy.
+
+5. **Supervisor loops need explicit stop contracts**
+   - Termination behavior must be guaranteed in code paths, not assumed from intent.
+
+6. **Bounded runtime + visible estimate reduces anxiety**
+   - Hard limits plus transparent timing make long-running retrieval pipelines operationally legible.
+
+### Open Follow-ups
+
+- Add richer prune reason surfacing in row-level UI (reason chips/tooltips).
+- Add tests for parent-prune -> child-cascade scenarios across multiple domains.
+- Add stricter per-source-family budget partitioning to avoid source monopolies.
+- Extend cancellation semantics to include hard delete of thread/run artifacts on user action.
 
 ## External Review Notes
 

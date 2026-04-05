@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import type { RowDetailsResponse } from "@/lib/contracts";
 import { summarizeProductCounts } from "@/lib/runtime-policy";
+import { runLoadingHeadline } from "@/lib/run-stage-copy";
 import {
   isBlankTerminalCell,
   isPendingCell,
@@ -93,6 +94,18 @@ function sourcesForEvidence(detail: RowDetailsResponse | null, evidenceId: strin
   if (!evidence) return [];
   const source = sourcesById.get(evidence.sourceDocumentId);
   return source ? [source] : [];
+}
+
+function dedupeSources<T extends { id: string; url: string; title: string }>(sources: T[]): T[] {
+  const seen = new Set<string>();
+  const deduped: T[] = [];
+  for (const source of sources) {
+    const key = `${source.url}::${source.title}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(source);
+  }
+  return deduped;
 }
 
 function summarizeCellState(cell: SearchCell | undefined) {
@@ -243,6 +256,15 @@ export function WorkspaceSidebar({
   const cacheLookups = (thread.metrics?.cacheHits ?? 0) + (thread.metrics?.cacheMisses ?? 0);
   const cacheHitRate =
     cacheLookups > 0 ? Math.round(((thread.metrics?.cacheHits ?? 0) / cacheLookups) * 100) : 0;
+  const selectedSources = useMemo(
+    () => dedupeSources(selectedRowDetail?.sources ?? []),
+    [selectedRowDetail],
+  );
+  const runBanner = runLoadingHeadline({
+    phase: thread.phase,
+    stage: run?.stage ?? "idle",
+    statusSummary: thread.statusSummary,
+  });
 
   const detailCells = useMemo(() => {
     if (!selectedResult) return [];
@@ -281,12 +303,32 @@ export function WorkspaceSidebar({
           </TabsTrigger>
           <TabsTrigger value="sources" className="text-[11px] h-7 px-2.5 rounded-none">
             Sources
-            {selectedRowDetail ? ` (${selectedRowDetail.sources.length})` : ""}
+            {selectedSources.length > 0 ? ` (${selectedSources.length})` : ""}
           </TabsTrigger>
           <TabsTrigger value="run" className="text-[11px] h-7 px-2.5 rounded-none">
             Run
           </TabsTrigger>
         </TabsList>
+        {run ? (
+          <div className="shrink-0 border-b bg-muted/20 px-3 py-2">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[11px] font-medium text-foreground">{runBanner.headline}</p>
+                {runBanner.subline ? (
+                  <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">{runBanner.subline}</p>
+                ) : null}
+              </div>
+              <Badge variant={runIsActive ? "secondary" : "outline"} className="shrink-0 text-[10px] font-mono">
+                {runIsActive ? formatClock(budgetRemainingMs) : run.status}
+              </Badge>
+            </div>
+            {runIsActive ? (
+              <p className="mt-1 text-[10px] leading-snug text-muted-foreground">
+                {formatClock(elapsedLiveMs)} elapsed · hard stop in up to {formatClock(budgetRemainingMs)}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         <TabsContent value="search" className="mt-0 flex-1 min-h-0 overflow-y-auto">
           <div className="p-3 space-y-4">
@@ -415,28 +457,6 @@ export function WorkspaceSidebar({
               <p className="text-[10px] text-muted-foreground font-mono">
                 {acceptedCount} accepted · {analyzed} / {target} analyzed
               </p>
-              {runIsActive ? (
-                <p className="text-[10px] text-muted-foreground leading-snug">
-                  <span className="font-mono text-foreground/90">{formatClock(elapsedLiveMs)}</span>
-                  {" elapsed"}
-                  {run?.stage && run.stage !== "idle" ? (
-                    <>
-                      {" · stage "}
-                      <span className="font-mono">{run.stage}</span>
-                    </>
-                  ) : null}
-                  <br />
-                  {elapsedLiveMs < SERVER_RUN_BUDGET_MS ? (
-                    <>
-                      Hard stop in up to{" "}
-                      <span className="font-mono">{formatClock(budgetRemainingMs)}</span> (server cap). Typical
-                      runs finish in 2–6 minutes.
-                    </>
-                  ) : (
-                    <>Past the usual server time budget — if this looks stuck, refresh or start a new run.</>
-                  )}
-                </p>
-              ) : null}
             </div>
           </div>
         </TabsContent>
@@ -593,11 +613,11 @@ export function WorkspaceSidebar({
                   className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-0.5"
                 >
                   {expandedSources ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                  {selectedRowDetail?.sources.length ?? 0} sources visited
+                  {selectedSources.length} sources visited
                 </button>
               </div>
               {expandedSources &&
-                (selectedRowDetail?.sources ?? []).map((source) => (
+                selectedSources.map((source) => (
                   <a
                     key={source.id}
                     href={source.url}

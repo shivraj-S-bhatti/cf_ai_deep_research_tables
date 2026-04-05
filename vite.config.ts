@@ -4,6 +4,17 @@ import react from "@vitejs/plugin-react-swc";
 import path from "path";
 import { handleApiRequest } from "./src/worker/core/app";
 
+/** Merge process.env with Vite file env; file wins so .env.local keys are not wiped by empty shell vars. */
+function workerEnvForLocalApi(mode: string): Record<string, string> {
+  const fromFiles = loadEnv(mode, process.cwd(), "");
+  const fromProcess: Record<string, string> = {};
+  for (const key of Object.keys(process.env)) {
+    const v = process.env[key];
+    if (typeof v === "string") fromProcess[key] = v;
+  }
+  return { ...fromProcess, ...fromFiles };
+}
+
 function localWorkerApiPlugin(workerEnv: Record<string, string>): Plugin {
   return {
     name: "local-worker-api",
@@ -45,7 +56,7 @@ export default defineConfig(({ mode }) => ({
       overlay: false,
     },
   },
-  plugins: [react(), localWorkerApiPlugin(loadEnv(mode, process.cwd(), ""))],
+  plugins: [react(), localWorkerApiPlugin(workerEnvForLocalApi(mode))],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

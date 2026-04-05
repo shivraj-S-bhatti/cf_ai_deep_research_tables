@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Bug,
   Download,
   Filter,
   Plus,
@@ -19,9 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { AgentActivityModal } from "@/components/AgentActivityModal";
 import type {
-  AgentStep,
   DatasetSortDir,
   DatasetSortKey,
   TableFilterCondition,
@@ -52,7 +51,10 @@ interface ActionToolbarProps {
   acceptedCount: number;
   totalCount: number;
   onExportCsv: () => void;
-  agentSteps: AgentStep[];
+  debugHref: string | null;
+  /** When set with debugHref, Debug becomes a toggle for the in-app panel; otherwise opens a new tab (non-breaking default). */
+  onToggleDebug?: () => void;
+  debugOpen?: boolean;
   tableFilters: TableFilterCondition[];
   onAddTableFilter: () => void;
   onRemoveTableFilter: (id: string) => void;
@@ -66,7 +68,9 @@ export function ActionToolbar({
   acceptedCount,
   totalCount,
   onExportCsv,
-  agentSteps,
+  debugHref,
+  onToggleDebug,
+  debugOpen = false,
   tableFilters,
   onAddTableFilter,
   onRemoveTableFilter,
@@ -212,8 +216,26 @@ export function ActionToolbar({
           <Download className="h-3 w-3" />
           CSV
         </Button>
-
-        <AgentActivityModal steps={agentSteps} />
+        {debugHref && onToggleDebug ? (
+          <Button
+            type="button"
+            variant={debugOpen ? "secondary" : "outline"}
+            size="sm"
+            className="gap-1 text-[11px] h-7"
+            aria-pressed={debugOpen}
+            onClick={onToggleDebug}
+          >
+            <Bug className="h-3 w-3" />
+            Debug
+          </Button>
+        ) : debugHref ? (
+          <Button asChild variant="outline" size="sm" className="gap-1 text-[11px] h-7">
+            <a href={debugHref} target="_blank" rel="noreferrer">
+              <Bug className="h-3 w-3" />
+              Debug
+            </a>
+          </Button>
+        ) : null}
       </div>
     </div>
   );

@@ -1,0 +1,845 @@
+Exported from: pre-refactor-app-logic.ipynb
+Generated with: executed notebook (pre-refactor-app-logic.executed.ipynb) so OUTPUT sections include stdout/results.
+========================================================================
+
+------------------------------------------------------------------------
+Cell 1 (markdown)
+------------------------------------------------------------------------
+# Pre Refactor App Logic
+
+## Document Metadata
+
+- `Doc ID`: `notebook.pre-refactor-app-logic`
+- `Version`: `1.0.0`
+- `Status`: `working`
+- `Kind`: `baseline-notebook`
+- `Last Updated`: `2026-04-04`
+- `Authority`: This notebook is an executable baseline of the current pre-refactor app logic. It is intentionally descriptive, not normative.
+- `Supersedes`: `none`
+
+This notebook mirrors the current app logic in small local functions so we can inspect what the system is actually doing, change prompts, and test alternative control flow without running the whole app. It intentionally keeps the broken heuristics visible.
+
+------------------------------------------------------------------------
+Cell 2 (markdown)
+------------------------------------------------------------------------
+## What This Notebook Mirrors
+
+The current runtime is roughly:
+
+1. preview the query into entity type, criteria, columns, and search queries
+2. search the web and create provisional rows directly from search results
+3. fetch and strip page content
+4. ask the extractor prompt to coerce a page into an entity row, or fall back heuristically
+5. evaluate criteria
+6. deduplicate by normalized URL only
+7. optionally verify ambiguous rows with another prompt
+8. rank and partition rows
+
+Important limitations of the current implementation:
+
+- no vector search
+- no embeddings
+- no recursive crawling
+- no browser rendering
+- no chunk retrieval index
+- no strong entity canonicalization beyond URL heuristics
+- no serious graph reasoning
+
+------------------------------------------------------------------------
+Cell 3 (code)
+------------------------------------------------------------------------
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from pprint import pprint
+from typing import Literal, Optional
+from urllib.parse import urlparse, urlunparse
+import json
+import math
+import re
+
+EntityType = Literal["company", "project", "website", "business", "news_item", "unknown"]
+CriterionKind = Literal["hard_filter", "soft_signal", "heuristic"]
+CriterionVerdict = Literal["pass", "fail", "uncertain", "conflict"]
+RowStatus = Literal["accepted", "rejected", "uncertain", "conflict"]
+CellState = Literal["pending", "filled", "not_found", "unsupported", "uncertain", "conflict"]
+SourceOriginClass = Literal["official", "structured", "secondary", "roundup", "directory"]
+
+
+@dataclass
+class SearchQuery:
+    text: str
+
+
+@dataclass
+class Criterion:
+    label: str
+    kind: CriterionKind
+
+
+@dataclass
+class ColumnSpec:
+    key: str
+    label: str
+    kind: Literal["identity", "criterion_summary", "enrichment"]
+    value_type: Literal["string", "number", "date", "enum", "url", "bool", "json"]
+
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    description: str
+
+
+@dataclass
+class ParsedDocument:
+    final_url: str
+    title: str
+    description: str
+    text: str
+
+
+@dataclass
+class SourceDocument:
+    source_id: str
+    url: str
+    title: str
+    snippet: str
+    domain: str
+    trust_tier: str = "reputable_secondary"
+
+
+@dataclass
+class ResultCell:
+    column_key: str
+    value_text: Optional[str]
+    state: CellState
+    confidence: float
+    reason_code: Optional[str] = None
+    evidence_text: Optional[str] = None
+
+
+@dataclass
+class CriterionEvaluation:
+    label: str
+    verdict: CriterionVerdict
+    summary: str
+    confidence: float
+    evidence_text: Optional[str] = None
+
+
+@dataclass
+class ResultRow:
+    canonical_name: str
+    canonical_url: str
+    entity_type: EntityType
+    status: RowStatus
+    processing_state: Literal["pending", "verifying", "finalized", "failed"]
+    score: float
+    source_count: int
+    duplicate_of: Optional[str]
+    source_origin_class: SourceOriginClass
+    cells: list[ResultCell]
+    evaluations: list[CriterionEvaluation]
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+# execution_count: 1
+
+--- OUTPUT ---
+(no output)
+
+------------------------------------------------------------------------
+Cell 4 (code)
+------------------------------------------------------------------------
+# Sample input and fixtures. These are deliberately similar to the broken pizza workflow.
+
+QUERY = "Top pizza places in Brooklyn"
+TARGET_RESULTS = 5
+
+SEARCH_FIXTURES = {
+    "Top pizza places in Brooklyn": [
+        SearchResult(
+            title="A Slice of Brooklyn Bus Tour",
+            url="https://asliceofbrooklyn.com/bus-tours/pizza-tour/",
+            description="Guided Brooklyn pizza tour with famous slice stops.",
+        ),
+        SearchResult(
+            title="LOCAL'S GUIDE for Best Pizza in NYC + MAP",
+            url="https://yourbrooklynguide.com/best-pizza-in-nyc/",
+            description="A local guide to the best pizza around NYC and Brooklyn.",
+        ),
+        SearchResult(
+            title="Reddit - best pizza in brooklyn",
+            url="https://www.reddit.com/r/Brooklyn/comments/173q8cs/best_pizza_in_brooklyn/",
+            description="Crowdsourced Brooklyn pizza discussion.",
+        ),
+    ],
+    "Top pizza places in Brooklyn official": [
+        SearchResult(
+            title="THE 10 BEST Pizza Places in Brooklyn (Updated 2026)",
+            url="https://www.tripadvisor.com/Restaurants-g60827-c31-Brooklyn_New_York.html",
+            description="Tripadvisor list of Brooklyn pizza places.",
+        ),
+        SearchResult(
+            title="Brooklyn Pizza Walk to Discover New York's Best Slices 2023",
+            url="https://www.viator.com/tours/New-York-City/Brooklyn-Pizza-Walk/d687-5579P2",
+            description="Walking tour of Brooklyn pizza spots.",
+        ),
+    ],
+    "Top pizza places in Brooklyn source": [
+        SearchResult(
+            title="L'Industrie Pizzeria review",
+            url="https://www.theinfatuation.com/new-york/reviews/lindustrie-pizzeria",
+            description="Review page for a pizza place in Brooklyn.",
+        )
+    ],
+}
+
+HTML_FIXTURES = {
+    "https://asliceofbrooklyn.com/bus-tours/pizza-tour/": """
+        <html><head><title>A Slice of Brooklyn Pizza Tour</title>
+        <meta name='description' content='Ride a bus through Brooklyn and sample legendary pizza slices.'></head>
+        <body><h1>Pizza Tour</h1><p>Experience famous Brooklyn pizza shops on a guided bus tour.</p></body></html>
+    """,
+    "https://yourbrooklynguide.com/best-pizza-in-nyc/": """
+        <html><head><title>LOCAL'S GUIDE for Best Pizza in NYC + MAP</title>
+        <meta name='description' content='A roundup of pizza spots in NYC and Brooklyn.'></head>
+        <body><h1>Best Pizza in NYC</h1><p>This article highlights several pizza spots.</p></body></html>
+    """,
+    "https://www.reddit.com/r/Brooklyn/comments/173q8cs/best_pizza_in_brooklyn/": """
+        <html><head><title>Reddit - best pizza in brooklyn</title></head>
+        <body><p>Users discuss favorite Brooklyn pizza spots.</p></body></html>
+    """,
+    "https://www.tripadvisor.com/Restaurants-g60827-c31-Brooklyn_New_York.html": """
+        <html><head><title>THE 10 BEST Pizza Places in Brooklyn (Updated 2026)</title></head>
+        <body><p>Listicle directory page for pizza in Brooklyn.</p></body></html>
+    """,
+    "https://www.viator.com/tours/New-York-City/Brooklyn-Pizza-Walk/d687-5579P2": """
+        <html><head><title>Brooklyn Pizza Walk to Discover New York's Best Slices 2023</title></head>
+        <body><p>Walking tour visiting top pizza neighborhoods.</p></body></html>
+    """,
+    "https://www.theinfatuation.com/new-york/reviews/lindustrie-pizzeria": """
+        <html><head><title>L'Industrie Pizzeria review</title>
+        <meta name='description' content='A review of a well-regarded Brooklyn pizza place.'></head>
+        <body><h1>L'Industrie Pizzeria</h1><p>Brooklyn pizza shop with standout slices and strong reviews.</p></body></html>
+    """,
+}
+
+print(QUERY)
+print("fixture query variants:")
+for key in SEARCH_FIXTURES:
+    print("-", key)
+
+# execution_count: 2
+
+--- OUTPUT ---
+Top pizza places in Brooklyn
+fixture query variants:
+- Top pizza places in Brooklyn
+- Top pizza places in Brooklyn official
+- Top pizza places in Brooklyn source
+
+------------------------------------------------------------------------
+Cell 5 (code)
+------------------------------------------------------------------------
+# Query planning. This mirrors the current fallback planner and the Gemini planner prompt shape.
+
+def heuristic_entity_type(query: str) -> EntityType:
+    lower = query.lower()
+    if re.search(r"\b(startup|company|companies|ipo|funding|yc)\b", lower):
+        return "company"
+    if re.search(r"\b(open source|oss|github|repo|tool|tools|library|libraries|sdk)\b", lower):
+        return "project"
+    if re.search(r"\b(doc|docs|documentation|website|site|sites)\b", lower):
+        return "website"
+    if re.search(r"\b(restaurant|pizza|museum|exhibition|place|places|business|businesses)\b", lower):
+        return "business"
+    if re.search(r"\b(news|announcement|announcements|layoff|ipo|m&a|acquisition|merger)\b", lower):
+        return "news_item"
+    return "unknown"
+
+
+def default_columns_for_entity_type(entity_type: EntityType) -> list[ColumnSpec]:
+    if entity_type == "business":
+        return [
+            ColumnSpec("website", "Website", "identity", "url"),
+            ColumnSpec("summary", "Summary", "enrichment", "string"),
+            ColumnSpec("location", "Location", "enrichment", "string"),
+            ColumnSpec("evidence_count", "Evidence", "criterion_summary", "number"),
+        ]
+    return [
+        ColumnSpec("url", "URL", "identity", "url"),
+        ColumnSpec("summary", "Summary", "enrichment", "string"),
+        ColumnSpec("evidence_count", "Evidence", "criterion_summary", "number"),
+    ]
+
+
+def fallback_preview(query: str, target_results: int) -> dict:
+    entity_type = heuristic_entity_type(query)
+    columns = default_columns_for_entity_type(entity_type)
+    return {
+        "entity_type": entity_type,
+        "criteria": [
+            Criterion(f'Entity appears relevant to "{query}"', "hard_filter")
+        ],
+        "columns": columns,
+        "search_queries": [
+            SearchQuery(query),
+            SearchQuery(f"{query} official"),
+            SearchQuery(f"{query} source"),
+        ],
+        "budgets": {
+            "search_budget": 3,
+            "fetch_budget": max(6, target_results),
+            "verification_budget": max(3, math.ceil(target_results / 4)),
+        },
+        "notes": "Fallback heuristic plan. Replace with Gemini-backed planning when available.",
+    }
+
+
+def build_planner_prompt(query: str, target_results: int) -> str:
+    return "\n".join([
+        "You are planning a grounded entity discovery run.",
+        "Return JSON only.",
+        "Goal: parse the research query into an entity type, hard filters, soft signals, output columns, search queries, and conservative budgets.",
+        "Constraints:",
+        "- Prefer generic entity discovery, not people-search framing.",
+        "- Keep 3 to 6 search queries.",
+        "- Keep budgets conservative for a free-tier demo.",
+        "- Columns should be dynamic and suitable for export.",
+        "",
+        f"Query: {query}",
+        f"Target results: {target_results}",
+    ])
+
+
+preview = fallback_preview(QUERY, TARGET_RESULTS)
+print(build_planner_prompt(QUERY, TARGET_RESULTS))
+print("\n--- fallback preview ---")
+pprint(preview)
+
+# execution_count: 3
+
+--- OUTPUT ---
+You are planning a grounded entity discovery run.
+Return JSON only.
+Goal: parse the research query into an entity type, hard filters, soft signals, output columns, search queries, and conservative budgets.
+Constraints:
+- Prefer generic entity discovery, not people-search framing.
+- Keep 3 to 6 search queries.
+- Keep budgets conservative for a free-tier demo.
+- Columns should be dynamic and suitable for export.
+
+Query: Top pizza places in Brooklyn
+Target results: 5
+
+--- fallback preview ---
+{'budgets': {'fetch_budget': 6, 'search_budget': 3, 'verification_budget': 3},
+ 'columns': [ColumnSpec(key='website',
+                        label='Website',
+                        kind='identity',
+                        value_type='url'),
+             ColumnSpec(key='summary',
+                        label='Summary',
+                        kind='enrichment',
+                        value_type='string'),
+             ColumnSpec(key='location',
+                        label='Location',
+                        kind='enrichment',
+                        value_type='string'),
+             ColumnSpec(key='evidence_count',
+                        label='Evidence',
+                        kind='criterion_summary',
+                        value_type='number')],
+ 'criteria': [Criterion(label='Entity appears relevant to "Top pizza places in '
+                              'Brooklyn"',
+                        kind='hard_filter')],
+ 'entity_type': 'business',
+ 'notes': 'Fallback heuristic plan. Replace with Gemini-backed planning when '
+          'available.',
+ 'search_queries': [SearchQuery(text='Top pizza places in Brooklyn'),
+                    SearchQuery(text='Top pizza places in Brooklyn official'),
+                    SearchQuery(text='Top pizza places in Brooklyn source')]}
+
+------------------------------------------------------------------------
+Cell 6 (code)
+------------------------------------------------------------------------
+# Search and provisional row creation. This mirrors the current bug-prone behavior:
+# search results are pages, but we create provisional entity rows directly from them.
+
+def ensure_http_url(value: str) -> str:
+    if re.match(r"^https?://", value, flags=re.I):
+        return value
+    return "https://" + value.lstrip("/")
+
+
+def normalize_url(value: str) -> str:
+    parsed = urlparse(ensure_http_url(value))
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, ""))
+
+
+def clean_title(title: str) -> str:
+    return re.sub(r"\s+[|\-–:]\s+.*$", "", title).strip()
+
+
+def classify_source_origin(url: str, title: str) -> SourceOriginClass:
+    normalized = f"{url} {title}".lower()
+    if "ycombinator.com/companies" in normalized or "/directory" in normalized:
+        return "directory"
+    if "github.com" in normalized or "schema.org" in normalized or "api" in normalized:
+        return "structured"
+    if any(token in normalized for token in ["top ", "best ", "list of", "roundup", "guide"]):
+        return "roundup"
+    return "official" if "official" in normalized else "secondary"
+
+
+def search_brave_stub(query: SearchQuery) -> list[SearchResult]:
+    return SEARCH_FIXTURES.get(query.text, [])
+
+
+def create_provisional_rows(query_plan: dict) -> list[ResultRow]:
+    rows: list[ResultRow] = []
+    seen_urls: set[str] = set()
+
+    for query in query_plan["search_queries"]:
+        for result in search_brave_stub(query):
+            normalized_url = normalize_url(result.url)
+            if normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+
+            row = ResultRow(
+                canonical_name=clean_title(result.title),
+                canonical_url=normalized_url,
+                entity_type=query_plan["entity_type"],
+                status="uncertain",
+                processing_state="pending",
+                score=0.35,
+                source_count=0,
+                duplicate_of=None,
+                source_origin_class=classify_source_origin(normalized_url, result.title),
+                cells=[
+                    ResultCell(column.key, None, "pending", 0.0)
+                    for column in query_plan["columns"]
+                ],
+                evaluations=[],
+            )
+            rows.append(row)
+    return rows
+
+
+provisional_rows = create_provisional_rows(preview)
+for row in provisional_rows:
+    print(row.canonical_name, "|", row.canonical_url, "|", row.source_origin_class)
+
+# execution_count: 4
+
+--- OUTPUT ---
+A Slice of Brooklyn Bus Tour | https://asliceofbrooklyn.com/bus-tours/pizza-tour/ | secondary
+LOCAL'S GUIDE for Best Pizza in NYC + MAP | https://yourbrooklynguide.com/best-pizza-in-nyc/ | roundup
+Reddit | https://www.reddit.com/r/Brooklyn/comments/173q8cs/best_pizza_in_brooklyn/ | roundup
+THE 10 BEST Pizza Places in Brooklyn (Updated 2026) | https://www.tripadvisor.com/Restaurants-g60827-c31-Brooklyn_New_York.html | roundup
+Brooklyn Pizza Walk to Discover New York's Best Slices 2023 | https://www.viator.com/tours/New-York-City/Brooklyn-Pizza-Walk/d687-5579P2 | roundup
+L'Industrie Pizzeria review | https://www.theinfatuation.com/new-york/reviews/lindustrie-pizzeria | secondary
+
+------------------------------------------------------------------------
+Cell 7 (code)
+------------------------------------------------------------------------
+# Fetch and content extraction. This mirrors the shallow fetcher in the app:
+# no browser rendering, no DOM reasoning, just title/meta/text extraction from raw HTML.
+
+def strip_html(html: str) -> str:
+    return (
+        html
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+
+
+def _strip_html_tags(html: str) -> str:
+    html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.I)
+    html = re.sub(r"<noscript[\s\S]*?</noscript>", " ", html, flags=re.I)
+    html = re.sub(r"<svg[\s\S]*?</svg>", " ", html, flags=re.I)
+    html = re.sub(r"<[^>]+>", " ", html)
+    html = re.sub(r"\s+", " ", strip_html(html))
+    return html.strip()
+
+
+def match_tag(html: str, pattern: str) -> str:
+    match = re.search(pattern, html, flags=re.I)
+    return match.group(1).strip() if match else ""
+
+
+def fetch_and_parse_document_stub(url: str, max_chars: int = 9000) -> ParsedDocument:
+    html = HTML_FIXTURES[url]
+    title = match_tag(html, r"<title[^>]*>([\s\S]*?)</title>")
+    description = (
+        match_tag(html, r"<meta[^>]+name=['\"]description['\"][^>]+content=['\"]([^'\"]+)['\"]")
+        or match_tag(html, r"<meta[^>]+content=['\"]([^'\"]+)['\"][^>]+name=['\"]description['\"]")
+    )
+    text = _strip_html_tags(html)[:max_chars]
+    return ParsedDocument(final_url=url, title=title, description=description, text=text)
+
+
+parsed_docs = {row.canonical_url: fetch_and_parse_document_stub(row.canonical_url) for row in provisional_rows}
+for url, doc in parsed_docs.items():
+    print(url)
+    print("title:", doc.title)
+    print("description:", doc.description)
+    print("text:", doc.text[:120], "...")
+    print()
+
+# execution_count: 5
+
+--- OUTPUT ---
+https://asliceofbrooklyn.com/bus-tours/pizza-tour/
+title: A Slice of Brooklyn Pizza Tour
+description: Ride a bus through Brooklyn and sample legendary pizza slices.
+text: A Slice of Brooklyn Pizza Tour Pizza Tour Experience famous Brooklyn pizza shops on a guided bus tour. ...
+
+https://yourbrooklynguide.com/best-pizza-in-nyc/
+title: LOCAL'S GUIDE for Best Pizza in NYC + MAP
+description: A roundup of pizza spots in NYC and Brooklyn.
+text: LOCAL'S GUIDE for Best Pizza in NYC + MAP Best Pizza in NYC This article highlights several pizza spots. ...
+
+https://www.reddit.com/r/Brooklyn/comments/173q8cs/best_pizza_in_brooklyn/
+title: Reddit - best pizza in brooklyn
+description: 
+text: Reddit - best pizza in brooklyn Users discuss favorite Brooklyn pizza spots. ...
+
+https://www.tripadvisor.com/Restaurants-g60827-c31-Brooklyn_New_York.html
+title: THE 10 BEST Pizza Places in Brooklyn (Updated 2026)
+description: 
+text: THE 10 BEST Pizza Places in Brooklyn (Updated 2026) Listicle directory page for pizza in Brooklyn. ...
+
+https://www.viator.com/tours/New-York-City/Brooklyn-Pizza-Walk/d687-5579P2
+title: Brooklyn Pizza Walk to Discover New York's Best Slices 2023
+description: 
+text: Brooklyn Pizza Walk to Discover New York's Best Slices 2023 Walking tour visiting top pizza neighborhoods. ...
+
+https://www.theinfatuation.com/new-york/reviews/lindustrie-pizzeria
+title: L'Industrie Pizzeria review
+description: A review of a well-regarded Brooklyn pizza place.
+text: L'Industrie Pizzeria review L'Industrie Pizzeria Brooklyn pizza shop with standout slices and strong reviews. ...
+
+------------------------------------------------------------------------
+Cell 8 (code)
+------------------------------------------------------------------------
+# Extraction and verification prompt shapes plus the current heuristic fallback.
+# The live app uses Gemini here when budget allows, otherwise it falls back to this kind of logic.
+
+def build_extractor_prompt(query: str, entity_type: EntityType, criteria: list[Criterion], columns: list[ColumnSpec], url: str, title: str, snippet: str, body_text: str) -> str:
+    return "\n".join([
+        "You are extracting grounded entity data from a fetched web document.",
+        "Return JSON only.",
+        "Prefer abstention over guessing.",
+        "Use `not_found` when you looked and didn't find a grounded value.",
+        "Use `unsupported` when the field is not reasonably groundable from this source/query.",
+        "Use `uncertain` or `conflict` only when a weak or conflicting claim is present.",
+        "",
+        f"Query: {query}",
+        f"Entity type: {entity_type}",
+        f"Source URL: {url}",
+        f"Source title: {title}",
+        f"Search snippet: {snippet}",
+        f"Criteria: {json.dumps([asdict(c) for c in criteria])}",
+        f"Columns: {json.dumps([asdict(c) for c in columns])}",
+        "Source body excerpt:",
+        body_text[:4000],
+    ])
+
+
+def build_verifier_prompt(query: str, row: ResultRow) -> str:
+    return "\n".join([
+        "You are verifying an already-extracted row from a grounded entity discovery pipeline.",
+        "Return JSON only.",
+        "Only change the row status if the evidence clearly supports it.",
+        "Prefer abstention over overclaiming.",
+        "",
+        f"Query: {query}",
+        f"Row name: {row.canonical_name}",
+        f"Row URL: {row.canonical_url}",
+        f"Current row status: {row.status}",
+        f"Current score: {row.score}",
+    ])
+
+
+def build_fallback_extraction(query: str, criteria: list[Criterion], columns: list[ColumnSpec], result: SearchResult, source_doc: ParsedDocument) -> tuple[RowStatus, float, str, list[ResultCell], list[CriterionEvaluation]]:
+    canonical_name = clean_title(source_doc.title or result.title)
+    canonical_url = source_doc.final_url
+    summary_text = source_doc.description or result.description or source_doc.title
+    lower_summary = f"{canonical_name} {summary_text} {query}".lower()
+
+    cells: list[ResultCell] = []
+    for column in columns:
+        key = column.key.lower()
+        if re.search(r"(^name$|headline|company|project|business_name)", key):
+            cells.append(ResultCell(column.key, canonical_name, "filled", 0.55, "heuristic_identity", canonical_name))
+        elif re.search(r"(^url$|website|repo|source_url)", key):
+            cells.append(ResultCell(column.key, canonical_url, "filled", 0.55, "heuristic_identity", canonical_url))
+        elif re.search(r"(description|summary|headline|about)", key):
+            cells.append(ResultCell(column.key, summary_text, "filled", 0.45, "heuristic_summary", summary_text))
+        elif key == "evidence_count":
+            cells.append(ResultCell(column.key, "1", "filled", 1.0, "source_count", "Resolved against 1 fetched source document."))
+        else:
+            cells.append(ResultCell(column.key, None, "unsupported", 0.10, "llm_budget_guard", None))
+
+    evaluations: list[CriterionEvaluation] = []
+    for criterion in criteria:
+        label = criterion.label.lower()
+        if "pizza" in label and re.search(r"pizza", lower_summary):
+            verdict: CriterionVerdict = "pass"
+            summary = f"Heuristic fallback matched '{criterion.label}' against visible source text."
+            confidence = 0.45
+        elif "brooklyn" in label and re.search(r"brooklyn", lower_summary):
+            verdict = "pass"
+            summary = f"Heuristic fallback matched '{criterion.label}' against visible source text."
+            confidence = 0.45
+        else:
+            verdict = "uncertain"
+            summary = "LLM extraction budget was exhausted, so this row was compacted into a heuristic fallback."
+            confidence = 0.18
+        evaluations.append(CriterionEvaluation(criterion.label, verdict, summary, confidence, summary_text if verdict == "pass" else None))
+
+    return "uncertain", 0.18, "LLM extraction budget was exhausted, so this row was compacted into a heuristic fallback.", cells, evaluations
+
+
+human_criteria = [
+    Criterion("Business is a pizza place", "hard_filter"),
+    Criterion("Business is located in Brooklyn", "hard_filter"),
+    Criterion("Repeated positive mentions from reputable local guides", "soft_signal"),
+]
+
+human_columns = [
+    ColumnSpec("business_name", "Business Name", "identity", "string"),
+    ColumnSpec("address", "Address", "enrichment", "string"),
+    ColumnSpec("city", "City", "enrichment", "string"),
+    ColumnSpec("website", "Website", "identity", "url"),
+    ColumnSpec("rating", "Rating", "enrichment", "number"),
+    ColumnSpec("review_count", "Review Count", "enrichment", "number"),
+    ColumnSpec("evidence_count", "Evidence", "criterion_summary", "number"),
+]
+
+sample_result = SEARCH_FIXTURES[QUERY][0]
+sample_doc = parsed_docs[normalize_url(sample_result.url)]
+print(build_extractor_prompt(QUERY, "business", human_criteria, human_columns, sample_result.url, sample_result.title, sample_result.description, sample_doc.text)[:1200])
+print("\n--- fallback extraction output ---")
+fallback_status, fallback_score, fallback_summary, fallback_cells, fallback_evals = build_fallback_extraction(QUERY, human_criteria, human_columns, sample_result, sample_doc)
+print(fallback_status, fallback_score)
+pprint([asdict(cell) for cell in fallback_cells])
+pprint([asdict(ev) for ev in fallback_evals])
+
+# execution_count: 6
+
+--- OUTPUT ---
+You are extracting grounded entity data from a fetched web document.
+Return JSON only.
+Prefer abstention over guessing.
+Use `not_found` when you looked and didn't find a grounded value.
+Use `unsupported` when the field is not reasonably groundable from this source/query.
+Use `uncertain` or `conflict` only when a weak or conflicting claim is present.
+
+Query: Top pizza places in Brooklyn
+Entity type: business
+Source URL: https://asliceofbrooklyn.com/bus-tours/pizza-tour/
+Source title: A Slice of Brooklyn Bus Tour
+Search snippet: Guided Brooklyn pizza tour with famous slice stops.
+Criteria: [{"label": "Business is a pizza place", "kind": "hard_filter"}, {"label": "Business is located in Brooklyn", "kind": "hard_filter"}, {"label": "Repeated positive mentions from reputable local guides", "kind": "soft_signal"}]
+Columns: [{"key": "business_name", "label": "Business Name", "kind": "identity", "value_type": "string"}, {"key": "address", "label": "Address", "kind": "enrichment", "value_type": "string"}, {"key": "city", "label": "City", "kind": "enrichment", "value_type": "string"}, {"key": "website", "label": "Website", "kind": "identity", "value_type": "url"}, {"key": "rating", "label": 
+
+--- fallback extraction output ---
+uncertain 0.18
+[{'column_key': 'business_name',
+  'confidence': 0.55,
+  'evidence_text': 'A Slice of Brooklyn Pizza Tour',
+  'reason_code': 'heuristic_identity',
+  'state': 'filled',
+  'value_text': 'A Slice of Brooklyn Pizza Tour'},
+ {'column_key': 'address',
+  'confidence': 0.1,
+  'evidence_text': None,
+  'reason_code': 'llm_budget_guard',
+  'state': 'unsupported',
+  'value_text': None},
+ {'column_key': 'city',
+  'confidence': 0.1,
+  'evidence_text': None,
+  'reason_code': 'llm_budget_guard',
+  'state': 'unsupported',
+  'value_text': None},
+ {'column_key': 'website',
+  'confidence': 0.55,
+  'evidence_text': 'https://asliceofbrooklyn.com/bus-tours/pizza-tour/',
+  'reason_code': 'heuristic_identity',
+  'state': 'filled',
+  'value_text': 'https://asliceofbrooklyn.com/bus-tours/pizza-tour/'},
+ {'column_key': 'rating',
+  'confidence': 0.1,
+  'evidence_text': None,
+  'reason_code': 'llm_budget_guard',
+  'state': 'unsupported',
+  'value_text': None},
+ {'column_key': 'review_count',
+  'confidence': 0.1,
+  'evidence_text': None,
+  'reason_code': 'llm_budget_guard',
+  'state': 'unsupported',
+  'value_text': None},
+ {'column_key': 'evidence_count',
+  'confidence': 1.0,
+  'evidence_text': 'Resolved against 1 fetched source document.',
+  'reason_code': 'source_count',
+  'state': 'filled',
+  'value_text': '1'}]
+[{'confidence': 0.45,
+  'evidence_text': 'Ride a bus through Brooklyn and sample legendary pizza '
+                   'slices.',
+  'label': 'Business is a pizza place',
+  'summary': "Heuristic fallback matched 'Business is a pizza place' against "
+             'visible source text.',
+  'verdict': 'pass'},
+ {'confidence': 0.45,
+  'evidence_text': 'Ride a bus through Brooklyn and sample legendary pizza '
+                   'slices.',
+  'label': 'Business is located in Brooklyn',
+  'summary': "Heuristic fallback matched 'Business is located in Brooklyn' "
+             'against visible source text.',
+  'verdict': 'pass'},
+ {'confidence': 0.18,
+  'evidence_text': None,
+  'label': 'Repeated positive mentions from reputable local guides',
+  'summary': 'LLM extraction budget was exhausted, so this row was compacted '
+             'into a heuristic fallback.',
+  'verdict': 'uncertain'}]
+
+------------------------------------------------------------------------
+Cell 9 (code)
+------------------------------------------------------------------------
+# Canonicalization and final ranking. This mirrors the shallow URL-level dedupe and final status logic.
+
+def looks_like_document_instead_of_entity(row: ResultRow) -> bool:
+    if row.entity_type in {"news_item", "website"}:
+        return False
+    title = row.canonical_name.lower()
+    url = row.canonical_url.lower()
+    if row.source_origin_class in {"roundup", "directory"}:
+        return True
+    if re.search(r"(^the\s+\d+)|\bbest\b|\btop\b|\bguide\b|\bupdated\b|\breview\b", title):
+        return True
+    if re.search(r"(/blog/|/news/|/posts/|/article/)", url):
+        return True
+    return False
+
+
+def derive_final_status(row: ResultRow) -> RowStatus:
+    hard_evaluations = [ev for ev in row.evaluations if ev.label in {"Business is a pizza place", "Business is located in Brooklyn"}]
+    if any(ev.verdict == "conflict" for ev in hard_evaluations):
+        return "conflict"
+    if any(ev.verdict == "uncertain" for ev in hard_evaluations):
+        return "uncertain"
+    if any(ev.verdict == "fail" for ev in hard_evaluations):
+        return "rejected"
+    if looks_like_document_instead_of_entity(row):
+        return "rejected"
+    return row.status
+
+
+def dedupe_rows_by_url(rows: list[ResultRow]) -> list[ResultRow]:
+    seen: dict[str, str] = {}
+    deduped: list[ResultRow] = []
+    for row in rows:
+        canonical = normalize_url(row.canonical_url)
+        if canonical in seen:
+            row.duplicate_of = seen[canonical]
+        else:
+            seen[canonical] = row.canonical_name
+        deduped.append(row)
+    return deduped
+
+
+def run_current_baseline(query: str, criteria: list[Criterion], columns: list[ColumnSpec]) -> list[ResultRow]:
+    plan = fallback_preview(query, TARGET_RESULTS)
+    provisional = create_provisional_rows(plan)
+    final_rows: list[ResultRow] = []
+
+    for row in provisional:
+        search_result = next(result for results in SEARCH_FIXTURES.values() for result in results if normalize_url(result.url) == row.canonical_url)
+        parsed = fetch_and_parse_document_stub(row.canonical_url)
+        status, score, _, cells, evaluations = build_fallback_extraction(query, criteria, columns, search_result, parsed)
+        row.status = status
+        row.score = score
+        row.cells = cells
+        row.evaluations = evaluations
+        row.source_count = 1
+        final_rows.append(row)
+
+    final_rows = dedupe_rows_by_url(final_rows)
+    final_rows = sorted(final_rows, key=lambda row: row.score, reverse=True)
+    for row in final_rows:
+        row.status = derive_final_status(row)
+        row.processing_state = "finalized"
+    return final_rows
+
+
+baseline_rows = run_current_baseline(QUERY, human_criteria, human_columns)
+for row in baseline_rows:
+    print(row.canonical_name, "| status=", row.status, "| origin=", row.source_origin_class)
+    for ev in row.evaluations:
+        print("   ", ev.label, "->", ev.verdict)
+    print()
+
+# execution_count: 7
+
+--- OUTPUT ---
+A Slice of Brooklyn Bus Tour | status= uncertain | origin= secondary
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+LOCAL'S GUIDE for Best Pizza in NYC + MAP | status= rejected | origin= roundup
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+Reddit | status= rejected | origin= roundup
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+THE 10 BEST Pizza Places in Brooklyn (Updated 2026) | status= rejected | origin= roundup
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+Brooklyn Pizza Walk to Discover New York's Best Slices 2023 | status= rejected | origin= roundup
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+L'Industrie Pizzeria review | status= rejected | origin= secondary
+    Business is a pizza place -> pass
+    Business is located in Brooklyn -> pass
+    Repeated positive mentions from reputable local guides -> uncertain
+
+------------------------------------------------------------------------
+Cell 10 (markdown)
+------------------------------------------------------------------------
+## Why This Baseline Goes Wrong
+
+The current app logic is easiest to reason about as a page-first pipeline:
+
+- search returns pages
+- discovery creates entity rows from page titles
+- extraction tries to reinterpret a page as a business/entity
+- ranking only weakly filters obvious document rows
+
+That is why tours, listicles, and discussion pages can survive much longer than they should. Use this notebook as the baseline when you refactor prompts, control flow, row lineage, and entity-vs-document separation.
+
+========================================================================

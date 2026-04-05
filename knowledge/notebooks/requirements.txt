@@ -1,0 +1,18 @@
+# Python deps for knowledge/notebooks/*.ipynb (live API notebooks)
+#
+# IMPORTANT: This repo's .venv is Python 3.11. If `source .venv/bin/activate` then
+# `python` still points at system Python 3.12, pip installs there — not into .venv.
+# Always use the venv binary explicitly:
+#   .venv/bin/python -m pip install -r knowledge/notebooks/requirements.txt
+#
+# In Jupyter / Cursor: pick the kernel/interpreter
+#   .../agentic-insights-dashboard/.venv/bin/python
+# (Command Palette → "Notebook: Select Notebook Kernel" or Python: Select Interpreter)
+
+requests>=2.28.0
+ipykernel>=6.29.0
+
+# Export notebooks to .txt: `nbformat` only (default: no execution).
+# Optional --execute flag needs nbclient.
+nbformat>=5.8.0
+nbclient>=0.8.0

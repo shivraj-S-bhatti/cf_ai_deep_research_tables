@@ -3,10 +3,10 @@
 ## Document Metadata
 
 - `Doc ID`: `context.current-decisions`
-- `Version`: `1.2.0`
+- `Version`: `1.4.1`
 - `Status`: `authoritative`
 - `Kind`: `decision-record`
-- `Last Updated`: `2026-04-03`
+- `Last Updated`: `2026-04-05`
 - `Authority`: This is the current source of truth for active project decisions unless replaced by a newer authoritative doc with the same scope.
 - `Supersedes`: `none`
 
@@ -19,13 +19,20 @@
 - Preserve external review/context notes in-repo, but keep them separate from binding project decisions.
 - Re-center future functionality around generic entity discovery with evidence-backed cells, not people-search-specific framing.
 - Clean out template and legacy Lovable scaffolding when it does not affect the current UI shell.
-- Maintain the docs registry and metadata system so we can distinguish authoritative docs from working notes and flavor/context text.
+- Maintain the knowledge registry and metadata system so we can distinguish authoritative docs, notebooks, working notes, and flavor/context text.
 - Build v0.1 as a single Cloudflare Worker codebase with `/api/v1/*`, fixture-backed locally until real Cloudflare resources and provider keys are available.
 - Keep the local runtime hybrid: deterministic fixtures for tests, live Brave + Gemini for operator-driven local development when secrets are available.
 - Use D1 as the future source of truth and KV as cache only; never model live run state around KV semantics.
 - Treat progressive rendering as a binding contract: rows appear early, pending cells show loaders, weak terminal cells stay explicit, and dashes appear only for terminal blanks.
 - Expose observability and budget usage inside the app, not only in logs.
-- Treat the app as an engineer-facing system demo during this phase: execution internals, checkpoints, tool calls, and reward-style runtime proxies should be inspectable in the UI.
+- Keep the main product path restrained by default:
+  - query
+  - plan
+  - table
+  - details
+  - evidence
+  - small execution summary
+- Keep the full execution trace, tool/function calls, provider ledger, raw payloads, and debug metrics in a separate engineer-facing debug workspace.
 - Use richer row processing states than a binary pending/finalized model:
   - `pending`
   - `verifying`
@@ -33,6 +40,12 @@
   - `failed`
 - Keep rejected rows visible in a dedicated unmatched section instead of mixing them into the accepted result partition.
 - Distinguish `not_found` from `unsupported` clearly in detail views even if both compact to a dash in the table.
+- Prefer stage/module language over anthropomorphic agent language in the product path.
+- Treat candidate-document vs candidate-entity separation as a core quality concern, not a later polish item.
+- Maintain row lineage explicitly:
+  - suggesting sources
+  - grounding sources
+  - source origin class
 - Guard free-tier provider usage explicitly:
   - cap candidate fan-out per run
   - cap LLM extraction calls per run
@@ -50,3 +63,8 @@
   - `cells extracted`
   - `criteria evaluated`
   - `final ranking committed`
+- Treat constant-factor request explosion as the immediate performance target:
+  - no row-detail fan-out during active polling
+  - no debug trace loading in the normal workspace
+  - product path should poll compact summaries only
+- Client thread list synchronization: guard overlapping `listThreads` results with a generation counter; avoid tying full-list refetch to every `activeThreadId` change when hydration and mutations already update `threads`; after `createThread`, hydrate (upsert) the new thread **before** setting `activeThreadId` so repair logic cannot repoint to an unrelated thread. Details: [ARCHITECTURE.md](../../ARCHITECTURE.md).

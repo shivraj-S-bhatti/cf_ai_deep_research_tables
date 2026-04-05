@@ -1,79 +1,160 @@
 # Deep Research Datasets
 
-Deep Research Datasets is an evidence-backed entity discovery system built for the Agentic Search Challenge. Given a topic query such as `best pizza places in Brooklyn`, `open source database tools`, or `YC W24 healthcare startups`, it is intended to search the web, extract candidate entities from source documents, merge them into a structured table, and keep each populated value traceable to supporting evidence.
+**`query_raw` → grounded entity table**  
+Brave search · Gemini planning/extraction · Cloudflare Worker
 
-## What The System Does
+---
 
-The product flow is straightforward. A user enters a topic query, the system turns that query into a structured research plan, searches the web for relevant sources, fetches and parses those pages, extracts entity candidates and their attributes, merges repeated mentions across sources, and returns a table where filled cells can be inspected back to the text that justified them. The UI is designed around that workflow: query, plan, results, row details, sources, and evidence.
+## The Hard Problems
 
-## Approach
+**1. Entity kind from raw query**
+- Query names no type. Planner must infer from intent.
+- `"best pizza in Brooklyn"` → `restaurant`
+- `"YC W24 healthcare startups"` → `startup`
+- Wrong kind → wrong checks → wrong search targets
 
-The backend is organized as a retrieval and extraction pipeline rather than a generic chat loop. It plans the query, generates search variants, gathers web results, parses the resulting documents, extracts entity information, deduplicates repeated mentions, verifies ambiguous claims, and ranks the resulting rows.
+**2. Checks from raw query**
+- Hidden marks in user intent: location, cohort, category, date
+- Split: `hard_filter` (must pass) vs `soft_signal` (weight toward)
+- Output shape per check: `{label, kind, fieldHint, operatorHint, valueHint}`
+- Planner must not collapse all marks into keyword variants of the query
 
-The key modeling distinction is between three different objects:
+**3. Query → planner input**
+- `query_raw` → `{entityType, criteria[], columns[], searchQueries[], budgets}`
+- Search queries must seek missing proof — not rewrites of the same query
+- Failing here means all downstream stages run on the wrong search space
 
-- **Source documents**: pages such as guides, directories, official sites, review pages, or forum threads.
-- **Entity mentions**: one or more candidate entities extracted from those documents.
-- **Final rows**: merged entities that survive filtering, verification, and ranking.
+**4. Page ≠ Row**
+- Roundup page → many entity candidates, not one row
+- Official site → one entity, many facts
+- Forum thread → weak backing only
+- Must class the page before pulling; wrong class → wrong row count
+- This is the biggest single source of bad output
 
-That separation matters because the challenge is not to return URLs. It is to return entities with grounded attributes. A page may mention many entities, and many pages may refer to the same entity.
+**5. Folding across pages**
+- Same thing named differently across Yelp, official site, guide, review
+- Group by: `normName(a) == normName(b)` OR `jaccardTokens(a,b) ≥ 0.5`
+- Merge: keep highest-weight cell per key; keep highest-weight check per label
+- URL-only dedup cannot catch this
 
-## Design Tradeoffs And What We Learned
+**6. Cell traceability**
+- Every filled cell must carry backing text (`evidenceText`)
+- Weight drives merge winner; lower-weight cell is dropped, not blended
+- Null policy: `dash` — not blank string
 
-The theoretically stronger design is document-first: classify the source, extract all matching entities from it, merge those mentions across sources, and only then rank the final rows. Our first serious implementation drifted toward a page-first pipeline, where search results became provisional rows too early. That turned out to be the core quality problem.
+---
 
-The most important lessons from the build were:
+## Run State Machine
 
-- Query reconstruction matters more than naive lexical variants. Appending words like `official` or `source` to a query does not create genuinely better coverage; better rewritten queries target missing evidence and different source types.
-- Document classification matters before extraction. A roundup page, an official site, a directory, and a forum thread should not be treated the same way.
-- Roundup pages should expand into many candidates, not one row. A “10 best pizza places” article is valuable because it names entities, not because the article itself is the entity.
-- Retrieval and ranking heuristics are only useful after row semantics are correct. If the row is actually a guide page, no ranking formula will save the result.
-- Progressive UI and explicit debug surfaces were useful, but over-instrumentation in the main product path made the app harder to reason about.
-- The biggest practical performance gains came from reducing request fan-out, lazy-loading row details, and separating normal product polling from debug polling.
+```mermaid
+stateDiagram-v2
+    [*] --> Plan : query_raw
+    Plan --> Search : entityType + checks + columns + searchQueries
+    Search --> Fetch : urls[]
+    Fetch --> Class : page body
+    Class --> Pull : sourceClass
+    Pull --> Fold : mentions[]
+    Fold --> Weigh : canonical rows
+    Weigh --> Rank : rowStatus per row
+    Rank --> Export : scored rows
+    Export --> [*]
 
-## Current Implementation
+    Weigh --> Fetch : table gaps → re-fetch
+    Weigh --> Search : table gaps → re-search
+```
 
-The current repo includes a working frontend shell, a Worker-style `/api/v1/*` runtime, live Brave search integration, and Gemini-based planning, extraction, and verification paths. The product surface supports query entry, editable criteria and columns, progressive result rendering, row details, source inspection, and export.
+`sourceClass`: `roundup` · `entity_page` · `official` · `directory` · `forum`
 
-At the same time, the runtime is still in transition. Local execution still relies more on in-memory state than the intended persistent Cloudflare architecture. The live path is real, but the deterministic test path still uses fixture-backed behavior so tests can run without burning provider quota. In other words, the repo demonstrates the right product shape and several real integrations, but the search and extraction logic is still being hardened.
+---
+
+## Three Objects
+
+|  | What | Not |
+|---|---|---|
+| **page** | Fetched doc. Has `sourceClass`. | Not a row. |
+| **mention** | One candidate pulled from one page. | May share name with mentions from other pages. |
+| **row** | Merged canonical thing. Cells from best mention per key. | Not a page. |
+
+---
+
+## Row States
+
+**kind:** `accepted` · `rejected` · `uncertain` · `conflict`  
+**step:** `pending` · `verifying` · `finalized` · `failed`
+
+---
+
+## Fold Logic (`dedup.ts`)
+
+```
+normName(s):
+  lowercase → strip (the|a|an) → strip non-alphanumeric → collapse spaces
+
+jaccardTokens(a, b):
+  tokenSet(a), tokenSet(b) → |intersect| / |union|
+
+group if:
+  normName(a) == normName(b)
+  OR jaccardTokens(a, b) >= 0.5
+
+merge group:
+  seed      = highest-score row
+  cells     = max-weight per key across group
+  checks    = max-weight per label across group
+  rowStatus = conflict > uncertain > rejected > accepted
+  score     = max across group
+```
+
+---
+
+## Cost Shape
+
+| Stage | Bound |
+|---|---|
+| Plan | O(1) |
+| Search | O(Q + S) |
+| Fetch | O(S) |
+| Pull | O(R × C) |
+| Weigh | O(R × K) |
+
+`Q`=queries · `S`=pages · `R`=rows · `C`=columns · `K`=checks
+
+Blowup in practice: not asymptotic. Per-row polling and repeated full-event transfer were the real hotspots.
+
+---
+
+## Open Gaps
+
+- Roundup expansion: should yield N rows; currently yields 1
+- Cross-page fold too weak for local business queries
+- Page misclass silently routes to wrong pull path
+- Long roundup pages time out on single-call extraction
+- Local run: in-memory, not D1/KV/Queue
+
+---
 
 ## Setup
 
-Install dependencies and start the local app:
-
 ```bash
 npm install
-npm run dev
+npm run dev   # → http://localhost:8080
 ```
 
-The app runs on `http://localhost:8080`.
+Copy `.env.local.example` → `.env.local` for live Brave + Gemini keys.
 
-To run with live providers, copy [.env.local.example](.env.local.example) to `.env.local` and fill in the provider keys. If you want the same configuration for Wrangler local development, copy [.dev.vars.example](.dev.vars.example) to `.dev.vars`.
+| Script | |
+|---|---|
+| `npm run dev:live` | live keys |
+| `npm run build` | build |
+| `npm run test` | unit |
+| `npm run test:e2e` | e2e |
+| `npm run cf:deploy` | deploy |
 
-Useful scripts:
-
-```bash
-npm run dev
-npm run dev:live
-npm run build
-npm run lint
-npm run test
-npm run test:e2e
-npm run cf:deploy
-```
-
-## Known Limitations
-
-- Entity/document separation is still the hardest correctness problem in the runtime.
-- Roundup and multi-entity extraction remain the main quality and latency bottlenecks, especially on long pages.
-- Canonicalization across sources is still weaker than it should be for local business and review-heavy queries.
-- Cost tracking is currently estimated telemetry, not exact provider billing.
-- The local runtime is not yet the full D1/KV/Queue target architecture described in the deeper docs.
+---
 
 ## Further Reading
 
-- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
-- API contract: [OPENAPI.yaml](OPENAPI.yaml)
-- Submission draft: [knowledge/submission/assignment-submission-draft.md](knowledge/submission/assignment-submission-draft.md)
-- Retrospective writeup: [knowledge/blog/pages-are-not-entities-draft.md](knowledge/blog/pages-are-not-entities-draft.md)
-- Investigation notebooks: [knowledge/notebooks](knowledge/notebooks)
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [OPENAPI.yaml](OPENAPI.yaml)
+- [Submission draft](knowledge/submission/assignment-submission-draft.md)
+- [Notebooks](knowledge/notebooks)

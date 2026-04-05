@@ -5,10 +5,12 @@ import type {
   PreviewRequest,
   PreviewResponse,
   RowDetailsResponse,
+  RunDiagnosticsResponse,
   RunDebugSummary,
   RunEventsResponse,
   RunResultsResponse,
   RunTraceResponse,
+  RuntimeDiagnosticsResponse,
   ResearchRun,
   ThreadDetailsResponse,
   ThreadsListResponse,
@@ -129,6 +131,14 @@ export const apiClient = {
 
   getRunDebug(runId: string, signal?: AbortSignal): Promise<RunDebugSummary> {
     return requestJson(`/api/v1/runs/${runId}/debug`, { signal });
+  },
+
+  getRuntimeDiagnostics(signal?: AbortSignal): Promise<RuntimeDiagnosticsResponse> {
+    return requestJson("/api/v1/debug/runtime", { signal });
+  },
+
+  getRunDiagnostics(runId: string, signal?: AbortSignal): Promise<RunDiagnosticsResponse> {
+    return requestJson(`/api/v1/runs/${runId}/debug/diagnostics`, { signal });
   },
 
   getRunTrace(

@@ -26,7 +26,7 @@ import {
 } from "@/components/ui/select";
 import type { RowDetailsResponse } from "@/lib/contracts";
 import { summarizeProductCounts } from "@/lib/runtime-policy";
-import { runLoadingHeadline } from "@/lib/run-stage-copy";
+import { describeActiveRunState, describePotentialStall, runLoadingHeadline } from "@/lib/run-stage-copy";
 import {
   isBlankTerminalCell,
   isPendingCell,
@@ -251,8 +251,6 @@ export function WorkspaceSidebar({
   const unresolvedCount = productCounts.uncertain + productCounts.conflict;
   const analyzed = productCounts.finalizedCount;
   const target = thread.targetResults;
-  const progressPct =
-    target > 0 ? Math.min(100, Math.round((analyzed / target) * 100)) : analyzed > 0 ? 100 : 0;
   const cacheLookups = (thread.metrics?.cacheHits ?? 0) + (thread.metrics?.cacheMisses ?? 0);
   const cacheHitRate =
     cacheLookups > 0 ? Math.round(((thread.metrics?.cacheHits ?? 0) / cacheLookups) * 100) : 0;
@@ -265,6 +263,16 @@ export function WorkspaceSidebar({
     stage: run?.stage ?? "idle",
     statusSummary: thread.statusSummary,
   });
+  const activeRunState = run
+    ? describeActiveRunState({
+        run,
+        targetResults: thread.targetResults,
+      })
+    : null;
+  const stallWarning = run ? describePotentialStall(run) : null;
+  const progressPct = runIsActive && activeRunState
+    ? activeRunState.progressPct
+    : target > 0 ? Math.min(100, Math.round((analyzed / target) * 100)) : analyzed > 0 ? 100 : 0;
 
   const detailCells = useMemo(() => {
     if (!selectedResult) return [];
@@ -316,6 +324,12 @@ export function WorkspaceSidebar({
                 <p className="text-[11px] font-medium text-foreground">{runBanner.headline}</p>
                 {runBanner.subline ? (
                   <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">{runBanner.subline}</p>
+                ) : null}
+                {runIsActive && activeRunState ? (
+                  <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground">{activeRunState.detail}</p>
+                ) : null}
+                {stallWarning ? (
+                  <p className="mt-1 text-[10px] leading-snug text-amber-700">{stallWarning}</p>
                 ) : null}
               </div>
               <Badge variant={runIsActive ? "secondary" : "outline"} className="shrink-0 text-[10px] font-mono">
@@ -455,7 +469,9 @@ export function WorkspaceSidebar({
               </div>
               <Progress value={progressPct} className="h-2" />
               <p className="text-[10px] text-muted-foreground font-mono">
-                {acceptedCount} accepted · {analyzed} / {target} analyzed
+                {runIsActive && activeRunState
+                  ? activeRunState.detail
+                  : `${acceptedCount} accepted · ${analyzed} / ${target} analyzed`}
               </p>
             </div>
           </div>

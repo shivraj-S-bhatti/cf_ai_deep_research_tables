@@ -12,6 +12,7 @@ import {
   isPendingCell,
   isWeakTerminalCell,
   type ColumnDefinition,
+  type ResearchRun,
   type SearchResult,
   type ThreadLifecyclePhase,
 } from "@/lib/types";
@@ -22,6 +23,8 @@ interface DataGridProps {
   results: SearchResult[];
   totalResultsCount: number;
   phase: ThreadLifecyclePhase;
+  run?: ResearchRun | null;
+  targetResults?: number;
   columns: ColumnDefinition[];
   selectedId: string | null;
   onSelect: (id: string) => void;
@@ -100,6 +103,8 @@ export function DataGrid({
   results,
   totalResultsCount,
   phase,
+  run = null,
+  targetResults = 0,
   columns,
   selectedId,
   onSelect,
@@ -111,6 +116,8 @@ export function DataGrid({
     visibleCount: primary.length + unmatched.length,
     totalCount: totalResultsCount,
     phase,
+    run,
+    targetResults,
   });
 
   const expandedPayload = useMemo(() => {
@@ -243,7 +250,15 @@ export function DataGrid({
               <TableCell colSpan={totalColumns} className="py-10 text-center">
                 <div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
                   {emptyState.kind === "loading" ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                  {emptyState.message}
+                  <div className="space-y-1 text-center">
+                    {emptyState.title ? (
+                      <div className="font-medium text-foreground">{emptyState.title}</div>
+                    ) : null}
+                    <div>{emptyState.message}</div>
+                    {emptyState.note ? (
+                      <div className="text-xs text-muted-foreground">{emptyState.note}</div>
+                    ) : null}
+                  </div>
                 </div>
               </TableCell>
             </TableRow>

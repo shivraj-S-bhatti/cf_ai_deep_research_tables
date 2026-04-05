@@ -27,7 +27,11 @@ export async function handleApiRequest(
 
   try {
     if (request.method === "GET" && getPathname(request) === "/api/v1/health") {
-      return jsonResponse({ ok: true, requestId, now: Date.now() });
+      return jsonResponse({ ok: true, requestId, instanceId: runtime.getInstanceId(), now: Date.now() });
+    }
+
+    if (request.method === "GET" && getPathname(request) === "/api/v1/debug/runtime") {
+      return jsonResponse(runtime.getRuntimeDiagnostics(), 200, { "x-request-id": requestId });
     }
 
     if (request.method === "POST" && getPathname(request) === "/api/v1/query-plans/preview") {
@@ -90,6 +94,12 @@ export async function handleApiRequest(
         const debug = runtime.getRunDebug(runId);
         if (!debug) return errorResponse(requestId, 404, "run_not_found", "Run not found.");
         return jsonResponse(debug, 200, { "x-request-id": requestId });
+      }
+
+      if (request.method === "GET" && parts[4] === "debug" && parts[5] === "diagnostics") {
+        const diagnostics = runtime.getRunDiagnostics(runId);
+        if (!diagnostics) return errorResponse(requestId, 404, "run_not_found", "Run not found.");
+        return jsonResponse(diagnostics, 200, { "x-request-id": requestId });
       }
 
       if (request.method === "GET" && parts[4] === "debug" && parts[5] === "trace") {

@@ -388,6 +388,42 @@ export type RunDebugSummary = {
   recentEvents: ActivityEvent[];
 };
 
+export type RunDiagnosticsResponse = {
+  instanceId: string;
+  runId: string;
+  inflight: boolean;
+  run: ResearchRun;
+  thread: ResearchThread | null;
+  counts: {
+    rows: number;
+    visibleRows: number;
+    cells: number;
+    sources: number;
+    evidence: number;
+    events: number;
+  };
+  stallWarning: string | null;
+  checkpoints: Array<{
+    label: string;
+    reached: boolean;
+  }>;
+  recentEvents: ActivityEvent[];
+};
+
+export type RuntimeDiagnosticsResponse = {
+  instanceId: string;
+  now: number;
+  threadCount: number;
+  threads: Array<{
+    threadId: string;
+    queryRaw: string;
+    phase: ThreadPhase;
+    latestRunId: string | null;
+    statusSummary: string;
+  }>;
+  inflightRunIds: string[];
+};
+
 export type RunTraceResponse = {
   runId: string;
   page: number;

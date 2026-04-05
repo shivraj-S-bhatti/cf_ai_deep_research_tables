@@ -14,6 +14,8 @@ import type {
   ResearchRun,
   ResultCell,
   ResultRow,
+  RunDiagnosticsResponse,
+  RuntimeDiagnosticsResponse,
   SearchQuery,
   SourceDocument,
   Evidence,
@@ -22,6 +24,7 @@ import type {
   UpdateThreadConfigRequest,
   UsageRecord,
 } from "../../lib/contracts";
+import { describePotentialStall } from "../../lib/run-stage-copy";
 import { buildThreadBundle, previewQuery, rebuildThreadBundle } from "../domain/planner";
 import { findScenario } from "../fixtures/scenarios";
 import {
@@ -248,11 +251,17 @@ type TraceToolCall = {
   cacheHit?: boolean;
 };
 
+type RunExecutionControl = {
+  requestControl: (timeoutMs?: number) => RequestControl;
+  armDeadline: (startedAt: number) => void;
+  dispose: () => void;
+  failIfWallClockExceeded: () => boolean;
+};
+
 export class AgenticSearchRuntime {
   private readonly store = new MemoryResearchStore();
   private readonly inflightRuns = new Map<string, Promise<void>>();
-  private readonly runAbortControllers = new Map<string, AbortController>();
-  private readonly runDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly instanceId = crypto.randomUUID();
   private config: RuntimeConfig;
   private readonly cache: RuntimeCache = {
     preview: new Map(),
@@ -270,6 +279,10 @@ export class AgenticSearchRuntime {
 
   listThreads(): ThreadsListResponse {
     return { threads: this.store.listThreadSnapshots() };
+  }
+
+  getInstanceId(): string {
+    return this.instanceId;
   }
 
   getThread(threadId: string): ThreadDetailsResponse | null {
@@ -352,6 +365,53 @@ export class AgenticSearchRuntime {
     return this.store.getDebugSummary(runId);
   }
 
+  getRuntimeDiagnostics(): RuntimeDiagnosticsResponse {
+    const threads = this.store.listThreadSnapshots().map((snapshot) => ({
+      threadId: snapshot.thread.id,
+      queryRaw: snapshot.thread.queryRaw,
+      phase: snapshot.thread.phase,
+      latestRunId: snapshot.thread.latestRunId,
+      statusSummary: snapshot.thread.statusSummary,
+    }));
+
+    return {
+      instanceId: this.instanceId,
+      now: now(),
+      threadCount: threads.length,
+      threads,
+      inflightRunIds: [...this.inflightRuns.keys()],
+    };
+  }
+
+  getRunDiagnostics(runId: string): RunDiagnosticsResponse | null {
+    const run = this.store.getRun(runId);
+    if (!run) return null;
+    const thread = this.store.getThreadSnapshot(run.threadId)?.thread ?? null;
+    const rows = this.store.listRows(runId);
+    const events = this.store.listEvents(runId);
+    const debug = this.store.getDebugSummary(runId);
+    const visibleRows = rows.filter((row) => row.duplicateOfRowId === null && row.lineage.groundedBySourceIds.length > 0);
+
+    return {
+      instanceId: this.instanceId,
+      runId,
+      inflight: this.inflightRuns.has(runId),
+      run,
+      thread,
+      counts: {
+        rows: rows.length,
+        visibleRows: visibleRows.length,
+        cells: this.store.listCells(runId).length,
+        sources: this.store.countSources(runId),
+        evidence: this.store.countEvidence(runId),
+        events: events.length,
+      },
+      stallWarning: describePotentialStall(run),
+      checkpoints: debug?.checkpoints ?? [],
+      recentEvents: events.slice(-10),
+    };
+  }
+
   getRunTrace(runId: string, page = 1, pageSize = 50) {
     return this.store.getTrace(runId, page, pageSize);
   }
@@ -369,9 +429,20 @@ export class AgenticSearchRuntime {
     if (!current) return null;
     if (["complete", "failed", "canceled"].includes(current.status)) return current;
     const canceled = this.store.cancelRun(runId);
-    this.clearRunDeadline(runId);
     this.markNonTerminalRowsFailed(runId);
-    this.abortRunRequests(runId, "Run canceled.");
+    this.store.addActivity(
+      runId,
+      stageEvent(
+        runId,
+        current.stage === "idle" ? "planning" : current.stage,
+        "skipped",
+        "Cancellation requested. The current provider call will stop after the in-flight request settles.",
+        {
+          actor: "runtime",
+          title: "Cancellation requested",
+        },
+      ),
+    );
     return canceled;
   }
 
@@ -444,13 +515,14 @@ export class AgenticSearchRuntime {
 
   private scheduleRun(runId: string): void {
     if (this.inflightRuns.has(runId)) return;
-    const promise = this.executeRun(runId)
+    const executionControl = this.createRunExecutionControl(runId);
+    const promise = this.executeRun(runId, executionControl)
       .catch(() => {
         // `runStage` already records terminal failure state; swallow here so the local dev server
         // does not crash on an unhandled rejection while background work is still observable in-app.
       })
       .finally(() => {
-        this.clearRunControl(runId);
+        executionControl.dispose();
         this.inflightRuns.delete(runId);
       });
     this.inflightRuns.set(runId, promise);
@@ -463,9 +535,9 @@ export class AgenticSearchRuntime {
     return providerResult.data;
   }
 
-  private async executeRun(runId: string): Promise<void> {
+  private async executeRun(runId: string, executionControl: RunExecutionControl): Promise<void> {
     if (shouldUseLiveProviders(this.config)) {
-      await this.executeLiveRun(runId);
+      await this.executeLiveRun(runId, executionControl);
       return;
     }
 
@@ -476,7 +548,7 @@ export class AgenticSearchRuntime {
     const scenario = findScenario(thread.thread.queryRaw);
     const criteriaByLabel = new Map(thread.criteria.map((criterion) => [criterion.label, criterion]));
 
-    await this.runStage(runId, "planning", async () => {
+    await this.runStage(runId, "planning", executionControl, async () => {
       const usage = usageRecord(runId, "llm", "fixture", "plan_query", 1, 120, false, 320, 84, {
         query: thread.thread.queryRaw,
       });
@@ -521,7 +593,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "discovery", async () => {
+    await this.runStage(runId, "discovery", executionControl, async () => {
       const maxLength = Math.max(thread.plan.searchQueries.length, scenario.candidates.length);
       for (let index = 0; index < maxLength; index += 1) {
         this.assertRunActive(runId);
@@ -631,7 +703,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "fetch", async () => {
+    await this.runStage(runId, "fetch", executionControl, async () => {
       for (const candidate of scenario.candidates) {
         this.assertRunActive(runId);
         for (const source of candidate.sources) {
@@ -703,7 +775,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "extraction", async () => {
+    await this.runStage(runId, "extraction", executionControl, async () => {
       for (const candidate of scenario.candidates) {
         this.assertRunActive(runId);
         const usage = usageRecord(runId, "llm", "fixture", "extract_candidate", 1, 110, false, 420, 96, {
@@ -759,7 +831,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "evaluation", async () => {
+    await this.runStage(runId, "evaluation", executionControl, async () => {
       for (const candidate of scenario.candidates) {
         this.assertRunActive(runId);
         const usage = usageRecord(runId, "llm", "fixture", "evaluate_candidate", 1, 90, false, 260, 74, {
@@ -814,7 +886,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "canonicalization", async () => {
+    await this.runStage(runId, "canonicalization", executionControl, async () => {
       this.store.addActivity(
         runId,
         stageEvent(runId, "canonicalization", "started", "Checking for duplicate entities and unstable canonical URLs.", {
@@ -829,7 +901,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "verification", async () => {
+    await this.runStage(runId, "verification", executionControl, async () => {
       const rows = this.store.listRows(runId);
       for (const row of rows.filter(
         (candidate) => candidate.status === "uncertain" || candidate.status === "conflict",
@@ -868,7 +940,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "ranking", async () => {
+    await this.runStage(runId, "ranking", executionControl, async () => {
       const usage = usageRecord(runId, "llm", "fixture", "rank_results", 1, 55, false, 120, 26, {});
       this.store.addUsage(runId, usage);
       const rankedRows = this.store
@@ -914,7 +986,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "export", async () => {
+    await this.runStage(runId, "export", executionControl, async () => {
       const usage = usageRecord(runId, "llm", "fixture", "export_results", 1, 35, false, 0, 0, {});
       this.store.addUsage(runId, usage);
       this.exportRun(runId, "json");
@@ -949,7 +1021,7 @@ export class AgenticSearchRuntime {
     }));
   }
 
-  private async executeLiveRun(runId: string): Promise<void> {
+  private async executeLiveRun(runId: string, executionControl: RunExecutionControl): Promise<void> {
     const run = this.store.getRun(runId);
     if (!run) return;
     const thread = this.store.getThreadSnapshot(run.threadId);
@@ -1098,8 +1170,9 @@ export class AgenticSearchRuntime {
             this.config.braveApiKey!,
             searchQuery,
             Math.min(this.config.searchResultsPerQuery, 4),
-            this.requestControlForRun(runId),
+            executionControl.requestControl(),
           );
+          this.assertRunActive(runId);
           const usage = usageRecord(runId, "search", "brave", "search_anchor_corroboration", 1, now() - startedAt, false, 0, 0, {
             query: queryText,
             anchor: anchor.canonicalName,
@@ -1133,6 +1206,15 @@ export class AgenticSearchRuntime {
                 anchor: anchor.canonicalName,
                 query: queryText,
                 urls: selected.map((entry) => this.normalizeUrl(entry.url)),
+                toolCalls: [
+                  this.toolCallFromUsage(usage, "Search for corroborating sources for an extracted anchor.", {
+                    input: queryText,
+                    output: this.stringifyForTrace({
+                      selectedUrls: selected.map((entry) => this.normalizeUrl(entry.url)),
+                      resultCount: results.length,
+                    }),
+                  }),
+                ],
               }),
             ),
           );
@@ -1413,7 +1495,7 @@ export class AgenticSearchRuntime {
       const nextFetched: FetchedDoc[] = [];
       const byUrl = new Map(discovered.map((result) => [this.normalizeUrl(result.url), result]));
       for (const rawUrl of urls) {
-        if (this.failRunIfWallClockExceeded(runId)) return nextFetched;
+        if (executionControl.failIfWallClockExceeded()) return nextFetched;
         this.assertRunActive(runId);
         const normalizedUrl = this.normalizeUrl(rawUrl);
         if (failedUrls.has(normalizedUrl) || fetchedUrls.has(normalizedUrl)) continue;
@@ -1443,8 +1525,9 @@ export class AgenticSearchRuntime {
           const parsed = await fetchAndParseDocument(normalizedUrl, this.config.fetchTextCharLimit, {
             jinaApiKey: this.config.jinaApiKey,
             entityType: thread.plan.entityType,
-            ...this.requestControlForRun(runId),
+            ...executionControl.requestControl(),
           });
+          this.assertRunActive(runId);
           const fetchLatency = now() - fetchStartedAt;
           const finalNorm = this.normalizeUrl(parsed.finalUrl);
           if (fetchedUrls.has(finalNorm)) {
@@ -1492,6 +1575,17 @@ export class AgenticSearchRuntime {
                 sourceUrl: parsed.finalUrl,
                 sourceClass: parsed.sourceClass,
                 mode,
+                toolCalls: [
+                  this.toolCallFromUsage(usage, "Fetch and normalize a candidate source page.", {
+                    input: normalizedUrl,
+                    output: this.stringifyForTrace({
+                      finalUrl: parsed.finalUrl,
+                      title: parsed.title,
+                      sourceClass: parsed.sourceClass,
+                      description: parsed.description,
+                    }),
+                  }),
+                ],
               }),
             ),
           );
@@ -1510,6 +1604,7 @@ export class AgenticSearchRuntime {
                 title: "Source fetch failed",
                 sourceUrl: normalizedUrl,
                 mode,
+                error: error instanceof Error ? error.message : "Unknown fetch failure",
               }),
             ),
           );
@@ -1527,7 +1622,7 @@ export class AgenticSearchRuntime {
     const extractDocs = async (docs: FetchedDoc[]): Promise<ExtractedEntityRow[]> => {
       const extracted: ExtractedEntityRow[] = [];
       for (const entry of docs) {
-        if (this.failRunIfWallClockExceeded(runId)) return extracted;
+        if (executionControl.failIfWallClockExceeded()) return extracted;
         const maybeAnchorKey = [...anchorCandidates.values()].find((anchor) =>
           anchor.followUpUrls.has(this.normalizeUrl(entry.parsed.finalUrl))
           || anchor.candidateWebsite === this.normalizeUrl(entry.parsed.finalUrl),
@@ -1565,8 +1660,9 @@ export class AgenticSearchRuntime {
             bodyText: entry.parsed.text,
           },
           entry.parsed.sourceClass,
-          this.requestControlForRun(runId),
+          executionControl.requestControl(),
         );
+        this.assertRunActive(runId);
         const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
           backend: providerResult.meta.backend,
           model: providerResult.meta.model,
@@ -1599,6 +1695,25 @@ export class AgenticSearchRuntime {
               sourceUrl: entry.parsed.finalUrl,
               sourceClass: entry.parsed.sourceClass,
               keptCount: kept.length,
+              toolCalls: [
+                this.toolCallFromUsage(usage, "Extract anchors or grounded fields from the fetched page.", {
+                  input: this.stringifyForTrace({
+                    query: thread.thread.queryRaw,
+                    url: entry.parsed.finalUrl,
+                    sourceClass: entry.parsed.sourceClass,
+                    title: entry.parsed.title || entry.result.title,
+                  }),
+                  output: this.stringifyForTrace(
+                    kept.map((row) => ({
+                      canonicalName: row.canonicalName,
+                      candidateWebsite: row.candidateWebsite,
+                      followUpUrls: row.followUpUrls,
+                      cellCount: row.cells.length,
+                      criteriaCount: row.criteria.length,
+                    })),
+                  ),
+                }),
+              ],
             }),
           ),
         );
@@ -1628,7 +1743,7 @@ export class AgenticSearchRuntime {
       return extractDocs(allowedItems);
     };
 
-    await this.runStage(runId, "planning", async () => {
+    await this.runStage(runId, "planning", executionControl, async () => {
       this.store.updateRun(runId, (current) => ({
         ...current,
         status: "running",
@@ -1654,7 +1769,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "discovery", async () => {
+    await this.runStage(runId, "discovery", executionControl, async () => {
       for (const query of thread.plan.searchQueries) {
         this.assertRunActive(runId);
         const cacheKey = `search:${query.text}`;
@@ -1670,8 +1785,9 @@ export class AgenticSearchRuntime {
             this.config.braveApiKey!,
             query,
             this.config.searchResultsPerQuery,
-            this.requestControlForRun(runId),
+            executionControl.requestControl(),
           );
+        this.assertRunActive(runId);
         const searchLatency = now() - searchStartedAt;
 
         if (!cachedResults) {
@@ -1701,13 +1817,21 @@ export class AgenticSearchRuntime {
         }));
         this.store.addActivity(
           runId,
-          stageEvent(runId, "discovery", "started", `Issued Brave search query: ${query.text}`, {
+          stageEvent(runId, "discovery", "completed", `Issued Brave search query: ${query.text}`, {
             actor: actorForStage("discovery"),
             title: "Discovering candidates",
-            checkpoint: "candidate rows created",
             query: query.text,
             results: searchResults.length,
             cacheHit: Boolean(cachedResults),
+            toolCalls: [
+              this.toolCallFromUsage(searchUsage ?? cacheUsage, "Search for source pages for the current query.", {
+                input: query.text,
+                output: this.stringifyForTrace({
+                  resultCount: searchResults.length,
+                  topUrls: searchResults.slice(0, 5).map((entry) => this.normalizeUrl(entry.url)),
+                }),
+              }),
+            ],
           }),
         );
 
@@ -1717,9 +1841,9 @@ export class AgenticSearchRuntime {
       }
     });
     if (this.shouldStop(runId)) return;
-    if (this.failRunIfWallClockExceeded(runId)) return;
+    if (executionControl.failIfWallClockExceeded()) return;
 
-    await this.runStage(runId, "fetch", async () => {
+    await this.runStage(runId, "fetch", executionControl, async () => {
       const initialFetchLimit = computeFetchBatchSize({
         iteration: 0,
         targetResults: thread.thread.targetResults,
@@ -1731,16 +1855,16 @@ export class AgenticSearchRuntime {
       fetchedDocs.push(...fetched);
     });
     if (this.shouldStop(runId)) return;
-    if (this.failRunIfWallClockExceeded(runId)) return;
+    if (executionControl.failIfWallClockExceeded()) return;
 
-    await this.runStage(runId, "extraction", async () => {
+    await this.runStage(runId, "extraction", executionControl, async () => {
       const extracted = await extractWithinBudget(fetchedDocs, "initial extraction");
       processExtractedRows(extracted, fetchedDocs);
     });
     if (this.shouldStop(runId)) return;
-    if (this.failRunIfWallClockExceeded(runId)) return;
+    if (executionControl.failIfWallClockExceeded()) return;
 
-    await this.runStage(runId, "evaluation", async () => {
+    await this.runStage(runId, "evaluation", executionControl, async () => {
       this.store.addActivity(
         runId,
         stageEvent(runId, "evaluation", "completed", "Criteria are captured during extraction and merged per entity.", {
@@ -1752,7 +1876,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "canonicalization", async () => {
+    await this.runStage(runId, "canonicalization", executionControl, async () => {
       const rows = this.store.listRows(runId).filter((row) => row.duplicateOfRowId === null);
       const seen = new Map<string, string>();
       for (const row of rows) {
@@ -1770,10 +1894,10 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "refinement", async () => {
+    await this.runStage(runId, "refinement", executionControl, async () => {
       let iteration = 1;
       while (!this.shouldStop(runId) && hasExtractionBudgetRemaining(extractionBudget)) {
-        if (this.failRunIfWallClockExceeded(runId)) return;
+        if (executionControl.failIfWallClockExceeded()) return;
         const groundedCount = visibleGroundedRows().length;
         if (shouldStopExploration(groundedCount, thread.thread.targetResults)) {
           break;
@@ -1835,7 +1959,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "ranking", async () => {
+    await this.runStage(runId, "ranking", executionControl, async () => {
       const rankedRows = this.store
         .listRows(runId)
         .filter((row) => row.duplicateOfRowId === null)
@@ -1888,7 +2012,7 @@ export class AgenticSearchRuntime {
     });
     if (this.shouldStop(runId)) return;
 
-    await this.runStage(runId, "export", async () => {
+    await this.runStage(runId, "export", executionControl, async () => {
       this.exportRun(runId, "json");
       this.exportRun(runId, "csv");
       this.store.addActivity(
@@ -1958,6 +2082,7 @@ export class AgenticSearchRuntime {
   private async runStage(
     runId: string,
     stage: ActivityStage,
+    executionControl: RunExecutionControl,
     work: () => Promise<void>,
   ): Promise<void> {
     const currentRun = this.store.getRun(runId);
@@ -1980,7 +2105,7 @@ export class AgenticSearchRuntime {
       };
     });
     if (updatedRun?.startedAt) {
-      this.armRunDeadline(runId, updatedRun.startedAt);
+      executionControl.armDeadline(updatedRun.startedAt);
     }
     this.store.addActivity(
       runId,
@@ -2041,53 +2166,6 @@ export class AgenticSearchRuntime {
     }
   }
 
-  private getOrCreateRunAbortController(runId: string): AbortController {
-    const existing = this.runAbortControllers.get(runId);
-    if (existing && !existing.signal.aborted) return existing;
-    const controller = new AbortController();
-    this.runAbortControllers.set(runId, controller);
-    return controller;
-  }
-
-  private requestControlForRun(runId: string, timeoutMs = this.config.requestTimeoutMs): RequestControl {
-    this.assertRunActive(runId);
-    const controller = this.getOrCreateRunAbortController(runId);
-    return {
-      signal: controller.signal,
-      timeoutMs,
-    };
-  }
-
-  private armRunDeadline(runId: string, startedAt: number): void {
-    if (this.config.maxRunWallClockMs <= 0) return;
-    if (this.runDeadlineTimers.has(runId)) return;
-    const remainingMs = Math.max(0, startedAt + this.config.maxRunWallClockMs - now());
-    const timeoutId = setTimeout(() => {
-      this.failRunForWallClockExceeded(runId);
-    }, remainingMs);
-    this.runDeadlineTimers.set(runId, timeoutId);
-  }
-
-  private clearRunDeadline(runId: string): void {
-    const timeoutId = this.runDeadlineTimers.get(runId);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      this.runDeadlineTimers.delete(runId);
-    }
-  }
-
-  private clearRunControl(runId: string): void {
-    this.clearRunDeadline(runId);
-    this.runAbortControllers.delete(runId);
-  }
-
-  private abortRunRequests(runId: string, message: string): void {
-    const controller = this.runAbortControllers.get(runId);
-    if (controller && !controller.signal.aborted) {
-      controller.abort(createAbortError(message));
-    }
-  }
-
   private markNonTerminalRowsFailed(runId: string): void {
     for (const row of this.store.listRows(runId)) {
       if (row.processingState === "finalized" || row.processingState === "failed") continue;
@@ -2098,6 +2176,59 @@ export class AgenticSearchRuntime {
     }
   }
 
+  private wallClockExceededMessage(): string {
+    return `Run exceeded maximum wall time (${Math.round(this.config.maxRunWallClockMs / 60_000)} min).`;
+  }
+
+  private createRunExecutionControl(runId: string): RunExecutionControl {
+    const controller = new AbortController();
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const abort = (message: string) => {
+      if (!controller.signal.aborted) {
+        controller.abort(createAbortError(message));
+      }
+    };
+    const clearDeadline = () => {
+      if (!deadlineTimer) return;
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    };
+    return {
+      requestControl: (timeoutMs = this.config.requestTimeoutMs) => {
+        this.assertRunActive(runId);
+        return {
+          signal: controller.signal,
+          timeoutMs,
+        };
+      },
+      armDeadline: (startedAt: number) => {
+        if (this.config.maxRunWallClockMs <= 0 || deadlineTimer) return;
+        const remainingMs = Math.max(0, startedAt + this.config.maxRunWallClockMs - now());
+        deadlineTimer = setTimeout(() => {
+          const message = this.wallClockExceededMessage();
+          if (this.failRunForWallClockExceeded(runId)) {
+            abort(message);
+          }
+        }, remainingMs);
+      },
+      dispose: () => {
+        clearDeadline();
+      },
+      failIfWallClockExceeded: () => {
+        if (this.config.maxRunWallClockMs <= 0) return false;
+        const run = this.store.getRun(runId);
+        if (!run?.startedAt) return false;
+        if (now() - run.startedAt <= this.config.maxRunWallClockMs) return false;
+        const message = this.wallClockExceededMessage();
+        const failed = this.failRunForWallClockExceeded(runId);
+        if (failed) {
+          abort(message);
+        }
+        return failed;
+      },
+    };
+  }
+
   private failRunForWallClockExceeded(runId: string): boolean {
     const run = this.store.getRun(runId);
     if (!run?.startedAt) return false;
@@ -2105,7 +2236,7 @@ export class AgenticSearchRuntime {
     if (run.status === "complete" || run.status === "canceled" || run.status === "failed") return false;
 
     const stage = (run.stage === "idle" ? "planning" : run.stage) as ActivityStage;
-    const message = `Run exceeded maximum wall time (${Math.round(this.config.maxRunWallClockMs / 60_000)} min).`;
+    const message = this.wallClockExceededMessage();
     this.store.updateRun(runId, (current) => ({
       ...current,
       status: "failed",
@@ -2126,8 +2257,6 @@ export class AgenticSearchRuntime {
         checkpoint: "run terminated",
       }),
     );
-    this.clearRunDeadline(runId);
-    this.abortRunRequests(runId, message);
     return true;
   }
 
@@ -2162,15 +2291,6 @@ export class AgenticSearchRuntime {
     return evidence;
   }
 
-  /** Returns true if the run was marked failed (wall clock). */
-  private failRunIfWallClockExceeded(runId: string): boolean {
-    if (this.config.maxRunWallClockMs <= 0) return false;
-    const run = this.store.getRun(runId);
-    if (!run?.startedAt) return false;
-    if (now() - run.startedAt <= this.config.maxRunWallClockMs) return false;
-    return this.failRunForWallClockExceeded(runId);
-  }
-
   private assertRunActive(runId: string): void {
     const run = this.store.getRun(runId);
     if (!run) {
@@ -2202,6 +2322,20 @@ export class AgenticSearchRuntime {
       costUsd: usage.estimatedCostUsd,
       cacheHit: usage.cacheHit,
     };
+  }
+
+  private truncateForTrace(value: string, limit = 1200): string {
+    if (value.length <= limit) return value;
+    return `${value.slice(0, limit)}…`;
+  }
+
+  private stringifyForTrace(value: unknown, limit = 1200): string {
+    if (typeof value === "string") return this.truncateForTrace(value, limit);
+    try {
+      return this.truncateForTrace(JSON.stringify(value, null, 2), limit);
+    } catch {
+      return this.truncateForTrace(String(value), limit);
+    }
   }
 
   private computeRewardSignals(runId: string, targetResults: number): Array<{

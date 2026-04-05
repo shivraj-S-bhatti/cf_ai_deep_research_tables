@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { RunDebugSummary, RunTraceResponse } from "@/lib/contracts";
 import { apiClient } from "@/lib/api-client";
+import { describePotentialStall } from "@/lib/run-stage-copy";
 import { mapActivityEventToAgentStep } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -179,6 +180,7 @@ export function DebugWorkspace({
   const filteredTrace = useMemo(() => filterTraceForRow(trace, traceFilter ?? null), [trace, traceFilter]);
 
   const groupedTrace = useMemo(() => (filteredTrace ? groupTrace(filteredTrace) : []), [filteredTrace]);
+  const stallWarning = debugSummary ? describePotentialStall(debugSummary.run) : null;
 
   const traceEventCount = filteredTrace?.events.length ?? 0;
   const traceTotal = trace?.total ?? 0;
@@ -249,6 +251,11 @@ export function DebugWorkspace({
             <span className="font-mono">{debugSummary.run.metrics.fetchCalls}</span>
           </span>
         </div>
+        {stallWarning ? (
+          <div className="rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            {stallWarning}
+          </div>
+        ) : null}
 
         <details className="rounded-md border bg-card" open>
           <summary className="cursor-pointer px-3 py-2 text-xs font-medium">Checkpoints</summary>

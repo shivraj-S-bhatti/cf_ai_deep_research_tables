@@ -8,9 +8,36 @@ describe("describeDataGridEmptyState", () => {
       visibleCount: 0,
       totalCount: 0,
       phase: "running",
+      run: {
+        status: "running",
+        stage: "extraction",
+        progress: {
+          queriesCompleted: 1,
+          sourcesFetched: 3,
+          rowsCreated: 0,
+          cellsResolved: 0,
+          totalQueries: 1,
+          totalRows: 0,
+        },
+        metrics: {
+          searchCalls: 1,
+          fetchCalls: 3,
+          llmCalls: 0,
+          cacheHits: 0,
+          cacheMisses: 0,
+          estimatedCostUsd: 0,
+          budgetConsumedUsd: 0,
+          elapsedMs: 20000,
+          stageDurationsMs: {},
+          providerBreakdown: [],
+        },
+      },
+      targetResults: 10,
     })).toEqual({
       kind: "loading",
-      message: "Research is running. Rows will appear as extraction completes.",
+      title: "Extracting candidate anchors",
+      message: "1/1 queries complete · 3 pages fetched · no grounded rows yet",
+      note: "Fetched pages, but still waiting on the first extraction response. This may be stalled.",
     });
   });
 

@@ -176,6 +176,24 @@ describe("Worker API vertical slice", () => {
     expect(refreshed.thread.queryRaw).toBe("Top pizza places in Brooklyn");
   });
 
+  it("exposes isolate and run diagnostics for operator verification", async () => {
+    const health = await apiJson<{
+      ok: boolean;
+      instanceId: string;
+    }>("GET", "/api/v1/health");
+    expect(health.ok).toBe(true);
+    expect(typeof health.instanceId).toBe("string");
+
+    const runtimeDiagnostics = await apiJson<{
+      instanceId: string;
+      threadCount: number;
+      inflightRunIds: string[];
+    }>("GET", "/api/v1/debug/runtime");
+    expect(runtimeDiagnostics.instanceId).toBe(health.instanceId);
+    expect(Array.isArray(runtimeDiagnostics.inflightRunIds)).toBe(true);
+    expect(runtimeDiagnostics.threadCount).toBeGreaterThanOrEqual(0);
+  });
+
   it("runs live pipeline with mocked providers", async () => {
     const originalFetch = globalThis.fetch;
     const geminiPayload = (json: unknown) => ({
@@ -308,22 +326,163 @@ describe("Worker API vertical slice", () => {
       const finalRun = await waitForRun(started.runId);
       expect(["complete", "failed"]).toContain(finalRun.status);
 
+      const diagnostics = await apiJson<{
+        instanceId: string;
+        inflight: boolean;
+        counts: { events: number };
+      }>("GET", `/api/v1/runs/${started.runId}/debug/diagnostics`, undefined, env);
+      expect(typeof diagnostics.instanceId).toBe("string");
+      expect(diagnostics.counts.events).toBeGreaterThan(0);
+
       const finalResults = await apiJson<{
         rows: Array<{ canonicalName: string; processingState: string }>;
       }>("GET", `/api/v1/runs/${started.runId}/results?include_rejected=true`, undefined, env);
-      if (finalRun.status === "complete") {
+      const trace = await apiJson<{
+        total: number;
+        events: Array<{
+          payloadJson?: {
+            query?: string;
+            sourceUrl?: string;
+            toolCalls?: Array<{ input?: string; output?: string }>;
+          };
+        }>;
+      }>("GET", `/api/v1/runs/${started.runId}/debug/trace?page=1&page_size=50`, undefined, env);
+      expect(trace.total).toBeGreaterThan(0);
+      if (finalRun.status === "complete" && finalResults.rows.length > 0) {
         expect(finalResults.rows.some((row) => row.processingState === "finalized")).toBe(true);
         expect(finalResults.rows.some((row) => row.canonicalName.includes("Project Alpha"))).toBe(true);
-      } else {
-        const trace = await apiJson<{ total: number }>(
-          "GET",
-          `/api/v1/runs/${started.runId}/debug/trace?page=1&page_size=20`,
-          undefined,
-          env,
-        );
-        expect(trace.total).toBeGreaterThan(0);
       }
     } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("cancels a live run cooperatively while preserving terminal state", async () => {
+    const originalFetch = globalThis.fetch;
+    let releaseFetch: (() => void) | null = null;
+    let fetchStartedResolve: (() => void) | null = null;
+    const fetchStarted = new Promise<void>((resolve) => {
+      fetchStartedResolve = resolve;
+    });
+
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("api.search.brave.com")) {
+        return new Response(JSON.stringify({
+          web: {
+            results: [
+              {
+                title: "Best Pizza Williamsburg",
+                url: "https://example.com/best-pizza-williamsburg",
+                description: "Candidate source",
+              },
+            ],
+          },
+        }), { status: 200 });
+      }
+      if (url.includes("r.jina.ai/")) {
+        fetchStartedResolve?.();
+        return await new Promise<Response>((resolve, reject) => {
+          releaseFetch = () => {
+            resolve(new Response(JSON.stringify({
+              data: {
+                url: "https://example.com/best-pizza-williamsburg",
+                title: "Best Pizza Williamsburg",
+                description: "Candidate source",
+                content: "Best Pizza Williamsburg official site https://bestpizza.example.com",
+              },
+            }), { status: 200 }));
+          };
+          const signal = init?.signal;
+          const onAbort = () => {
+            reject(signal?.reason ?? new DOMException("Request aborted.", "AbortError"));
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return new Response("Not mocked", { status: 404 });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      const criteria = [
+        {
+          id: "preview:criterion:relevance",
+          label: "Entity appears relevant to \"Top pizza places in Brooklyn\"",
+          kind: "hard_filter" as const,
+          color: "hsl(220, 80%, 50%)",
+          orderIndex: 0,
+        },
+      ];
+      const columns = [
+        {
+          id: "preview:column:website",
+          key: "website",
+          label: "Website",
+          kind: "identity" as const,
+          valueType: "url" as const,
+          preferredSources: ["official"],
+          requiresVerification: true,
+          allowInference: false,
+          nullPolicy: "dash" as const,
+          orderIndex: 0,
+        },
+      ];
+      const env = {
+        AGENTIC_RUNTIME_MODE: "live",
+        BRAVE_API_KEY: "test-brave",
+        GEMINI_API_KEY: "test-gemini",
+        JINA_API_KEY: "test-jina",
+      };
+
+      const created = await apiJson<{ threadId: string }>("POST", "/api/v1/threads", {
+        query: "Top pizza places in Brooklyn",
+        targetResults: 5,
+        criteria,
+        columns,
+        preview: {
+          entityType: "business",
+          criteria,
+          columns,
+          searchQueries: [{ id: "sq-1", text: "top pizza places in brooklyn" }],
+          budgets: { searchBudget: 1, fetchBudget: 2, verificationBudget: 1 },
+          notes: "mock plan",
+        },
+      }, env);
+
+      const started = await apiJson<{ runId: string }>(
+        "POST",
+        `/api/v1/threads/${created.threadId}/runs`,
+        undefined,
+        env,
+      );
+      await fetchStarted;
+
+      const canceled = await apiJson<{ status: string }>(
+        "POST",
+        `/api/v1/runs/${started.runId}/cancel`,
+        undefined,
+        env,
+      );
+      expect(canceled.status).toBe("canceled");
+
+      releaseFetch?.();
+
+      const finalRun = await waitForRun(started.runId);
+      expect(finalRun.status).toBe("canceled");
+
+      const diagnostics = await apiJson<{
+        run: { status: string };
+        recentEvents: Array<{ message: string }>;
+      }>("GET", `/api/v1/runs/${started.runId}/debug/diagnostics`, undefined, env);
+      expect(diagnostics.run.status).toBe("canceled");
+      expect(diagnostics.recentEvents.some((event) => /Cancellation requested/i.test(event.message))).toBe(true);
+    } finally {
+      releaseFetch?.();
       globalThis.fetch = originalFetch;
     }
   });

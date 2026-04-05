@@ -236,6 +236,7 @@ export class MemoryResearchStore {
     const events = this.listEvents(runId);
     const reached = new Set(
       events
+        .filter((event) => event.status === "completed")
         .map((event) => event.payloadJson.checkpoint)
         .filter((value): value is string => typeof value === "string"),
     );
@@ -364,6 +365,14 @@ export class MemoryResearchStore {
         if (rankA !== rankB) return rankA - rankB;
         return b.score - a.score;
       });
+  }
+
+  countSources(runId: string): number {
+    return this.runs.get(runId)?.sources.size ?? 0;
+  }
+
+  countEvidence(runId: string): number {
+    return this.runs.get(runId)?.evidence.size ?? 0;
   }
 
   upsertCell(runId: string, cell: ResultCell): void {
@@ -539,7 +548,17 @@ export class MemoryResearchStore {
       thread.thread.phase = "running";
       const rows = [...(this.runs.get(run.id)?.rows.values() ?? [])].filter((row) => row.duplicateOfRowId === null);
       const summary = summarizeProductCounts(rows);
-      thread.thread.statusSummary = `${summary.accepted} accepted · ${summary.inFlightCount} in-flight`;
+      const detailParts = [
+        `${summary.accepted} accepted`,
+        `${run.progress.sourcesFetched} pages fetched`,
+      ];
+      if (run.progress.totalQueries > 0) {
+        detailParts.push(`${run.progress.queriesCompleted}/${run.progress.totalQueries} queries`);
+      }
+      if (run.progress.rowsCreated === 0) {
+        detailParts.push("no grounded rows yet");
+      }
+      thread.thread.statusSummary = detailParts.join(" · ");
       return;
     }
     if (run.status === "complete") {

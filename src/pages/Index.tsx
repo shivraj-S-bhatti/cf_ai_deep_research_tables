@@ -362,13 +362,15 @@ const Index = () => {
                 />
               </div>
               <div className="flex-1 overflow-hidden p-4 min-w-0 min-h-0">
-                <DataGrid
-                  results={displayed}
-                  totalResultsCount={activeThread.results.length}
-                  phase={activeThread.phase}
-                  columns={activeThread.columns}
-                  selectedId={selectedId}
-                  onSelect={setSelectedId}
+        <DataGrid
+          results={displayed}
+          totalResultsCount={activeThread.results.length}
+          phase={activeThread.phase}
+          run={activeThread.latestRun}
+          targetResults={activeThread.targetResults}
+          columns={activeThread.columns}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
                 />
               </div>
             </div>

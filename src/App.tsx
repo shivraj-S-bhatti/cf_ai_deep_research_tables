@@ -12,6 +12,8 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Index />} />
+          <Route path="/threads/new" element={<Index />} />
+          <Route path="/threads/:threadId" element={<Index />} />
           <Route path="/threads/:threadId/debug" element={<DebugRun />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

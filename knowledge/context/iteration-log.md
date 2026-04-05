@@ -113,6 +113,43 @@ The main shell uses those flags to:
 
 This does not shorten provider latency directly, but it makes the latency legible instead of looking broken.
 
+## Devlog Entry — 2026-04-05 (Route-driven preview bootstrap + bounded provider concurrency)
+
+### Symptom
+
+- Reloading `/` could jump back into the most recent thread because navigation was derived from in-memory thread presence instead of the URL.
+- New preview creation still felt blocked because thread bootstrap depended on preview generation.
+- Live runs were still paying avoidable serial latency because search, fetch, and extraction were mostly awaited one-by-one inside a single thread owner.
+
+### Root cause
+
+- `createThread` was still functionally planner-gated because the bundle builder synthesized a preview if one was not provided.
+- The client store still treated `activeThreadId` as a navigation primitive instead of a route consequence.
+- Durable Objects were correctly providing ownership, but that ownership boundary was being confused with a need for fully serial provider I/O.
+
+### Change
+
+- The shell is now route-driven:
+  - `/` stays home
+  - `/threads/new?query=...` is a draft bootstrap route
+  - `/threads/:threadId` is a concrete workspace
+- Thread bootstrap is now draft-first:
+  - create a thread immediately
+  - persist an empty plan with `statusSummary = "Building preview…"`
+  - navigate into the thread shell
+  - hydrate the live preview asynchronously
+- The default thread bootstrap no longer synthesizes a hidden heuristic preview.
+- Live provider work now uses bounded parallelism within a single thread owner:
+  - small concurrency for search
+  - small concurrency for fetch
+  - small concurrency for extraction
+
+### Result
+
+- Home reload no longer auto-opens the last thread.
+- Preview creation is no longer blocked on the planner before navigation.
+- One slow provider call no longer forces the whole discovery/fetch/extraction batch to remain fully serial.
+
 ## Devlog Entry — 2026-04-05 (Client thread store: `listThreads` vs `activeThreadId`)
 
 ### Symptom

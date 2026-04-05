@@ -45,6 +45,13 @@ describe("Worker API vertical slice", () => {
       entityType: string;
       criteria: Array<{ label: string }>;
       columns: Array<{ label: string }>;
+      searchQueries: Array<{ text: string }>;
+      budgets: {
+        searchBudget: number;
+        fetchBudget: number;
+        verificationBudget: number;
+      };
+      notes: string;
     }>("POST", "/api/v1/query-plans/preview", {
       query: "YC W24 healthcare startups",
       targetResults: 25,
@@ -63,6 +70,7 @@ describe("Worker API vertical slice", () => {
       targetResults: 25,
       criteria: preview.criteria,
       columns: preview.columns,
+      preview,
     });
 
     expect(created.phase).toBe("preview");
@@ -142,8 +150,16 @@ describe("Worker API vertical slice", () => {
 
   it("clears the stale run reference when the config is refreshed", async () => {
     const preview = await apiJson<{
+      entityType: string;
       criteria: Array<{ label: string }>;
       columns: Array<{ label: string }>;
+      searchQueries: Array<{ text: string }>;
+      budgets: {
+        searchBudget: number;
+        fetchBudget: number;
+        verificationBudget: number;
+      };
+      notes: string;
     }>("POST", "/api/v1/query-plans/preview", {
       query: "Open source LLM projects with >1k stars",
       targetResults: 25,
@@ -156,6 +172,7 @@ describe("Worker API vertical slice", () => {
       targetResults: 25,
       criteria: preview.criteria,
       columns: preview.columns,
+      preview,
     });
 
     const started = await apiJson<{ runId: string }>(
@@ -174,6 +191,41 @@ describe("Worker API vertical slice", () => {
     expect(refreshed.thread.phase).toBe("preview");
     expect(refreshed.thread.latestRunId).toBeNull();
     expect(refreshed.thread.queryRaw).toBe("Top pizza places in Brooklyn");
+  });
+
+  it("creates a draft thread immediately and blocks run start until preview is ready", async () => {
+    const created = await apiJson<{
+      threadId: string;
+      runId: string | null;
+      phase: string;
+    }>("POST", "/api/v1/threads", {
+      query: "Open source LLM projects with >1k stars",
+      targetResults: 10,
+    });
+
+    expect(created.phase).toBe("preview");
+    expect(created.runId).toBeNull();
+
+    const snapshot = await apiJson<{
+      thread: { statusSummary: string; entityType: string };
+      plan: { searchQueries: Array<{ text: string }> };
+      criteria: unknown[];
+      columns: unknown[];
+    }>("GET", `/api/v1/threads/${created.threadId}`);
+
+    expect(snapshot.thread.statusSummary).toBe("Building preview…");
+    expect(snapshot.thread.entityType).toBe("unknown");
+    expect(snapshot.plan.searchQueries).toHaveLength(0);
+    expect(snapshot.criteria).toHaveLength(0);
+    expect(snapshot.columns).toHaveLength(0);
+
+    const response = await apiRequest("POST", `/api/v1/threads/${created.threadId}/runs`);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        code: "preview_pending",
+      },
+    });
   });
 
   it("exposes isolate and run diagnostics for operator verification", async () => {
@@ -307,8 +359,16 @@ describe("Worker API vertical slice", () => {
       };
 
       const preview = await apiJson<{
+        entityType: string;
         criteria: Array<{ label: string }>;
         columns: Array<{ label: string }>;
+        searchQueries: Array<{ text: string }>;
+        budgets: {
+          searchBudget: number;
+          fetchBudget: number;
+          verificationBudget: number;
+        };
+        notes: string;
       }>("POST", "/api/v1/query-plans/preview", {
         query: "open source llm projects with >1k stars",
         targetResults: 5,
@@ -320,6 +380,7 @@ describe("Worker API vertical slice", () => {
         targetResults: 5,
         criteria: preview.criteria,
         columns: preview.columns,
+        preview,
       }, env);
 
       const started = await apiJson<{ runId: string }>("POST", `/api/v1/threads/${created.threadId}/runs`, undefined, env);

@@ -20,6 +20,22 @@ function normalizeTargetResults(value: number): number {
   return Math.max(1, Math.min(25, Math.round(value)));
 }
 
+function createDraftPlan(threadId: string, entityType: ResearchThread["entityType"], columns: ColumnSpec[]): QueryPlan {
+  return {
+    id: makeId("plan"),
+    threadId,
+    entityType,
+    hardFilters: [],
+    softSignals: [],
+    columns,
+    searchQueries: [],
+    searchBudget: 0,
+    fetchBudget: 0,
+    verificationBudget: 0,
+    notes: "Preview generation is still in progress.",
+  };
+}
+
 function humanizeCriterionLabel(label: string): string {
   const safeLabel = typeof label === "string" ? label : String(label ?? "");
   const trimmed = safeLabel.trim();
@@ -122,18 +138,14 @@ export function buildThreadBundle(input: CreateThreadRequest, threadId = makeId(
 } {
   const now = Date.now();
   const normalizedTargetResults = normalizeTargetResults(input.targetResults);
-  const resolvedPreview =
-    input.preview ??
-    previewQuery({
-      query: input.query,
-      targetResults: normalizedTargetResults,
-    });
-  const baseCriteria = input.criteria ?? resolvedPreview.criteria;
-  const baseColumns = input.columns ?? resolvedPreview.columns;
+  const resolvedPreview = input.preview ?? null;
+  const baseCriteria = input.criteria ?? resolvedPreview?.criteria ?? [];
+  const baseColumns = input.columns ?? resolvedPreview?.columns ?? [];
   const criteria = baseCriteria.map((criterion, index) =>
     normalizeCriterion(criterion, threadId, index),
   );
   const columns = baseColumns.map((column, index) => normalizeColumn(column, threadId, index));
+  const entityType = resolvedPreview?.entityType ?? "unknown";
 
   const thread: ResearchThread = {
     id: threadId,
@@ -143,27 +155,31 @@ export function buildThreadBundle(input: CreateThreadRequest, threadId = makeId(
     queryNormalized: normalizeFixtureQuery(input.query),
     phase: "preview",
     targetResults: normalizedTargetResults,
-    entityType: resolvedPreview.entityType,
-    statusSummary: "Ready to review the generated plan.",
+    entityType,
+    statusSummary: resolvedPreview
+      ? "Ready to review the generated plan."
+      : "Building preview…",
     latestRunId: null,
   };
 
-  const plan: QueryPlan = {
-    id: makeId("plan"),
-    threadId,
-    entityType: resolvedPreview.entityType,
-    hardFilters: criteria.filter((criterion) => criterion.kind === "hard_filter"),
-    softSignals: criteria.filter((criterion) => criterion.kind === "soft_signal"),
-    columns,
-    searchQueries: resolvedPreview.searchQueries.map((searchQuery, index) => ({
-      id: searchQuery.id || `${threadId}:search:${index}`,
-      text: searchQuery.text,
-    })),
-    searchBudget: resolvedPreview.budgets.searchBudget,
-    fetchBudget: resolvedPreview.budgets.fetchBudget,
-    verificationBudget: resolvedPreview.budgets.verificationBudget,
-    notes: resolvedPreview.notes,
-  };
+  const plan: QueryPlan = resolvedPreview
+    ? {
+        id: makeId("plan"),
+        threadId,
+        entityType: resolvedPreview.entityType,
+        hardFilters: criteria.filter((criterion) => criterion.kind === "hard_filter"),
+        softSignals: criteria.filter((criterion) => criterion.kind === "soft_signal"),
+        columns,
+        searchQueries: resolvedPreview.searchQueries.map((searchQuery, index) => ({
+          id: searchQuery.id || `${threadId}:search:${index}`,
+          text: searchQuery.text,
+        })),
+        searchBudget: resolvedPreview.budgets.searchBudget,
+        fetchBudget: resolvedPreview.budgets.fetchBudget,
+        verificationBudget: resolvedPreview.budgets.verificationBudget,
+        notes: resolvedPreview.notes,
+      }
+    : createDraftPlan(threadId, entityType, columns);
 
   return { thread, plan, criteria, columns };
 }
@@ -180,22 +196,21 @@ export function rebuildThreadBundle(
 } {
   const nextQuery = patch.query ?? thread.queryRaw;
   const nextTargetResults = normalizeTargetResults(patch.targetResults ?? thread.targetResults);
-  const resolvedPreview =
-    patch.preview ??
-    previewQuery({
-      query: nextQuery,
-      targetResults: nextTargetResults,
-    });
+  const resolvedPreview = patch.preview ?? null;
   const baseCriteria =
-    patch.criteria ?? resolvedPreview.criteria.map((criterion) => ({
+    patch.criteria
+    ?? resolvedPreview?.criteria.map((criterion) => ({
       ...criterion,
       threadId: thread.id,
-    }));
+    }))
+    ?? existingPlan.hardFilters.concat(existingPlan.softSignals);
   const baseColumns =
-    patch.columns ?? resolvedPreview.columns.map((column) => ({
+    patch.columns
+    ?? resolvedPreview?.columns.map((column) => ({
       ...column,
       threadId: thread.id,
-    }));
+    }))
+    ?? existingPlan.columns;
 
   const criteria = baseCriteria.map((criterion, index) =>
     normalizeCriterion(criterion, thread.id, index),
@@ -209,26 +224,35 @@ export function rebuildThreadBundle(
       queryRaw: nextQuery,
       queryNormalized: normalizeFixtureQuery(nextQuery),
       targetResults: nextTargetResults,
-      entityType: resolvedPreview.entityType,
+      entityType: resolvedPreview?.entityType ?? existingPlan.entityType,
       phase: "preview",
       latestRunId: null,
-      statusSummary: "Plan refreshed. Review criteria and columns before running.",
+      statusSummary: resolvedPreview
+        ? "Plan refreshed. Review criteria and columns before running."
+        : thread.statusSummary,
     },
-    plan: {
-      ...existingPlan,
-      entityType: resolvedPreview.entityType,
-      hardFilters: criteria.filter((criterion) => criterion.kind === "hard_filter"),
-      softSignals: criteria.filter((criterion) => criterion.kind === "soft_signal"),
-      columns,
-      searchQueries: resolvedPreview.searchQueries.map((searchQuery, index) => ({
-        id: searchQuery.id || `${thread.id}:search:${index}`,
-        text: searchQuery.text,
-      })),
-      searchBudget: resolvedPreview.budgets.searchBudget,
-      fetchBudget: resolvedPreview.budgets.fetchBudget,
-      verificationBudget: resolvedPreview.budgets.verificationBudget,
-      notes: resolvedPreview.notes,
-    },
+    plan: resolvedPreview
+      ? {
+          ...existingPlan,
+          entityType: resolvedPreview.entityType,
+          hardFilters: criteria.filter((criterion) => criterion.kind === "hard_filter"),
+          softSignals: criteria.filter((criterion) => criterion.kind === "soft_signal"),
+          columns,
+          searchQueries: resolvedPreview.searchQueries.map((searchQuery, index) => ({
+            id: searchQuery.id || `${thread.id}:search:${index}`,
+            text: searchQuery.text,
+          })),
+          searchBudget: resolvedPreview.budgets.searchBudget,
+          fetchBudget: resolvedPreview.budgets.fetchBudget,
+          verificationBudget: resolvedPreview.budgets.verificationBudget,
+          notes: resolvedPreview.notes,
+        }
+      : {
+          ...existingPlan,
+          hardFilters: criteria.filter((criterion) => criterion.kind === "hard_filter"),
+          softSignals: criteria.filter((criterion) => criterion.kind === "soft_signal"),
+          columns,
+        },
     criteria,
     columns,
   };

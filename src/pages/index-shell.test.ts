@@ -5,7 +5,7 @@ import { resolveWorkspaceShellMode } from "./index-shell";
 describe("resolveWorkspaceShellMode", () => {
   it("stays in booting mode until thread summaries load", () => {
     expect(resolveWorkspaceShellMode({
-      showNewSearch: false,
+      routeMode: "thread",
       threadsLoaded: false,
       threadCount: 0,
       activeThreadId: null,
@@ -15,17 +15,27 @@ describe("resolveWorkspaceShellMode", () => {
 
   it("renders home when there are no threads after loading", () => {
     expect(resolveWorkspaceShellMode({
-      showNewSearch: false,
+      routeMode: "home",
       threadsLoaded: true,
-      threadCount: 0,
+      threadCount: 3,
       activeThreadId: null,
       activeThreadPhase: null,
     })).toBe("home");
   });
 
+  it("keeps the draft route in preview-building mode", () => {
+    expect(resolveWorkspaceShellMode({
+      routeMode: "draft",
+      threadsLoaded: true,
+      threadCount: 3,
+      activeThreadId: null,
+      activeThreadPhase: null,
+    })).toBe("draft");
+  });
+
   it("uses loading mode while an active thread is being resolved", () => {
     expect(resolveWorkspaceShellMode({
-      showNewSearch: false,
+      routeMode: "thread",
       threadsLoaded: true,
       threadCount: 2,
       activeThreadId: "thread-1",
@@ -35,7 +45,7 @@ describe("resolveWorkspaceShellMode", () => {
 
   it("treats preview as its own shell mode", () => {
     expect(resolveWorkspaceShellMode({
-      showNewSearch: false,
+      routeMode: "thread",
       threadsLoaded: true,
       threadCount: 1,
       activeThreadId: "thread-1",
@@ -45,7 +55,7 @@ describe("resolveWorkspaceShellMode", () => {
 
   it("routes non-preview phases into the results shell", () => {
     expect(resolveWorkspaceShellMode({
-      showNewSearch: false,
+      routeMode: "thread",
       threadsLoaded: true,
       threadCount: 1,
       activeThreadId: "thread-1",

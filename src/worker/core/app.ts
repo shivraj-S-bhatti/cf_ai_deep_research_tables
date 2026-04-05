@@ -260,7 +260,13 @@ async function handleApiRequestLegacy(
 
     if (request.method === "POST" && parts[4] === "runs") {
       const run = runtime.createRun(threadId);
-      if (!run) return errorResponse(requestId, 404, "thread_not_found", "Thread not found.");
+      if (!run) {
+        const thread = runtime.getThread(threadId);
+        if (thread) {
+          return errorResponse(requestId, 409, "preview_pending", "Preview is still building for this thread.");
+        }
+        return errorResponse(requestId, 404, "thread_not_found", "Thread not found.");
+      }
       const inflight = runtime.getInflightPromise(run.runId);
       if (ctx && inflight) {
         ctx.waitUntil(inflight);

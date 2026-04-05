@@ -1,7 +1,9 @@
 import { useCallback, useRef, useState, useMemo, useEffect } from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { PanelLeft } from "lucide-react";
 import { InitialSearch } from "@/components/InitialSearch";
 import { PreviewStage } from "@/components/PreviewStage";
+import { PreviewBuildingStage } from "@/components/PreviewBuildingStage";
 import { ActionToolbar } from "@/components/ActionToolbar";
 import { DataGrid } from "@/components/DataGrid";
 import { WorkspaceSidebar } from "@/components/WorkspaceSidebar";
@@ -32,6 +34,9 @@ import type { RowDetailsResponse } from "@/lib/contracts";
 import { resolveWorkspaceShellMode } from "./index-shell";
 
 const Index = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const params = useParams<{ threadId?: string }>();
   const {
     threads,
     threadsLoaded,
@@ -59,13 +64,20 @@ const Index = () => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedRowDetail, setSelectedRowDetail] = useState<RowDetailsResponse | null>(null);
   const [selectedRowLoading, setSelectedRowLoading] = useState(false);
-  const [showNewSearch, setShowNewSearch] = useState(false);
   const [threadsPanelOpen, setThreadsPanelOpen] = useState(false);
   const [tableFilters, setTableFilters] = useState<TableFilterCondition[]>([]);
   const [sortKey, setSortKey] = useState<DatasetSortKey | null>(null);
   const [sortDir, setSortDir] = useState<DatasetSortDir>("asc");
   const [confirmDialog, setConfirmDialog] = useState(false);
+  const [draftPreviewError, setDraftPreviewError] = useState<string | null>(null);
+  const [draftRetryNonce, setDraftRetryNonce] = useState(0);
   const pendingActionRef = useRef<(() => Promise<void>) | null>(null);
+  const startedDraftRef = useRef<string | null>(null);
+  const routeMode = location.pathname === "/" ? "home" : location.pathname === "/threads/new" ? "draft" : "thread";
+  const draftQuery = useMemo(
+    () => new URLSearchParams(location.search).get("query")?.trim() ?? "",
+    [location.search],
+  );
 
   useEffect(() => {
     setTableFilters([]);
@@ -75,6 +87,32 @@ const Index = () => {
     setSelectedRowDetail(null);
     setSelectedRowLoading(false);
   }, [activeThreadId]);
+
+  useEffect(() => {
+    if (routeMode === "thread") {
+      const nextThreadId = params.threadId ?? null;
+      if (activeThreadId !== nextThreadId) {
+        setActiveThreadId(nextThreadId);
+      }
+      return;
+    }
+    if (activeThreadId !== null) {
+      setActiveThreadId(null);
+    }
+  }, [activeThreadId, params.threadId, routeMode, setActiveThreadId]);
+
+  useEffect(() => {
+    if (routeMode === "draft") return;
+    setDraftPreviewError(null);
+    startedDraftRef.current = null;
+  }, [routeMode]);
+
+  useEffect(() => {
+    if (routeMode !== "thread" || !threadsLoaded || !params.threadId) return;
+    if (!threads.some((thread) => thread.id === params.threadId)) {
+      navigate("/", { replace: true });
+    }
+  }, [navigate, params.threadId, routeMode, threads, threadsLoaded]);
 
   const displayed = useMemo(() => {
     if (!activeThread) return [];
@@ -88,6 +126,35 @@ const Index = () => {
   const selectedResult = activeThread?.results.find((r) => r.id === selectedId) ?? null;
   const debugHref =
     activeThread?.latestRunId ? `/threads/${activeThread.id}/debug?runId=${activeThread.latestRunId}` : null;
+
+  useEffect(() => {
+    if (routeMode !== "draft") return;
+    if (!draftQuery) {
+      navigate("/", { replace: true });
+      return;
+    }
+    const flowKey = `${draftQuery.toLowerCase()}::${draftRetryNonce}`;
+    if (startedDraftRef.current === flowKey || creatingPreviewThread) return;
+    startedDraftRef.current = flowKey;
+    setDraftPreviewError(null);
+
+    let canceled = false;
+    void createThread(draftQuery)
+      .then((thread) => {
+        if (canceled || !thread) return;
+        setThreadsPanelOpen(false);
+        navigate(`/threads/${thread.id}`, { replace: true });
+      })
+      .catch((error) => {
+        if (canceled) return;
+        startedDraftRef.current = null;
+        setDraftPreviewError(error instanceof Error ? error.message : "Could not build preview.");
+      });
+
+    return () => {
+      canceled = true;
+    };
+  }, [createThread, creatingPreviewThread, draftQuery, draftRetryNonce, navigate, routeMode]);
 
   useEffect(() => {
     if (!activeThread?.latestRunId || !selectedId) {
@@ -149,14 +216,13 @@ const Index = () => {
 
   const handleNewSearch = (query: string) => {
     guardConcurrentRun(async () => {
-      try {
-        await createThread(query);
-        setShowNewSearch(false);
-      } catch (error) {
-        toast.error("Could not create research thread", {
-          description: error instanceof Error ? error.message : "Unexpected error",
-        });
-      }
+      setSelectedId(null);
+      setSelectedRowDetail(null);
+      setDraftPreviewError(null);
+      setThreadsPanelOpen(false);
+      startedDraftRef.current = null;
+      setDraftRetryNonce(0);
+      navigate(`/threads/new?query=${encodeURIComponent(query)}`);
     });
   };
 
@@ -181,7 +247,8 @@ const Index = () => {
   };
 
   const handleNewThread = () => {
-    setShowNewSearch(true);
+    navigate("/");
+    setThreadsPanelOpen(false);
     setSelectedId(null);
     setSelectedRowDetail(null);
   };
@@ -205,12 +272,16 @@ const Index = () => {
     async (threadId: string) => {
       if (!window.confirm("Delete this research thread? This cannot be undone.")) return;
       try {
+        const deletingActiveThread = threadId === activeThreadId;
         if (threadId === activeThreadId) {
           setSelectedId(null);
           setSelectedRowDetail(null);
           setSelectedRowLoading(false);
         }
         await deleteThread(threadId);
+        if (deletingActiveThread) {
+          navigate("/");
+        }
         toast.success("Thread deleted");
       } catch (error) {
         toast.error("Could not delete thread", {
@@ -247,7 +318,7 @@ const Index = () => {
   };
 
   const shellMode = resolveWorkspaceShellMode({
-    showNewSearch,
+    routeMode,
     threadsLoaded,
     threadCount: threads.length,
     activeThreadId,
@@ -302,11 +373,12 @@ const Index = () => {
             >
               <ThreadList
                 threads={threads}
-                activeThreadId={shellMode === "home" ? null : activeThreadId}
+                activeThreadId={shellMode === "results" || shellMode === "preview" ? activeThreadId : null}
                 onSelectThread={(id) => {
-                  setActiveThreadId(id);
-                  setShowNewSearch(false);
+                  navigate(`/threads/${id}`);
+                  setThreadsPanelOpen(false);
                   setSelectedId(null);
+                  setSelectedRowDetail(null);
                 }}
                 onNewThread={handleNewThread}
                 onStopRun={(tid, rid) => void handleThreadStopRun(tid, rid)}
@@ -324,12 +396,29 @@ const Index = () => {
                 {shellMode === "booting" ? "Loading research threads…" : "Opening workspace…"}
               </p>
               <p className="mt-1 text-xs text-muted-foreground">
-                The current thread state is being hydrated from the worker.
+                {routeMode === "draft"
+                  ? "Generating the preview plan and creating the thread."
+                  : "The current thread state is being hydrated from the worker."}
               </p>
             </div>
           </div>
         ) : shellMode === "home" ? (
           <InitialSearch onSearch={handleNewSearch} isSubmitting={creatingPreviewThread} />
+        ) : shellMode === "draft" ? (
+          <PreviewBuildingStage
+            query={draftQuery}
+            isBuilding={creatingPreviewThread}
+            error={draftPreviewError}
+            onRetry={() => {
+              startedDraftRef.current = null;
+              setDraftRetryNonce((current) => current + 1);
+            }}
+            onBack={() => {
+              setDraftPreviewError(null);
+              startedDraftRef.current = null;
+              navigate("/");
+            }}
+          />
         ) : shellMode === "preview" && activeThread ? (
           <PreviewStage
             thread={activeThread}

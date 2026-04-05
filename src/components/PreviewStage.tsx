@@ -39,6 +39,7 @@ export function PreviewStage({
   const [newEnrichment, setNewEnrichment] = useState("");
   const [editingQuery, setEditingQuery] = useState(false);
   const [queryDraft, setQueryDraft] = useState(thread.query);
+  const previewReady = thread.criteria.length > 0 && thread.columns.length > 0;
 
   useEffect(() => {
     setQueryDraft(thread.query);
@@ -207,7 +208,7 @@ export function PreviewStage({
               </SelectContent>
             </Select>
           </div>
-          <Button onClick={onStartSearch} className="gap-2" disabled={isRefreshingPreview || isStartingRun}>
+          <Button onClick={onStartSearch} className="gap-2" disabled={!previewReady || isRefreshingPreview || isStartingRun}>
             {isStartingRun ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
@@ -216,6 +217,11 @@ export function PreviewStage({
             {isStartingRun ? "Starting research…" : "Run Search"}
           </Button>
         </div>
+        {!previewReady ? (
+          <p className="text-xs text-muted-foreground">
+            The preview is still building. Research can start after criteria and output columns load.
+          </p>
+        ) : null}
       </div>
     </div>
   );

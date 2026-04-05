@@ -344,8 +344,8 @@ export type PreviewResponse = {
 export type CreateThreadRequest = {
   query: string;
   targetResults: number;
-  criteria: Criterion[];
-  columns: ColumnSpec[];
+  criteria?: Criterion[];
+  columns?: ColumnSpec[];
   preview?: PreviewResponse;
 };
 

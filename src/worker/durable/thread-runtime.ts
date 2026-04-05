@@ -161,7 +161,13 @@ export class ThreadRuntimeDurableObject extends DurableObject<WorkerEnv> {
         const missing = this.ensureThreadBootstrapped(requestId);
         if (missing) return missing;
         const run = this.runtime.createRun(this.threadId!);
-        if (!run) return errorResponse(requestId, 404, "thread_not_found", "Thread not found.");
+        if (!run) {
+          const thread = this.runtime.getThread(this.threadId!);
+          if (thread) {
+            return errorResponse(requestId, 409, "preview_pending", "Preview is still building for this thread.");
+          }
+          return errorResponse(requestId, 404, "thread_not_found", "Thread not found.");
+        }
         await this.persistNow();
         const inflight = this.runtime.getInflightPromise(run.runId);
         this.ctx.waitUntil?.(inflight ?? Promise.resolve());

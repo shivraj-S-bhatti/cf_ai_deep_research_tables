@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Index from "./Index";
 import { useThreadStore } from "@/stores/thread-store";
 import type { Thread } from "@/lib/types";
@@ -128,7 +129,15 @@ describe("Index", () => {
       removeEnrichment: vi.fn(),
     });
 
-    render(<Index />);
+    render(
+      <MemoryRouter initialEntries={["/threads/thread-1"]}>
+        <Routes>
+          <Route path="/" element={<Index />} />
+          <Route path="/threads/:threadId" element={<Index />} />
+          <Route path="/threads/new" element={<Index />} />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Show research threads" }));
 
@@ -136,5 +145,85 @@ describe("Index", () => {
     expect(screen.getByText(`Active thread: ${thread.id}`)).toBeInTheDocument();
     expect(screen.getByText(thread.query)).toBeInTheDocument();
     expect(screen.getByText("Results Grid")).toBeInTheDocument();
+  });
+
+  it("stays on the home shell after reload even when threads exist", () => {
+    const thread = makeThread();
+
+    mockedUseThreadStore.mockReturnValue({
+      threads: [thread],
+      threadsLoaded: true,
+      activeThread: null,
+      activeThreadId: null,
+      creatingPreviewThread: false,
+      refreshingPreviewThreadId: null,
+      startingRunThreadId: null,
+      activeRun: null,
+      setActiveThreadId: vi.fn(),
+      createThread: vi.fn(),
+      fetchRowDetails: vi.fn(),
+      refreshQueryPlan: vi.fn(),
+      updateTarget: vi.fn(),
+      startRun: vi.fn(),
+      cancelRun: vi.fn(),
+      deleteThread: vi.fn(),
+      hydrateThread: vi.fn(),
+      addCriterion: vi.fn(),
+      removeCriterion: vi.fn(),
+      addEnrichment: vi.fn(),
+      removeEnrichment: vi.fn(),
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Routes>
+          <Route path="/" element={<Index />} />
+          <Route path="/threads/:threadId" element={<Index />} />
+          <Route path="/threads/new" element={<Index />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Initial Search")).toBeInTheDocument();
+    expect(screen.queryByText("Results Grid")).not.toBeInTheDocument();
+  });
+
+  it("renders the preview-building shell on the draft route", () => {
+    mockedUseThreadStore.mockReturnValue({
+      threads: [],
+      threadsLoaded: true,
+      activeThread: null,
+      activeThreadId: null,
+      creatingPreviewThread: true,
+      refreshingPreviewThreadId: null,
+      startingRunThreadId: null,
+      activeRun: null,
+      setActiveThreadId: vi.fn(),
+      createThread: vi.fn(),
+      fetchRowDetails: vi.fn(),
+      refreshQueryPlan: vi.fn(),
+      updateTarget: vi.fn(),
+      startRun: vi.fn(),
+      cancelRun: vi.fn(),
+      deleteThread: vi.fn(),
+      hydrateThread: vi.fn(),
+      addCriterion: vi.fn(),
+      removeCriterion: vi.fn(),
+      addEnrichment: vi.fn(),
+      removeEnrichment: vi.fn(),
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/threads/new?query=Top%20pizza%20places%20in%20Brooklyn"]}>
+        <Routes>
+          <Route path="/" element={<Index />} />
+          <Route path="/threads/:threadId" element={<Index />} />
+          <Route path="/threads/new" element={<Index />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Building structured preview")).toBeInTheDocument();
+    expect(screen.getByText("Top pizza places in Brooklyn")).toBeInTheDocument();
   });
 });

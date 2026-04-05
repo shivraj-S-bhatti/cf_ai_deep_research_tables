@@ -85,6 +85,28 @@ function now(): number {
   return Date.now();
 }
 
+async function mapConcurrent<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const concurrency = Math.max(1, Math.min(limit, items.length));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  return results;
+}
+
 function stageEvent(
   runId: string,
   stage: ActivityStage,
@@ -365,6 +387,9 @@ export class AgenticSearchRuntime {
   createRun(threadId: string): CreateRunResponse | null {
     const snapshot = this.store.getThreadSnapshot(threadId);
     if (!snapshot) return null;
+    if (snapshot.plan.searchQueries.length === 0) {
+      return null;
+    }
     const run: ResearchRun = {
       id: makeId("run"),
       threadId,
@@ -1104,6 +1129,9 @@ export class AgenticSearchRuntime {
     const rowIdByName = new Map<string, string>();
 
     const compactSourcePayload = (payload: Record<string, unknown>) => payload;
+    const searchConcurrency = 3;
+    const fetchConcurrency = 3;
+    const extractionConcurrency = 2;
     const extractionTimeoutForSourceClass = (sourceClass: FetchedDoc["parsed"]["sourceClass"]): number => {
       if (sourceClass === "entity_page" || sourceClass === "official_site") {
         return Math.min(this.config.requestTimeoutMs, 12_000);
@@ -1540,11 +1568,11 @@ export class AgenticSearchRuntime {
     ): Promise<FetchedDoc[]> => {
       const nextFetched: FetchedDoc[] = [];
       const byUrl = new Map(discovered.map((result) => [this.normalizeUrl(result.url), result]));
-      for (const rawUrl of urls) {
-        if (executionControl.failIfWallClockExceeded()) return nextFetched;
+      await mapConcurrent(urls, fetchConcurrency, async (rawUrl) => {
+        if (executionControl.failIfWallClockExceeded()) return;
         this.assertRunActive(runId);
         const normalizedUrl = this.normalizeUrl(rawUrl);
-        if (failedUrls.has(normalizedUrl) || fetchedUrls.has(normalizedUrl)) continue;
+        if (failedUrls.has(normalizedUrl) || fetchedUrls.has(normalizedUrl)) return;
 
         const anchorKey = queuedCorroborationUrls.get(normalizedUrl) ?? null;
         queuedCorroborationUrls.delete(normalizedUrl);
@@ -1578,7 +1606,7 @@ export class AgenticSearchRuntime {
           const finalNorm = this.normalizeUrl(parsed.finalUrl);
           if (fetchedUrls.has(finalNorm)) {
             failedUrls.add(normalizedUrl);
-            continue;
+            return;
           }
           const pruneDecision = classifySourceScopeDecision(
             thread.thread.queryRaw,
@@ -1596,7 +1624,7 @@ export class AgenticSearchRuntime {
               }
             }
             failedUrls.add(normalizedUrl);
-            continue;
+            return;
           }
 
           const usage = usageRecord(runId, "fetch", "http_fetch", "fetch_source", 1, fetchLatency, false, 0, 0, {
@@ -1655,7 +1683,7 @@ export class AgenticSearchRuntime {
             ),
           );
         }
-      }
+      });
       this.store.updateRun(runId, (current) => ({
         ...current,
         progress: {
@@ -1667,8 +1695,8 @@ export class AgenticSearchRuntime {
     };
     const extractDocs = async (docs: FetchedDoc[]): Promise<ExtractedEntityRow[]> => {
       const extracted: ExtractedEntityRow[] = [];
-      for (const entry of docs) {
-        if (executionControl.failIfWallClockExceeded()) return extracted;
+      await mapConcurrent(docs, extractionConcurrency, async (entry) => {
+        if (executionControl.failIfWallClockExceeded()) return;
         const maybeAnchorKey = [...anchorCandidates.values()].find((anchor) =>
           anchor.followUpUrls.has(this.normalizeUrl(entry.parsed.finalUrl))
           || anchor.candidateWebsite === this.normalizeUrl(entry.parsed.finalUrl),
@@ -1806,9 +1834,9 @@ export class AgenticSearchRuntime {
               }),
             ),
           );
-          continue;
+          return;
         }
-      }
+      });
       return extracted;
     };
     const extractWithinBudget = async (docs: FetchedDoc[], context: string): Promise<ExtractedEntityRow[]> => {
@@ -1861,7 +1889,7 @@ export class AgenticSearchRuntime {
     if (this.shouldStop(runId)) return;
 
     await this.runStage(runId, "discovery", executionControl, async () => {
-      for (const query of thread.plan.searchQueries) {
+      await mapConcurrent(thread.plan.searchQueries, searchConcurrency, async (query) => {
         this.assertRunActive(runId);
         const cacheKey = `search:${query.text}`;
         const cachedResults = this.cache.search.get(cacheKey) as BraveWebResult[] | undefined;
@@ -1929,7 +1957,7 @@ export class AgenticSearchRuntime {
         for (const result of searchResults) {
           registerDiscoveredResult(result);
         }
-      }
+      });
     });
     if (this.shouldStop(runId)) return;
     if (executionControl.failIfWallClockExceeded()) return;

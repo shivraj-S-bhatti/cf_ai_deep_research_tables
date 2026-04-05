@@ -79,6 +79,13 @@
   - no debug trace loading in the normal workspace
   - product path should poll compact summaries only
 - Preview creation, preview refresh, and run start must expose immediate pending UI so provider latency is visible to the user instead of looking inert.
+- Thread creation must be cheap and route the user into a real preview shell immediately; live planner hydration happens after navigation, not before it.
+- Home/workspace navigation is route-driven, not derived from “some thread exists in memory”.
+- Do not silently synthesize a preview during thread bootstrap; the default fallback for thread creation is an empty draft plan, not a heuristic plan.
 - Keep hot-path trace payloads compact and machine-readable; do not emit large narrative reasoning blobs by default.
 - Allow parallelism across threads, but serialize stateful work within one thread owner so results/debug/cancel stay coherent.
+- Allow bounded parallel outbound provider work inside one thread owner where it materially reduces latency:
+  - small search concurrency
+  - small fetch concurrency
+  - small extraction concurrency
 - Client thread list synchronization: guard overlapping `listThreads` results with a generation counter; avoid tying full-list refetch to every `activeThreadId` change when hydration and mutations already update `threads`; after `createThread`, hydrate (upsert) the new thread **before** setting `activeThreadId` so repair logic cannot repoint to an unrelated thread. Details: [ARCHITECTURE.md](../../ARCHITECTURE.md).

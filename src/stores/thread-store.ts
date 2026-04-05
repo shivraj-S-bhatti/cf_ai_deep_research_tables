@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { apiClient } from "@/lib/api-client";
+import { toast } from "sonner";
 import type {
   ColumnSpec,
   Criterion,
@@ -195,9 +196,6 @@ export function useThreadStore() {
         }
         return merged;
       });
-      if (!activeThreadIdRef.current && list.threads[0]) {
-        setActiveThreadId(list.threads[0].thread.id);
-      }
     } finally {
       if (seq === listReloadSeqRef.current) {
         setThreadsLoaded(true);
@@ -208,13 +206,6 @@ export function useThreadStore() {
   useEffect(() => {
     void reloadThreadSummaries().catch(() => undefined);
   }, [reloadThreadSummaries]);
-
-  useEffect(() => {
-    if (!activeThreadId) return;
-    if (!threads.some((t) => t.id === activeThreadId)) {
-      setActiveThreadId(threads[0]?.id ?? null);
-    }
-  }, [threads, activeThreadId]);
 
   useEffect(() => {
     if (!activeThreadId) return;
@@ -235,37 +226,6 @@ export function useThreadStore() {
     }, pollDelayMs(activeThread));
     return () => window.clearTimeout(timeout);
   }, [activeThread, hydrateThread]);
-
-  const createThread = useCallback(
-    async (query: string) => {
-      setCreatingPreviewThread(true);
-      try {
-        let preview: PreviewResponse;
-        try {
-          preview = await apiClient.previewQuery({
-            query,
-            targetResults: 10,
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "planner failed";
-          throw new Error(`Could not generate criteria from planner: ${message}`);
-        }
-        const response = await apiClient.createThread({
-          query,
-          targetResults: 10,
-          criteria: preview.criteria,
-          columns: preview.columns,
-          preview,
-        });
-        const thread = await hydrateThread(response.threadId);
-        setActiveThreadId(response.threadId);
-        return thread;
-      } finally {
-        setCreatingPreviewThread(false);
-      }
-    },
-    [hydrateThread],
-  );
 
   const refreshQueryPlan = useCallback(
     async (threadId: string, query: string) => {
@@ -296,6 +256,28 @@ export function useThreadStore() {
       }
     },
     [hydrateThread, threads],
+  );
+
+  const createThread = useCallback(
+    async (query: string) => {
+      setCreatingPreviewThread(true);
+      try {
+        const response = await apiClient.createThread({
+          query,
+          targetResults: 10,
+        });
+        const thread = await hydrateThread(response.threadId);
+        void refreshQueryPlan(response.threadId, query).catch((error) => {
+          toast.error("Could not build preview", {
+            description: error instanceof Error ? error.message : "Unexpected planner failure",
+          });
+        });
+        return thread;
+      } finally {
+        setCreatingPreviewThread(false);
+      }
+    },
+    [hydrateThread, refreshQueryPlan],
   );
 
   const replaceCriteria = useCallback(
@@ -333,7 +315,7 @@ export function useThreadStore() {
     await apiClient.deleteThread(threadId);
     const next = threadsRef.current.filter((t) => t.id !== threadId);
     setThreads(next);
-    setActiveThreadId((cur) => (cur === threadId ? next[0]?.id ?? null : cur));
+    setActiveThreadId((cur) => (cur === threadId ? null : cur));
   }, []);
 
   const startRun = useCallback(

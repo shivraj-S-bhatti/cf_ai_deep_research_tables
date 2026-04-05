@@ -72,7 +72,11 @@ Parallelism with this shape:
 
 - **yes across threads** — different threads can execute on different Durable Objects at the same time
 - **serialized within one thread** — a single thread owner coordinates its own run state so trace/results/cancel stay coherent
-- outbound provider requests can still be parallelized later, but the ownership boundary is per-thread
+- outbound provider requests are now **bounded-parallel inside one thread owner**:
+  - search queries run with small concurrency
+  - source fetches run with small concurrency
+  - extraction runs with small concurrency
+- the ownership boundary is still per-thread; only external provider calls are parallelized
 
 ### Current Frontend Data Flow
 
@@ -86,18 +90,35 @@ Parallelism with this shape:
   - debug trace is no longer loaded as part of normal workspace hydration
 - A dedicated debug route exists for full execution inspection.
 
-#### Thread list and `activeThreadId` (client store)
+#### Thread list, routes, and `activeThreadId` (client store)
 
-The React thread store (`src/stores/thread-store.ts`) keeps `threads` and `activeThreadId` in sync with `GET /api/v1/threads`, per-thread hydration, and mutations. Two patterns caused real bugs (fixed 2026-04-05):
+The React shell is now route-owned:
 
-1. **Overlapping `listThreads()` responses** — If `reloadThreadSummaries` is triggered often (e.g. its callback depended on `activeThreadId`), multiple requests could complete out of order; an older response replaced `threads` with a snapshot that omitted a newly created thread, so the repair effect reset `activeThreadId` to `threads[0]` and the UI jumped to an unrelated thread.
-2. **`setActiveThreadId` before hydration** — Calling `setActiveThreadId(newId)` before the new thread was present in `threads` (i.e. before `hydrateThread` finished and `upsertThread` ran) triggered the same repair path and cleared or repointed the active id.
+- `/` means home
+- `/threads/new?query=...` means draft preview creation is in progress
+- `/threads/:threadId` means a concrete thread workspace
 
-Mitigations in code: a monotonic sequence guard so superseded list responses are ignored; a stable `reloadThreadSummaries` (mount-only) with `activeThreadId` read from a ref for the “pick first thread if none active” branch; optional re-merge of the current active thread from previous state when the server list is briefly stale; **`createThread` awaits `hydrateThread` then sets `activeThreadId`.**
+`activeThreadId` is now derived from the route instead of being used as an implicit navigation source of truth. The React thread store (`src/stores/thread-store.ts`) keeps `threads` and per-thread hydration in sync with `GET /api/v1/threads`, but it no longer auto-selects the first available thread on reload.
+
+Three patterns caused the earlier “jump back into the last thread” bugs:
+
+1. **Overlapping `listThreads()` responses** — If `reloadThreadSummaries` is triggered often, multiple requests can complete out of order; an older response can replace `threads` with a snapshot that omits a newly created thread.
+2. **Selection-before-hydration** — Setting `activeThreadId` before the thread exists in `threads` creates a temporary invalid selection.
+3. **Data-derived navigation** — Treating “threads exist” as “open a thread” makes `/` unstable on reload.
+
+Mitigations in code: a monotonic sequence guard so superseded list responses are ignored; a stable `reloadThreadSummaries` (mount-only); route-driven active thread selection; and draft-thread bootstrap so preview generation no longer blocks thread creation.
+
+Current behavior:
+
+- home route stays home even when prior threads exist
+- creating a new query first creates a cheap draft thread
+- the shell navigates immediately
+- live planner hydration then runs in the background and updates that thread in place
 
 ### Current Provider Path
 
 - Preview can come from fixtures or Gemini-backed planning depending on runtime mode and keys.
+- Thread creation itself no longer depends on preview generation. The server can create a draft thread with an empty plan, then the client hydrates the preview asynchronously.
 - Discovery uses Brave in live mode and fixtures otherwise.
 - Fetch uses direct HTTP fetch + parse.
 - Gemini-backed extraction is now split by source role:

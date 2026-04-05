@@ -14,7 +14,7 @@ export type ThreadPhase =
   | "failed"
   | "canceled";
 
-export type CriterionKind = "hard_filter" | "soft_signal";
+export type CriterionKind = "hard_filter" | "soft_signal" | "heuristic";
 
 export type ColumnKind = "identity" | "criterion_summary" | "enrichment";
 
@@ -22,7 +22,14 @@ export type ValueType = "string" | "number" | "date" | "enum" | "url" | "bool" |
 
 export type RunStatus = "queued" | "running" | "complete" | "failed" | "canceled";
 
-export type ProcessingState = "pending" | "verifying" | "finalized" | "failed";
+export type ProcessingState =
+  | "pending"
+  | "fetching"
+  | "extracting"
+  | "refining"
+  | "verifying"
+  | "finalized"
+  | "failed";
 
 export type RowStatus = "accepted" | "rejected" | "uncertain" | "conflict";
 
@@ -45,6 +52,7 @@ export type ActivityStage =
   | "extraction"
   | "evaluation"
   | "canonicalization"
+  | "refinement"
   | "verification"
   | "ranking"
   | "export";
@@ -54,6 +62,14 @@ export type SourceTier =
   | "primary_structured"
   | "reputable_secondary"
   | "weak_discovery";
+
+export type SourceOriginClass =
+  | "official"
+  | "structured"
+  | "secondary"
+  | "roundup"
+  | "directory"
+  | "forum";
 
 export type EvidenceKind =
   | "snippet"
@@ -194,11 +210,18 @@ export type ResultRow = {
   canonicalUrl: string;
   entityType: EntityType;
   status: RowStatus;
+  statusReasonCode?: "source_scope_pruned" | null;
+  statusReasonSummary?: string | null;
   processingState: ProcessingState;
   score: number;
   rank: number | null;
   sourceCount: number;
   duplicateOfRowId: string | null;
+  lineage: {
+    suggestedBySourceIds: string[];
+    groundedBySourceIds: string[];
+    sourceOriginClass: SourceOriginClass;
+  };
 };
 
 export type ResultCell = {
@@ -346,6 +369,28 @@ export type CreateRunResponse = {
 
 export type RunEventsResponse = {
   runId: string;
+  events: ActivityEvent[];
+};
+
+export type RunDebugSummary = {
+  run: ResearchRun;
+  checkpoints: Array<{
+    label: string;
+    reached: boolean;
+  }>;
+  providerBreakdown: UsageSummary[];
+  traceSummary: {
+    totalEvents: number;
+    stageCounts: Partial<Record<ActivityStage, number>>;
+  };
+  recentEvents: ActivityEvent[];
+};
+
+export type RunTraceResponse = {
+  runId: string;
+  page: number;
+  pageSize: number;
+  total: number;
   events: ActivityEvent[];
 };
 

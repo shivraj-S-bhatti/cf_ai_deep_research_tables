@@ -8,6 +8,7 @@ import type {
 } from "../../lib/contracts";
 import type { GeminiBackend, RuntimeConfig } from "../core/config";
 import { isValidPreviewResponse, normalizeSearchQuery } from "../core/config";
+import type { SourceClass } from "./fetch";
 
 type GeminiResponse = {
   candidates?: Array<{
@@ -61,6 +62,10 @@ type ExtractionJson = {
   }>;
 };
 
+type ExtractionEnvelopeJson = {
+  entities?: ExtractionJson[] | null;
+};
+
 type VerifyJson = {
   row_status?: "accepted" | "rejected" | "uncertain" | "conflict";
   score?: number;
@@ -74,7 +79,25 @@ type VerifyJson = {
   }>;
 };
 
-type GeminiOperation = "planner" | "extractor" | "verifier";
+type SupervisorDecisionJson = {
+  action?: "search_more" | "fetch_more" | "extract_from_existing" | "done";
+  queries?: string[] | null;
+  urls?: string[] | null;
+  focus_columns?: string[] | null;
+  reasoning?: string;
+};
+
+type RewriteQueriesJson = {
+  queries?: string[] | null;
+};
+
+type GeminiOperation =
+  | "planner"
+  | "extractor_roundup"
+  | "extractor_entity"
+  | "supervisor"
+  | "verifier"
+  | "rewriter";
 
 export type GeminiProviderMeta = {
   backend: GeminiBackend;
@@ -173,6 +196,37 @@ export type LiveVerificationOutput = {
   }>;
 };
 
+export type SupervisorDecisionInput = {
+  query: string;
+  iteration: number;
+  maxIterations: number;
+  totalRows: number;
+  targetRows: number;
+  columnSummaries: Array<{
+    label: string;
+    fillRate: number;
+    avgConfidence: number;
+  }>;
+  unfetchedUrls: string[];
+  prunedSources: Array<{
+    url: string;
+    reasonSummary: string;
+  }>;
+};
+
+export type SupervisorDecisionOutput = {
+  action: "search_more" | "fetch_more" | "extract_from_existing" | "done";
+  queries: string[];
+  urls: string[];
+  focusColumns: string[];
+  reasoning: string;
+};
+
+export type RewriteQueriesInput = {
+  query: string;
+  gapColumns: string[];
+};
+
 function slugify(value: string): string {
   return value
     .trim()
@@ -219,14 +273,21 @@ function resolveModelForBackend(
   operation: GeminiOperation,
   backend: GeminiBackend,
 ): string {
+  if (operation === "planner") {
+    return "gemini-2.5-flash";
+  }
   if (backend === "vertex_express") {
-    if (operation === "planner" && config.vertexPlannerModel) return config.vertexPlannerModel;
-    if (operation === "extractor" && config.vertexExtractorModel) return config.vertexExtractorModel;
+    if (operation === "extractor_roundup" && config.vertexExtractorModel) return config.vertexExtractorModel;
+    if (operation === "extractor_entity" && config.vertexExtractorModel) return config.vertexExtractorModel;
     if (operation === "verifier" && config.vertexVerifierModel) return config.vertexVerifierModel;
+    if (operation === "supervisor" && config.vertexSupervisorModel) return config.vertexSupervisorModel;
+    if (operation === "rewriter" && config.vertexRewriterModel) return config.vertexRewriterModel;
   }
 
-  if (operation === "planner") return config.plannerModel;
-  if (operation === "extractor") return config.extractorModel;
+  if (operation === "extractor_roundup") return config.extractorRoundupModel;
+  if (operation === "extractor_entity") return config.extractorModel;
+  if (operation === "supervisor") return config.supervisorModel;
+  if (operation === "rewriter") return config.rewriterModel;
   return config.verifierModel;
 }
 
@@ -265,6 +326,17 @@ function parseRetryDelayMs(message: string): number | null {
   return null;
 }
 
+function modelFallbacks(model: string): string[] {
+  if (model.includes("3-flash-preview")) return ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+  if (model.includes("3.1-flash-lite-preview")) return ["gemini-2.5-flash-lite"];
+  if (model.includes("2.5-flash")) return ["gemini-2.5-flash-lite"];
+  return [];
+}
+
+function modelChain(model: string): string[] {
+  return [...new Set([model, ...modelFallbacks(model)])];
+}
+
 function extractJsonText(payload: GeminiResponse): string {
   const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n") ?? "";
   return text.trim();
@@ -284,56 +356,70 @@ function parseJson<T>(text: string): T {
 async function generateStructuredJson<T>(
   config: RuntimeConfig,
   operation: GeminiOperation,
-  prompt: string,
+  system: string,
+  user: string,
 ): Promise<GeminiProviderResult<T>> {
   const backends = resolveBackendOrder(config);
   let lastError: Error | null = null;
 
   for (const backend of backends) {
-    const model = resolveModelForBackend(config, operation, backend);
+    const primaryModel = resolveModelForBackend(config, operation, backend);
     const apiKey = apiKeyForBackend(config, backend);
-    const endpoint = buildEndpoint(backend, apiKey, model);
-
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }],
+    for (const model of modelChain(primaryModel)) {
+      const endpoint = buildEndpoint(backend, apiKey, model);
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
             },
-          ],
-          generationConfig: {
-            temperature: 0.2,
-            responseMimeType: "application/json",
-          },
-        }),
-      });
+            body: JSON.stringify({
+              systemInstruction: {
+                parts: [{ text: system }],
+              },
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ text: user }],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.2,
+                responseMimeType: "application/json",
+              },
+            }),
+          });
 
-      if (!response.ok) {
-        const message = await response.text();
-        throw new GeminiRequestError(
-          `Gemini request failed: ${response.status} ${message}`,
-          response.status,
-          backend,
-          model,
-          parseRetryDelayMs(message),
-        );
-      }
+          if (!response.ok) {
+            const message = await response.text();
+            const requestError = new GeminiRequestError(
+              `Gemini request failed: ${response.status} ${message}`,
+              response.status,
+              backend,
+              model,
+              parseRetryDelayMs(message),
+            );
+            if (response.status === 429 || response.status === 503) {
+              const retryMs = requestError.retryDelayMs ?? Math.min(90000, 8000 + attempt * 14000);
+              await new Promise((resolve) => setTimeout(resolve, retryMs));
+              continue;
+            }
+            throw requestError;
+          }
 
-      const payload = (await response.json()) as GeminiResponse;
-      return {
-        data: parseJson<T>(extractJsonText(payload)),
-        meta: { backend, model },
-      };
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error("Unexpected Gemini request failure.");
-      if (backend === backends[backends.length - 1]) {
-        break;
+          const payload = (await response.json()) as GeminiResponse;
+          return {
+            data: parseJson<T>(extractJsonText(payload)),
+            meta: { backend, model },
+          };
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error("Unexpected Gemini request failure.");
+          if (attempt < 5) {
+            await new Promise((resolve) => setTimeout(resolve, 3000 + attempt * 2000));
+            continue;
+          }
+        }
       }
     }
   }
@@ -420,15 +506,7 @@ export function fallbackPreview(input: LivePlannerInput): PreviewResponse {
 
   return {
     entityType,
-    criteria: [
-      {
-        id: `preview:${slugify(input.query)}:criterion:0`,
-        label: `Entity appears relevant to "${input.query}"`,
-        kind: "hard_filter",
-        color: "hsl(220, 80%, 50%)",
-        orderIndex: 0,
-      },
-    ],
+    criteria: [],
     columns,
     searchQueries,
     budgets: {
@@ -444,20 +522,20 @@ export async function planWithGemini(
   config: RuntimeConfig,
   input: LivePlannerInput,
 ): Promise<GeminiProviderResult<LivePlannerOutput>> {
-  const prompt = [
+  const system = [
     "You are planning a grounded entity discovery run.",
     "Return JSON only.",
-    "Goal: parse the research query into an entity type, hard filters, soft signals, output columns, search queries, and conservative budgets.",
-    "Constraints:",
-    "- Prefer generic entity discovery, not people-search framing.",
-    "- Keep 3 to 6 search queries.",
-    "- Keep budgets conservative for a free-tier demo.",
-    "- Columns should be dynamic and suitable for export.",
-    "",
+    "Parse the research query into entity type, hard filters, soft signals, output columns, search queries, and conservative budgets.",
+    "Write criteria in plain, concise human assistant language.",
+    "Avoid jargon words like entity, scope, canonical, grounded.",
+    "Each criterion should read like a practical checklist item, not policy prose.",
+    "Prefer abstention over overfitting.",
+  ].join("\n");
+  const user = [
     `Query: ${input.query}`,
     `Target results: ${input.targetResults}`,
     "",
-    "Return a JSON object with this shape:",
+    "Return JSON with shape:",
     `{
   "entity_type": "company|project|website|business|news_item|unknown",
   "hard_filters": ["..."],
@@ -469,101 +547,116 @@ export async function planWithGemini(
 }`,
   ].join("\n");
 
-  try {
-    const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", prompt);
-    const preview: PreviewResponse = {
-      entityType: json.entity_type ?? heuristicEntityType(input.query),
-      criteria: [
-        ...(json.hard_filters ?? []).map((label, index) => ({
-          id: `preview:${slugify(input.query)}:criterion:hard:${index}`,
-          label,
-          kind: "hard_filter" as const,
-          color: "hsl(220, 80%, 50%)",
-          orderIndex: index,
-        })),
-        ...(json.soft_signals ?? []).map((label, index) => ({
-          id: `preview:${slugify(input.query)}:criterion:soft:${index}`,
-          label,
-          kind: "soft_signal" as const,
-          color: "hsl(280, 60%, 50%)",
-          orderIndex: (json.hard_filters?.length ?? 0) + index,
-        })),
-      ],
-      columns: (json.columns ?? defaultColumnsForEntityType(json.entity_type ?? heuristicEntityType(input.query))).map((column, index) => ({
-        id: `preview:${slugify(input.query)}:column:${column.key ?? slugify(column.label ?? `column_${index}`)}`,
-        key: column.key ?? slugify(column.label ?? `column_${index}`),
-        label: column.label ?? `Column ${index + 1}`,
-        kind: column.kind ?? "enrichment",
-        valueType: column.value_type ?? "string",
-        preferredSources: ["official", "reputable_secondary"],
-        requiresVerification: true,
-        allowInference: column.kind !== "identity",
-        nullPolicy: "dash" as const,
+  const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", system, user);
+  const preview: PreviewResponse = {
+    entityType: json.entity_type ?? heuristicEntityType(input.query),
+    criteria: [
+      ...(json.hard_filters ?? []).map((label, index) => ({
+        id: `preview:${slugify(input.query)}:criterion:hard:${index}`,
+        label,
+        kind: "hard_filter" as const,
+        color: "hsl(220, 80%, 50%)",
         orderIndex: index,
       })),
-      searchQueries: (json.search_queries ?? [input.query]).slice(0, 6).map(normalizeSearchQuery),
-      budgets: {
-        searchBudget: json.budgets?.search_budget ?? 3,
-        fetchBudget: json.budgets?.fetch_budget ?? Math.max(8, input.targetResults),
-        verificationBudget: json.budgets?.verification_budget ?? Math.max(3, Math.ceil(input.targetResults / 4)),
-      },
-      notes: json.notes ?? "Gemini-backed plan.",
-    };
+      ...(json.soft_signals ?? []).map((label, index) => ({
+        id: `preview:${slugify(input.query)}:criterion:soft:${index}`,
+        label,
+        kind: "soft_signal" as const,
+        color: "hsl(280, 60%, 50%)",
+        orderIndex: (json.hard_filters?.length ?? 0) + index,
+      })),
+    ],
+    columns: (json.columns ?? defaultColumnsForEntityType(json.entity_type ?? heuristicEntityType(input.query))).map((column, index) => ({
+      id: `preview:${slugify(input.query)}:column:${column.key ?? slugify(column.label ?? `column_${index}`)}`,
+      key: column.key ?? slugify(column.label ?? `column_${index}`),
+      label: column.label ?? `Column ${index + 1}`,
+      kind: column.kind ?? "enrichment",
+      valueType: column.value_type ?? "string",
+      preferredSources: ["official", "reputable_secondary"],
+      requiresVerification: true,
+      allowInference: column.kind !== "identity",
+      nullPolicy: "dash" as const,
+      orderIndex: index,
+    })),
+    searchQueries: (json.search_queries ?? [input.query]).slice(0, 6).map(normalizeSearchQuery),
+    budgets: {
+      searchBudget: json.budgets?.search_budget ?? 3,
+      fetchBudget: json.budgets?.fetch_budget ?? Math.max(8, input.targetResults),
+      verificationBudget: json.budgets?.verification_budget ?? Math.max(3, Math.ceil(input.targetResults / 4)),
+    },
+    notes: json.notes ?? "Gemini-backed plan.",
+  };
 
-    if (!isValidPreviewResponse(preview)) {
-      return {
-        data: fallbackPreview(input),
-        meta,
-      };
-    }
-
-    if (preview.criteria.length === 0) {
-      preview.criteria = fallbackPreview(input).criteria;
-    }
-    if (preview.columns.length === 0) {
-      preview.columns = fallbackPreview(input).columns;
-    }
-    if (preview.searchQueries.length === 0) {
-      preview.searchQueries = fallbackPreview(input).searchQueries;
-    }
-    return { data: preview, meta };
-  } catch {
-    return {
-      data: fallbackPreview(input),
-      meta: {
-        backend: config.geminiBackend === "vertex_express" && config.vertexApiKey ? "vertex_express" : "google_ai",
-        model: config.plannerModel,
-      },
-    };
+  if (!isValidPreviewResponse(preview)) {
+    throw new Error("Planner returned an invalid preview response.");
   }
+
+  preview.criteria = preview.criteria
+    .filter((criterion) => typeof criterion.label === "string" && criterion.label.trim().length > 0)
+    .slice(0, 3)
+    .map((criterion, index) => ({ ...criterion, orderIndex: index }));
+
+  if (preview.criteria.length === 0) {
+    throw new Error("Planner returned no criteria.");
+  }
+  if (preview.columns.length === 0) {
+    throw new Error("Planner returned no output columns.");
+  }
+  if (preview.searchQueries.length === 0) {
+    throw new Error("Planner returned no search queries.");
+  }
+
+  return { data: preview, meta };
 }
 
 export async function extractDocumentWithGemini(
   config: RuntimeConfig,
   input: LiveDocumentInput,
-): Promise<GeminiProviderResult<LiveDocumentExtraction>> {
-  const prompt = [
-    "You are extracting grounded entity data from a fetched web document.",
-    "Return JSON only.",
-    "Prefer abstention over guessing.",
-    "Use `not_found` when you looked and didn't find a grounded value.",
-    "Use `unsupported` when the field is not reasonably groundable from this source/query.",
-    "Use `uncertain` or `conflict` only when a weak or conflicting claim is present.",
-    "",
+  sourceClass: SourceClass = "entity_page",
+): Promise<GeminiProviderResult<LiveDocumentExtraction[]>> {
+  const operation: GeminiOperation =
+    sourceClass === "roundup" || sourceClass === "directory"
+      ? "extractor_roundup"
+      : "extractor_entity";
+
+  const system = sourceClass === "forum"
+    ? [
+      "You extract entities from forum/community content.",
+      "Return JSON only.",
+      "Prefer lower confidence for opinionated claims.",
+      "Do not invent URLs or ratings.",
+      "Return {\"entities\": [...]}",
+    ].join("\n")
+    : sourceClass === "roundup" || sourceClass === "directory"
+      ? [
+        "You extract multiple entities from roundup/list pages.",
+        "Return JSON only with an entities array.",
+        "Each entity must be grounded in the provided text.",
+        "If no valid entities are present, return {\"entities\": []}.",
+      ].join("\n")
+      : [
+        "You extract one grounded entity from an entity-specific page.",
+        "Return JSON only with an entities array (0 or 1 entity preferred).",
+        "Do not return page/site names as entities.",
+      ].join("\n");
+
+  const user = [
     `Query: ${input.query}`,
     `Entity type: ${input.entityType}`,
     `Source URL: ${input.url}`,
     `Source title: ${input.title}`,
     `Search snippet: ${input.snippet}`,
+    `Source class: ${sourceClass}`,
     "",
     `Criteria: ${JSON.stringify(input.criteria)}`,
     `Columns: ${JSON.stringify(input.columns)}`,
     "",
     "Source body excerpt:",
-    input.bodyText.slice(0, 8000),
+    input.bodyText.slice(0, 10000),
     "",
-    "Return a JSON object with this shape:",
+    "Return JSON with shape:",
     `{
+  "entities": [{
   "canonical_name": "string",
   "canonical_url": "https://...",
   "row_status": "accepted|rejected|uncertain|conflict",
@@ -571,33 +664,152 @@ export async function extractDocumentWithGemini(
   "row_summary": "short explanation",
   "cells": [{"key":"column_key","value_text":"string or null","state":"filled|not_found|unsupported|uncertain|conflict","confidence":0.0,"reason_code":"optional","evidence_text":"direct snippet or short grounded quote"}],
   "criteria": [{"label":"criterion label","verdict":"pass|fail|uncertain|conflict","summary":"short explanation","confidence":0.0,"evidence_text":"direct snippet or short grounded quote"}]
+  }]
 }`,
   ].join("\n");
 
-  const { data: json, meta } = await generateStructuredJson<ExtractionJson>(config, "extractor", prompt);
+  const { data: raw, meta } = await generateStructuredJson<ExtractionEnvelopeJson | ExtractionJson[]>(
+    config,
+    operation,
+    system,
+    user,
+  );
+  const entities: ExtractionJson[] = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw.entities)
+      ? raw.entities
+      : [];
+  const rows = entities.map((json) => ({
+    canonicalName: json.canonical_name?.trim() || input.title,
+    canonicalUrl: json.canonical_url?.trim() || input.url,
+    rowStatus: json.row_status ?? "uncertain",
+    score: typeof json.score === "number" ? Math.max(0, Math.min(1, json.score)) : 0.5,
+    rowSummary: json.row_summary?.trim() || "Row extracted from live document evidence.",
+    cells: (json.cells ?? []).map((cell) => ({
+      key: cell.key ?? "",
+      valueText: cell.value_text ?? null,
+      state: cell.state ?? "unsupported",
+      confidence: typeof cell.confidence === "number" ? cell.confidence : 0.2,
+      reasonCode: cell.reason_code ?? null,
+      evidenceText: cell.evidence_text ?? null,
+    })),
+    criteria: (json.criteria ?? []).map((criterion) => ({
+      label: criterion.label ?? "",
+      verdict: criterion.verdict ?? "uncertain",
+      summary: criterion.summary?.trim() || "No summary returned.",
+      confidence: typeof criterion.confidence === "number" ? criterion.confidence : 0.2,
+      evidenceText: criterion.evidence_text ?? null,
+    })),
+  }));
+
+  return {
+    data: rows,
+    meta,
+  };
+}
+
+export function isJunkExtraction(
+  row: LiveDocumentExtraction,
+  sourceUrl: string,
+): boolean {
+  const normalizedName = (row.canonicalName || "").trim().toLowerCase();
+  const sourceHost = (() => {
+    try {
+      return new URL(sourceUrl).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return "";
+    }
+  })();
+  const filledCells = row.cells.filter((cell) => cell.state === "filled").length;
+  if (!normalizedName || normalizedName === "not_found") return true;
+  if (normalizedName === sourceHost) return true;
+  if (row.score <= 0) return true;
+  if (filledCells === 0) return true;
+  return false;
+}
+
+export async function supervisorDecide(
+  config: RuntimeConfig,
+  input: SupervisorDecisionInput,
+): Promise<GeminiProviderResult<SupervisorDecisionOutput>> {
+  const system = [
+    "You are a research supervisor for a grounded entity discovery pipeline.",
+    "Decide exactly one action each turn.",
+    "Actions: search_more, fetch_more, extract_from_existing, done.",
+    "Do not choose done when identity columns are weak and target rows are not met.",
+  ].join("\n");
+  const cols = input.columnSummaries
+    .map((col) => `${col.label}: fill=${Math.round(col.fillRate * 100)}% avg_conf=${col.avgConfidence.toFixed(2)}`)
+    .join("\n");
+  const user = [
+    `Research query: ${input.query}`,
+    `Iteration: ${input.iteration} of ${input.maxIterations}`,
+    `Rows found: ${input.totalRows} (target: ${input.targetRows})`,
+    "",
+    "Column fill rates:",
+    cols,
+    "",
+    `Unfetched URLs available: ${input.unfetchedUrls.length}`,
+    ...input.unfetchedUrls.slice(0, 5).map((u) => `- ${u}`),
+    "",
+    `Pruned sources to avoid repeating: ${input.prunedSources.length}`,
+    ...input.prunedSources.slice(0, 5).map((entry) => `- ${entry.url} :: ${entry.reasonSummary}`),
+    "",
+    "Return JSON:",
+    `{
+  "action": "search_more|fetch_more|extract_from_existing|done",
+  "queries": ["..."],
+  "urls": ["..."],
+  "focus_columns": ["..."],
+  "reasoning": "one sentence"
+}`,
+  ].join("\n");
+
+  const { data, meta } = await generateStructuredJson<SupervisorDecisionJson>(
+    config,
+    "supervisor",
+    system,
+    user,
+  );
   return {
     data: {
-      canonicalName: json.canonical_name?.trim() || input.title,
-      canonicalUrl: json.canonical_url?.trim() || input.url,
-      rowStatus: json.row_status ?? "uncertain",
-      score: typeof json.score === "number" ? Math.max(0, Math.min(1, json.score)) : 0.5,
-      rowSummary: json.row_summary?.trim() || "Row extracted from live document evidence.",
-      cells: (json.cells ?? []).map((cell) => ({
-        key: cell.key ?? "",
-        valueText: cell.value_text ?? null,
-        state: cell.state ?? "unsupported",
-        confidence: typeof cell.confidence === "number" ? cell.confidence : 0.2,
-        reasonCode: cell.reason_code ?? null,
-        evidenceText: cell.evidence_text ?? null,
-      })),
-      criteria: (json.criteria ?? []).map((criterion) => ({
-        label: criterion.label ?? "",
-        verdict: criterion.verdict ?? "uncertain",
-        summary: criterion.summary?.trim() || "No summary returned.",
-        confidence: typeof criterion.confidence === "number" ? criterion.confidence : 0.2,
-        evidenceText: criterion.evidence_text ?? null,
-      })),
+      action: data.action ?? "done",
+      queries: (data.queries ?? []).filter((v): v is string => typeof v === "string" && v.trim().length > 0),
+      urls: (data.urls ?? []).filter((v): v is string => typeof v === "string" && v.trim().length > 0),
+      focusColumns: (data.focus_columns ?? []).filter((v): v is string => typeof v === "string" && v.trim().length > 0),
+      reasoning: data.reasoning ?? "",
     },
+    meta,
+  };
+}
+
+export async function rewriteQueries(
+  config: RuntimeConfig,
+  input: RewriteQueriesInput,
+): Promise<GeminiProviderResult<string[]>> {
+  const system = [
+    "You rewrite search queries for entity discovery.",
+    "Return JSON only.",
+    "Generate 2-3 high-recall but targeted search queries.",
+  ].join("\n");
+  const user = [
+    `Original query: ${input.query}`,
+    `Columns with poor fill rate: ${input.gapColumns.join(", ") || "none"}`,
+    "",
+    "Return JSON with shape:",
+    `{"queries": ["...", "..."]}`,
+  ].join("\n");
+
+  const { data, meta } = await generateStructuredJson<RewriteQueriesJson>(
+    config,
+    "rewriter",
+    system,
+    user,
+  );
+  return {
+    data: (data.queries ?? [])
+      .filter((query): query is string => typeof query === "string" && query.trim().length > 0)
+      .slice(0, 3),
     meta,
   };
 }
@@ -606,12 +818,13 @@ export async function verifyWithGemini(
   config: RuntimeConfig,
   input: LiveVerificationInput,
 ): Promise<GeminiProviderResult<LiveVerificationOutput>> {
-  const prompt = [
+  const system = [
     "You are verifying an already-extracted row from a grounded entity discovery pipeline.",
     "Return JSON only.",
-    "Only change the row status if the evidence clearly supports it.",
+    "Only change row_status when evidence clearly supports it.",
     "Prefer abstention over overclaiming.",
-    "",
+  ].join("\n");
+  const user = [
     `Query: ${input.query}`,
     `Row name: ${input.rowName}`,
     `Row URL: ${input.rowUrl}`,
@@ -621,7 +834,7 @@ export async function verifyWithGemini(
     `Cells: ${JSON.stringify(input.columns)}`,
     `Source evidence: ${JSON.stringify(input.sourceEvidence)}`,
     "",
-    "Return a JSON object with this shape:",
+    "Return JSON with shape:",
     `{
   "row_status": "accepted|rejected|uncertain|conflict",
   "score": 0.0,
@@ -631,7 +844,7 @@ export async function verifyWithGemini(
   ].join("\n");
 
   try {
-    const { data: json, meta } = await generateStructuredJson<VerifyJson>(config, "verifier", prompt);
+    const { data: json, meta } = await generateStructuredJson<VerifyJson>(config, "verifier", system, user);
     return {
       data: {
         rowStatus: json.row_status ?? input.rowStatus,

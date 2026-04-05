@@ -61,7 +61,12 @@ import {
   createAbortError,
   type RequestControl,
 } from "../providers/request-control";
-import { MemoryResearchStore, emptyMetrics, emptyProgress } from "../storage/memory-store";
+import {
+  MemoryResearchStore,
+  emptyMetrics,
+  emptyProgress,
+  type MemoryResearchStoreSnapshot,
+} from "../storage/memory-store";
 import { makeId, sleep } from "../utils/ids";
 import {
   classifySourceScopeDecision,
@@ -259,9 +264,9 @@ type RunExecutionControl = {
 };
 
 export class AgenticSearchRuntime {
-  private readonly store = new MemoryResearchStore();
+  private readonly store: MemoryResearchStore;
   private readonly inflightRuns = new Map<string, Promise<void>>();
-  private readonly instanceId = crypto.randomUUID();
+  private readonly instanceId: string;
   private config: RuntimeConfig;
   private readonly cache: RuntimeCache = {
     preview: new Map(),
@@ -269,7 +274,15 @@ export class AgenticSearchRuntime {
     pages: new Map(),
   };
 
-  constructor(env?: RuntimeEnvLike) {
+  constructor(
+    env?: RuntimeEnvLike,
+    options?: {
+      instanceId?: string;
+      store?: MemoryResearchStore;
+    },
+  ) {
+    this.store = options?.store ?? new MemoryResearchStore();
+    this.instanceId = options?.instanceId ?? crypto.randomUUID();
     this.config = resolveRuntimeConfig(env);
   }
 
@@ -279,6 +292,33 @@ export class AgenticSearchRuntime {
 
   listThreads(): ThreadsListResponse {
     return { threads: this.store.listThreadSnapshots() };
+  }
+
+  exportState(): MemoryResearchStoreSnapshot {
+    return this.store.exportState();
+  }
+
+  recoverInterruptedRuns(reason = "Thread runtime restarted before the run completed."): void {
+    for (const run of this.store.listRuns()) {
+      if (run.status !== "queued" && run.status !== "running") continue;
+      const stage = (run.stage === "idle" ? "planning" : run.stage) as ActivityStage;
+      this.store.updateRun(run.id, (current) => ({
+        ...current,
+        status: "failed",
+        finishedAt: now(),
+        errorCode: "owner_restarted",
+        errorMessage: reason,
+      }));
+      this.markNonTerminalRowsFailed(run.id);
+      this.store.addActivity(
+        run.id,
+        stageEvent(run.id, stage, "failed", reason, {
+          actor: "runtime",
+          title: "Owner restarted",
+          checkpoint: "run terminated",
+        }),
+      );
+    }
   }
 
   getInstanceId(): string {
@@ -300,8 +340,8 @@ export class AgenticSearchRuntime {
     return response;
   }
 
-  createThread(input: CreateThreadRequest): CreateThreadResponse {
-    const bundle = buildThreadBundle(input);
+  createThread(input: CreateThreadRequest, options?: { threadId?: string }): CreateThreadResponse {
+    const bundle = buildThreadBundle(input, options?.threadId);
     this.store.pruneOldestThreadsIfOver(this.config.maxStoredThreads);
     this.store.createThread(bundle);
     return {
@@ -1639,6 +1679,24 @@ export class AgenticSearchRuntime {
         }
 
         const startedAt = now();
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "extraction",
+            "started",
+            `Extracting ${entry.parsed.sourceClass} from ${entry.parsed.finalUrl}`,
+            compactSourcePayload({
+              actor: entry.parsed.sourceClass === "entity_page" || entry.parsed.sourceClass === "official_site"
+                ? "corroboration"
+                : "anchor_extraction",
+              title: "Structured extraction",
+              sourceUrl: entry.parsed.finalUrl,
+              sourceClass: entry.parsed.sourceClass,
+              operation: "extract_start",
+            }),
+          ),
+        );
         const providerResult = await extractDocumentWithGemini(
           this.config,
           {

@@ -3,7 +3,7 @@
 ## Document Metadata
 
 - `Doc ID`: `context.current-decisions`
-- `Version`: `1.5.0`
+- `Version`: `1.6.0`
 - `Status`: `authoritative`
 - `Kind`: `decision-record`
 - `Last Updated`: `2026-04-05`
@@ -21,8 +21,12 @@
 - Clean out template and legacy Lovable scaffolding when it does not affect the current UI shell.
 - Maintain the knowledge registry and metadata system so we can distinguish authoritative docs, notebooks, working notes, and flavor/context text.
 - Build v0.1 as a single Cloudflare Worker codebase with `/api/v1/*`, fixture-backed locally until real Cloudflare resources and provider keys are available.
+- In deployed environments, route thread and run ownership through Durable Objects instead of isolate-local Worker memory.
+- Use one Durable Object per thread plus a lightweight registry Durable Object for thread listing and `runId -> threadId` resolution.
+- Preserve the existing `/api/v1/*` REST surface while moving ownership behind Durable Objects.
 - Keep the local runtime hybrid: deterministic fixtures for tests, live Brave + Gemini for operator-driven local development when secrets are available.
 - Use D1 as the future source of truth and KV as cache only; never model live run state around KV semantics.
+- Treat current Durable Object snapshot persistence as an intermediate production step, not the final analytics/state model.
 - Treat progressive rendering as a binding contract: rows appear early, pending cells show loaders, weak terminal cells stay explicit, and dashes appear only for terminal blanks.
 - Refine progressive rendering so the main table only shows grounded rows; candidate anchors remain internal until at least one grounding source exists.
 - Expose observability and budget usage inside the app, not only in logs.
@@ -76,4 +80,5 @@
   - product path should poll compact summaries only
 - Preview creation, preview refresh, and run start must expose immediate pending UI so provider latency is visible to the user instead of looking inert.
 - Keep hot-path trace payloads compact and machine-readable; do not emit large narrative reasoning blobs by default.
+- Allow parallelism across threads, but serialize stateful work within one thread owner so results/debug/cancel stay coherent.
 - Client thread list synchronization: guard overlapping `listThreads` results with a generation counter; avoid tying full-list refetch to every `activeThreadId` change when hydration and mutations already update `threads`; after `createThread`, hydrate (upsert) the new thread **before** setting `activeThreadId` so repair logic cannot repoint to an unrelated thread. Details: [ARCHITECTURE.md](../../ARCHITECTURE.md).

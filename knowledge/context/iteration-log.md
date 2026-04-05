@@ -14,6 +14,52 @@
 
 This file keeps non-binding project context, external critique, and iteration notes that we want to preserve for later reporting and analysis.
 
+## Devlog Entry — 2026-04-05 (Durable Object run ownership)
+
+### Symptom
+
+- Production runs could look healthy from one endpoint and missing from another.
+- `health`, `debug/runtime`, `results`, and `cancel` requests could hit different Worker isolates.
+- Active runs could stall invisibly because state and inflight execution lived in isolate-local memory.
+
+### Root cause
+
+The previous production runtime kept thread/run state in a module-global `AgenticSearchRuntime` backed by `MemoryResearchStore`. That was acceptable locally, but invalid on multi-isolate Workers:
+
+- one isolate could own the live run
+- another isolate could serve `results` or `cancel`
+- `run_not_found` and split-brain diagnostics were therefore expected, not anomalous
+
+### Infra change
+
+The runtime is now split into:
+
+- edge Worker for static assets, preview, and REST routing
+- one **thread owner Durable Object** per thread for run state and execution
+- one **registry Durable Object** for thread summaries and `runId -> threadId` lookup
+
+This preserves the existing `/api/v1/*` API while moving stateful ownership to a single coordination surface per thread.
+
+### Why this shape
+
+- A single global Durable Object would fix consistency but destroy throughput.
+- One Durable Object per thread keeps a strong owner for:
+  - run execution
+  - trace
+  - results
+  - cancel
+- Different threads can still run in parallel because they route to different owners.
+
+### Persistence model
+
+Current persistence is snapshot-based:
+
+- `MemoryResearchStore` can export/import a serializable snapshot
+- thread owners persist snapshots into Durable Object storage
+- on owner restart, non-terminal runs are failed explicitly instead of pretending they are still alive
+
+This is the current production durability step, not the final D1-backed historical model.
+
 ## Devlog Entry — 2026-04-05 (Anchor-first live loop + explicit preview pending states)
 
 ### Symptom

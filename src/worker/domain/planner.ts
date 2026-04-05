@@ -114,13 +114,12 @@ export function previewQuery(input: PreviewRequest): PreviewResponse {
   };
 }
 
-export function buildThreadBundle(input: CreateThreadRequest): {
+export function buildThreadBundle(input: CreateThreadRequest, threadId = makeId("thr")): {
   thread: ResearchThread;
   plan: QueryPlan;
   criteria: Criterion[];
   columns: ColumnSpec[];
 } {
-  const threadId = makeId("thr");
   const now = Date.now();
   const normalizedTargetResults = normalizeTargetResults(input.targetResults);
   const resolvedPreview =

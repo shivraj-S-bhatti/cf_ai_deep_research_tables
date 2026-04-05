@@ -54,6 +54,26 @@ type ThreadRecord = {
   columns: ColumnSpec[];
 };
 
+type RunRecordSnapshot = {
+  run: ResearchRun;
+  rows: ResultRow[];
+  cells: ResultCell[];
+  evaluations: CriterionEvaluation[];
+  sources: SourceDocument[];
+  evidence: Evidence[];
+  events: ActivityEvent[];
+  usage: UsageRecord[];
+  exports: ExportArtifact[];
+  rowSourceIds: Array<[string, string[]]>;
+  rowEvidenceIds: Array<[string, string[]]>;
+};
+
+export type MemoryResearchStoreSnapshot = {
+  threads: ThreadRecord[];
+  runs: RunRecordSnapshot[];
+  threadOrder: string[];
+};
+
 function emptyProgress(totalQueries = 0): RunProgress {
   return {
     queriesCompleted: 0,
@@ -84,10 +104,105 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function snapshotRunRecord(record: RunRecord): RunRecordSnapshot {
+  return {
+    run: clone(record.run),
+    rows: [...record.rows.values()].map((row) => clone(row)),
+    cells: [...record.cellsByRow.values()].flatMap((rowCells) =>
+      [...rowCells.values()].map((cell) => clone(cell)),
+    ),
+    evaluations: [...record.evaluationsByRow.values()].flatMap((evaluations) =>
+      evaluations.map((evaluation) => clone(evaluation)),
+    ),
+    sources: [...record.sources.values()].map((source) => clone(source)),
+    evidence: [...record.evidence.values()].map((evidence) => clone(evidence)),
+    events: clone(record.events),
+    usage: clone(record.usage),
+    exports: [...record.exports.values()].map((artifact) => clone(artifact)),
+    rowSourceIds: [...record.rowSourceIds.entries()].map(([rowId, sourceIds]) => [rowId, [...sourceIds]]),
+    rowEvidenceIds: [...record.rowEvidenceIds.entries()].map(([rowId, evidenceIds]) => [rowId, [...evidenceIds]]),
+  };
+}
+
+function restoreRunRecord(snapshot: RunRecordSnapshot): RunRecord {
+  const cellsByRow = new Map<string, Map<string, ResultCell>>();
+  for (const cell of snapshot.cells) {
+    const rowCells = cellsByRow.get(cell.rowId) ?? new Map<string, ResultCell>();
+    rowCells.set(cell.columnKey, clone(cell));
+    cellsByRow.set(cell.rowId, rowCells);
+  }
+
+  const evaluationsByRow = new Map<string, CriterionEvaluation[]>();
+  for (const evaluation of snapshot.evaluations) {
+    const rowEvaluations = evaluationsByRow.get(evaluation.rowId) ?? [];
+    rowEvaluations.push(clone(evaluation));
+    evaluationsByRow.set(evaluation.rowId, rowEvaluations);
+  }
+
+  return {
+    run: clone(snapshot.run),
+    rows: new Map(snapshot.rows.map((row) => [row.id, clone(row)])),
+    cellsByRow,
+    evaluationsByRow,
+    sources: new Map(snapshot.sources.map((source) => [source.id, clone(source)])),
+    evidence: new Map(snapshot.evidence.map((evidence) => [evidence.id, clone(evidence)])),
+    events: clone(snapshot.events),
+    usage: clone(snapshot.usage),
+    exports: new Map(snapshot.exports.map((artifact) => [artifact.format, clone(artifact)])),
+    rowSourceIds: new Map(
+      snapshot.rowSourceIds.map(([rowId, sourceIds]) => [rowId, new Set(sourceIds)]),
+    ),
+    rowEvidenceIds: new Map(
+      snapshot.rowEvidenceIds.map(([rowId, evidenceIds]) => [rowId, new Set(evidenceIds)]),
+    ),
+  };
+}
+
 export class MemoryResearchStore {
   private readonly threads = new Map<string, ThreadRecord>();
   private readonly runs = new Map<string, RunRecord>();
   private readonly threadOrder: string[] = [];
+
+  constructor(
+    snapshot: MemoryResearchStoreSnapshot | null = null,
+    private readonly onMutation?: () => void,
+  ) {
+    if (snapshot) {
+      this.restore(snapshot);
+    }
+  }
+
+  exportState(): MemoryResearchStoreSnapshot {
+    return {
+      threads: [...this.threads.values()].map((record) => clone(record)),
+      runs: [...this.runs.values()].map((record) => snapshotRunRecord(record)),
+      threadOrder: [...this.threadOrder],
+    };
+  }
+
+  listRuns(): ResearchRun[] {
+    return [...this.runs.values()].map((record) => clone(record.run));
+  }
+
+  private restore(snapshot: MemoryResearchStoreSnapshot): void {
+    this.threads.clear();
+    this.runs.clear();
+    this.threadOrder.splice(0, this.threadOrder.length);
+
+    for (const thread of snapshot.threads ?? []) {
+      this.threads.set(thread.thread.id, clone(thread));
+    }
+    for (const run of snapshot.runs ?? []) {
+      this.runs.set(run.run.id, restoreRunRecord(run));
+    }
+    for (const threadId of snapshot.threadOrder ?? []) {
+      this.threadOrder.push(threadId);
+    }
+  }
+
+  private touch(): void {
+    this.onMutation?.();
+  }
 
   private deleteRunsForThread(threadId: string): void {
     for (const [runId, record] of this.runs.entries()) {
@@ -122,24 +237,27 @@ export class MemoryResearchStore {
     return record ? clone(record) : null;
   }
 
-  /** Drop oldest threads (and their latest run record) when over limit. Does not clear preview/search caches. */
+  /** Drop oldest threads (and associated run records) when over limit. */
   pruneOldestThreadsIfOver(maxThreads: number): void {
     if (maxThreads <= 0) return;
+    let changed = false;
     while (this.threadOrder.length > maxThreads) {
       const removeId = this.threadOrder.pop();
       if (!removeId) break;
       this.deleteRunsForThread(removeId);
       this.threads.delete(removeId);
+      changed = true;
     }
+    if (changed) this.touch();
   }
 
   createThread(record: ThreadRecord): ThreadSnapshot {
     this.threads.set(record.thread.id, clone(record));
     this.threadOrder.unshift(record.thread.id);
+    this.touch();
     return this.getThreadSnapshot(record.thread.id)!;
   }
 
-  /** Removes the thread and all run records associated with it. */
   deleteThread(threadId: string): boolean {
     const record = this.threads.get(threadId);
     if (!record) return false;
@@ -149,13 +267,11 @@ export class MemoryResearchStore {
     if (idx >= 0) {
       this.threadOrder.splice(idx, 1);
     }
+    this.touch();
     return true;
   }
 
-  updateThread(
-    threadId: string,
-    next: Partial<ThreadRecord>,
-  ): ThreadSnapshot | null {
+  updateThread(threadId: string, next: Partial<ThreadRecord>): ThreadSnapshot | null {
     const current = this.threads.get(threadId);
     if (!current) return null;
     this.threads.set(threadId, {
@@ -164,6 +280,7 @@ export class MemoryResearchStore {
       criteria: next.criteria ? clone(next.criteria) : current.criteria,
       columns: next.columns ? clone(next.columns) : current.columns,
     });
+    this.touch();
     return this.getThreadSnapshot(threadId);
   }
 
@@ -190,6 +307,7 @@ export class MemoryResearchStore {
       thread.thread.statusSummary = "Queued for execution.";
     }
 
+    this.touch();
     return clone(run);
   }
 
@@ -202,6 +320,7 @@ export class MemoryResearchStore {
     if (!record) return null;
     record.run = clone(updater(clone(record.run)));
     this.syncThreadFromRun(record.run);
+    this.touch();
     return clone(record.run);
   }
 
@@ -222,6 +341,7 @@ export class MemoryResearchStore {
     const record = this.runs.get(runId);
     if (!record) return;
     record.events.push(clone(event));
+    this.touch();
   }
 
   listEvents(runId: string): ActivityEvent[] {
@@ -398,6 +518,7 @@ export class MemoryResearchStore {
       const evidenceIds = record.rowEvidenceIds.get(cell.rowId) ?? new Set<string>();
       evidenceIds.add(cell.primaryEvidenceId);
       record.rowEvidenceIds.set(cell.rowId, evidenceIds);
+      this.touch();
     }
   }
 
@@ -421,6 +542,7 @@ export class MemoryResearchStore {
       evidenceIds.add(evaluation.primaryEvidenceId);
       record.rowEvidenceIds.set(evaluation.rowId, evidenceIds);
     }
+    this.touch();
   }
 
   addSource(runId: string, rowId: string, source: SourceDocument): void {
@@ -450,12 +572,14 @@ export class MemoryResearchStore {
     const evidenceIds = record.rowEvidenceIds.get(rowId) ?? new Set<string>();
     evidenceIds.add(evidence.id);
     record.rowEvidenceIds.set(rowId, evidenceIds);
+    this.touch();
   }
 
   addExport(runId: string, artifact: ExportArtifact): void {
     const record = this.runs.get(runId);
     if (!record) return;
     record.exports.set(artifact.format, clone(artifact));
+    this.touch();
   }
 
   getExport(runId: string, format: "csv" | "json"): ExportArtifact | null {

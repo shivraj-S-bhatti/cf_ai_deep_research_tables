@@ -71,4 +71,21 @@ describe("MemoryResearchStore", () => {
     expect(store.getThreadSnapshot(second.thread.id)).not.toBeNull();
     expect(store.getRun("second-run-1")).not.toBeNull();
   });
+
+  it("restores thread and run state from a serialized snapshot", () => {
+    const original = new MemoryResearchStore();
+    const bundle = buildThreadBundle({
+      query: "snapshot restore",
+      targetResults: 3,
+      criteria: [],
+      columns: [],
+    });
+    original.createThread(bundle);
+    original.createRun(makeRun(bundle.thread.id, "snapshot-run"));
+
+    const restored = new MemoryResearchStore(original.exportState());
+
+    expect(restored.getThreadSnapshot(bundle.thread.id)?.thread.queryRaw).toBe("snapshot restore");
+    expect(restored.getRun("snapshot-run")?.threadId).toBe(bundle.thread.id);
+  });
 });

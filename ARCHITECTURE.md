@@ -3,7 +3,7 @@
 ## Document Metadata
 
 - `Doc ID`: `architecture.v0`
-- `Version`: `2.1.0`
+- `Version`: `2.2.0`
 - `Status`: `authoritative`
 - `Kind`: `architecture`
 - `Last Updated`: `2026-04-05`
@@ -23,7 +23,8 @@ Two things are true at once right now:
   - row details
   - evidence and sources
 - the current implementation is still in transition:
-  - local and deployed runtime state is more in-memory than the earlier architecture implied
+  - local tests still use the legacy in-memory runtime path when Durable Object bindings are absent
+  - deployed runtime ownership now lives in Durable Objects rather than isolate-local Worker memory
   - the product and debug surfaces were over-coupled
   - request fan-out and trace volume grew before the entity-quality baseline was locked
 
@@ -36,13 +37,42 @@ This document therefore describes both:
 
 ### Runtime Path Today
 
-- A single Cloudflare Worker serves static assets and `/api/v1/*`.
+- A front Cloudflare Worker serves static assets and `/api/v1/*`.
 - The Worker runtime supports fixture, hybrid, and live provider modes.
-- The current truth model in actual runtime behavior is still dominated by an in-memory store, not a real D1-backed production state machine.
+- Preview remains stateless in the front Worker.
+- Deployed thread/run ownership now routes through Durable Objects:
+  - one **thread owner Durable Object** per thread
+  - one lightweight **registry Durable Object** for thread summaries and `runId -> threadId` lookup
+- The current durable truth model is **Durable Object storage snapshots**, not D1 yet.
 - Live provider execution currently uses:
   - Brave for search
   - direct fetch/parse for source retrieval
   - Gemini for planning, extraction, and verification
+
+```mermaid
+flowchart LR
+    Browser["Browser / SPA"]
+    Edge["Edge Worker\n(routes + preview)"]
+    Registry["Registry Durable Object\n(thread list + run owner lookup)"]
+    Thread["Thread Durable Object\n(one owner per thread)"]
+    Search["Brave Search"]
+    Fetch["HTTP / Jina fetch"]
+    LLM["Gemini"]
+
+    Browser --> Edge
+    Edge --> Registry
+    Edge --> Thread
+    Thread --> Registry
+    Thread --> Search
+    Thread --> Fetch
+    Thread --> LLM
+```
+
+Parallelism with this shape:
+
+- **yes across threads** — different threads can execute on different Durable Objects at the same time
+- **serialized within one thread** — a single thread owner coordinates its own run state so trace/results/cancel stay coherent
+- outbound provider requests can still be parallelized later, but the ownership boundary is per-thread
 
 ### Current Frontend Data Flow
 
@@ -108,7 +138,8 @@ This was the most concrete performance bug and is the first one addressed by the
 
 Remaining risk:
 - thread snapshot fetches are still separate from results fetches
-- the store is still local/in-memory and not yet optimized for real queue-backed concurrency
+- local legacy mode is still in-memory when DO bindings are absent
+- the current DO persistence format is coarse-grained snapshot persistence, not normalized D1-backed run truth
 
 ### 2. Over-instrumented Product UI
 

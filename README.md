@@ -5,6 +5,34 @@ Brave search · Gemini planning/extraction · Cloudflare Worker
 
 ---
 
+## Runtime Infra
+
+```mermaid
+flowchart LR
+    Browser["Browser / SPA"]
+    Edge["Edge Worker\n(routes + preview)"]
+    Registry["Registry Durable Object\n(thread list + run owner lookup)"]
+    Thread["Thread Durable Object\n(one owner per thread)"]
+    Search["Brave Search"]
+    Fetch["HTTP / Jina fetch"]
+    LLM["Gemini"]
+
+    Browser --> Edge
+    Edge --> Registry
+    Edge --> Thread
+    Thread --> Registry
+    Thread --> Search
+    Thread --> Fetch
+    Thread --> LLM
+```
+
+- Preview stays stateless in the edge Worker.
+- Thread creation, run execution, results, trace, and cancel route to a **per-thread Durable Object owner**.
+- A lightweight **registry Durable Object** tracks thread summaries and `runId -> threadId` ownership so results/debug/cancel hit the correct owner.
+- Parallelism: **yes across threads**. Each thread owner serializes its own state for consistency, but different threads can run concurrently on different Durable Objects.
+
+---
+
 ## The Hard Problems
 
 **1. Entity kind from raw query**
@@ -131,7 +159,7 @@ Blowup in practice: not asymptotic. Per-row polling and repeated full-event tran
 - Cross-page fold too weak for local business queries
 - Page misclass silently routes to wrong pull path
 - Long roundup pages time out on single-call extraction
-- Local run: in-memory, not D1/KV/Queue
+- Local tests still use the legacy in-memory runtime path when Durable Object bindings are absent
 
 ---
 

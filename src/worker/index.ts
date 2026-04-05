@@ -1,11 +1,23 @@
 import { handleApiRequest } from "./core/app";
+export { ThreadRuntimeDurableObject } from "./durable/thread-runtime";
+export { ThreadRegistryDurableObject } from "./durable/thread-registry";
 
 export type WorkerAssetsBinding = {
   fetch: (request: Request) => Promise<Response>;
 };
 
+export type DurableObjectStubLike = {
+  fetch: (request: Request | string, init?: RequestInit) => Promise<Response>;
+};
+
+export type DurableObjectNamespaceLike = {
+  getByName: (name: string) => DurableObjectStubLike;
+};
+
 export type WorkerEnv = {
   ASSETS?: WorkerAssetsBinding;
+  THREAD_RUNTIME?: DurableObjectNamespaceLike;
+  THREAD_REGISTRY?: DurableObjectNamespaceLike;
   APP_ENV?: string;
   AGENTIC_RUNTIME_MODE?: string;
   SEARCH_PROVIDER_PRIMARY?: string;

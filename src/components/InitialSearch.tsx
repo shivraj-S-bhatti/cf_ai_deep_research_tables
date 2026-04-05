@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Search, Sparkles } from "lucide-react";
+import { Loader2, Search, Sparkles } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 
 interface InitialSearchProps {
   onSearch: (query: string) => void;
+  isSubmitting?: boolean;
 }
 
 const SAMPLE_CARDS: { title: string; query: string; blurb: string; tags: string[] }[] = [
@@ -28,7 +29,7 @@ const SAMPLE_CARDS: { title: string; query: string; blurb: string; tags: string[
   },
 ];
 
-export function InitialSearch({ onSearch }: InitialSearchProps) {
+export function InitialSearch({ onSearch, isSubmitting = false }: InitialSearchProps) {
   const [query, setQuery] = useState("");
 
   const handleSubmit = () => {
@@ -53,19 +54,25 @@ export function InitialSearch({ onSearch }: InitialSearchProps) {
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+              onKeyDown={(e) => e.key === "Enter" && !isSubmitting && handleSubmit()}
               placeholder="e.g. YC W24 healthcare startups"
               className="h-9 max-h-9 border-0 bg-transparent pl-8 pr-2 text-sm shadow-none placeholder:text-muted-foreground/80 focus-visible:ring-0 sm:h-10 sm:max-h-10 sm:text-[15px]"
+              disabled={isSubmitting}
             />
           </div>
           <Button
             type="button"
             onClick={handleSubmit}
             className="h-9 shrink-0 gap-1.5 px-4 text-sm font-medium sm:h-10 sm:px-5"
-            disabled={!query.trim()}
+            disabled={!query.trim() || isSubmitting}
+            aria-busy={isSubmitting}
           >
-            <Sparkles className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
-            Start Research
+            {isSubmitting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin sm:h-4 sm:w-4" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+            )}
+            {isSubmitting ? "Building preview…" : "Start Research"}
           </Button>
         </div>
 

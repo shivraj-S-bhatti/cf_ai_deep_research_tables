@@ -3,12 +3,14 @@ import type { SourceClass } from "../providers/fetch";
 
 export type ExtractedEntityRow = {
   canonicalName: string;
-  canonicalUrl: string;
+  canonicalUrl: string | null;
+  candidateWebsite: string | null;
   rowStatus: "accepted" | "rejected" | "uncertain" | "conflict";
   score: number;
   rowSummary: string;
   sourceUrl: string;
   sourceClass: SourceClass;
+  followUpUrls: string[];
   cells: Array<{
     key: string;
     valueText: string | null;
@@ -86,12 +88,17 @@ export function dedupeAndMerge(rows: ExtractedEntityRow[]): ExtractedEntityRow[]
     }
     return {
       canonicalName: seed.canonicalName,
-      canonicalUrl: seed.canonicalUrl,
+      canonicalUrl: seed.canonicalUrl ?? group.find((row) => row.canonicalUrl)?.canonicalUrl ?? null,
+      candidateWebsite:
+        seed.candidateWebsite
+        ?? group.find((row) => row.candidateWebsite)?.candidateWebsite
+        ?? null,
       rowStatus: chooseStatus(group.map((row) => row.rowStatus)),
       score: Math.max(...group.map((row) => row.score)),
       rowSummary: seed.rowSummary,
       sourceUrl: seed.sourceUrl,
       sourceClass: seed.sourceClass,
+      followUpUrls: [...new Set(group.flatMap((row) => row.followUpUrls))].slice(0, 5),
       cells: [...mergedCells.values()],
       criteria: [...mergedCriteria.values()],
     };

@@ -136,6 +136,12 @@ describe("runtime policy", () => {
       }),
       [makeEvaluation({ verdict: "fail", confidence: 0.92 })],
       makeCriteria(),
+      [
+        {
+          id: "src-1",
+          trustTier: "official",
+        },
+      ],
     );
 
     expect(status).toBe("rejected");

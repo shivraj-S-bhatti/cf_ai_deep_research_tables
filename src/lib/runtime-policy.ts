@@ -4,6 +4,7 @@ import type {
   ProcessingState,
   ResultRow,
   RowStatus,
+  SourceDocument,
 } from "./contracts";
 
 export const DEFAULT_REJECT_CONFIDENCE_MIN = 0.8;
@@ -175,6 +176,7 @@ export function deriveFinalStatus(
   row: Pick<ResultRow, "status" | "entityType" | "canonicalName" | "canonicalUrl" | "lineage">,
   evaluations: CriterionEvaluation[],
   criteria: Criterion[],
+  sources: Array<Pick<SourceDocument, "id" | "trustTier">> = [],
   thresholds: Partial<FinalStatusThresholds> = {},
 ): RowStatus {
   const rejectConfidenceMin = thresholds.rejectConfidenceMin ?? DEFAULT_REJECT_CONFIDENCE_MIN;
@@ -183,7 +185,12 @@ export function deriveFinalStatus(
     criteria.filter((criterion) => criterion.kind === "hard_filter").map((criterion) => criterion.id),
   );
   const hardEvaluations = evaluations.filter((evaluation) => hardCriteriaIds.has(evaluation.criterionId));
-  const hasGrounding = row.lineage.groundedBySourceIds.length > 0;
+  const groundedSources = sources.filter((source) => row.lineage.groundedBySourceIds.includes(source.id));
+  const hasGrounding = groundedSources.length > 0;
+  const hasAuthoritativeGrounding = groundedSources.some(
+    (source) => source.trustTier === "official" || source.trustTier === "primary_structured",
+  );
+  const hasEnoughAcceptanceEvidence = hasAuthoritativeGrounding || groundedSources.length >= 2;
 
   if (!hasGrounding && row.status !== "rejected") {
     return "uncertain";
@@ -208,6 +215,7 @@ export function deriveFinalStatus(
   const hasAnyFail = hardEvaluations.some((evaluation) => evaluation.verdict === "fail");
   if (hasAnyFail) return "uncertain";
 
+  if (!hasEnoughAcceptanceEvidence) return "uncertain";
   if (looksLikeDocumentInsteadOfEntity(row)) return "uncertain";
   return "accepted";
 }

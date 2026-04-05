@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExtractedEntityRow } from "../domain/dedup";
 import {
+  buildCorroborationQueries,
   collectFollowUpUrls,
   computeFetchBatchSize,
   coerceRowStatusForSource,
@@ -13,6 +14,8 @@ function makeExtractedRow(overrides: Partial<ExtractedEntityRow> = {}): Extracte
   return {
     canonicalName: "Acme Health",
     canonicalUrl: "https://acme-health.example.com",
+    candidateWebsite: "https://acme-health.example.com",
+    followUpUrls: [],
     rowStatus: "accepted",
     score: 0.8,
     rowSummary: "Grounded candidate.",
@@ -62,6 +65,22 @@ describe("live run policy", () => {
     expect(groundingUrls).toEqual([]);
   });
 
+  it("builds small deterministic corroboration queries once an anchor exists", () => {
+    expect(
+      buildCorroborationQueries({
+        anchorName: "Acme Health",
+        query: "YC W24 healthcare startups",
+        entityType: "company",
+        candidateWebsite: "https://acme-health.example.com/about",
+      }),
+    ).toEqual([
+      "\"Acme Health\"",
+      "\"Acme Health\" company",
+      "\"Acme Health\" YC W24 healthcare startups",
+      "\"Acme Health\" site:acme-health.example.com",
+    ]);
+  });
+
   it("prefers non-list search results when selecting a fetch batch", () => {
     const selected = selectDiscoveryBatch(
       "yc w24 healthcare startups",
@@ -106,7 +125,7 @@ describe("live run policy", () => {
     ).toBe(2);
   });
 
-  it("stops exploration once the candidate row target is reached", () => {
+  it("stops exploration once the grounded row target is reached", () => {
     expect(shouldStopExploration(10, 10)).toBe(true);
     expect(shouldStopExploration(11, 10)).toBe(true);
     expect(shouldStopExploration(9, 10)).toBe(false);

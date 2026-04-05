@@ -25,6 +25,7 @@ export type WorkerEnv = {
   MAX_SOURCES_PER_ROW?: string;
   MAX_LLM_EXTRACTIONS_PER_RUN?: string;
   MAX_VERIFICATIONS_PER_RUN?: string;
+  ENABLE_SUPERVISOR_REFINEMENT?: string;
   FETCH_TEXT_CHAR_LIMIT?: string;
   PROVIDER_TIMEOUT_MS?: string;
 };

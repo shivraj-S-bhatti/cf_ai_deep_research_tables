@@ -3,7 +3,7 @@
 ## Document Metadata
 
 - `Doc ID`: `architecture.v0`
-- `Version`: `2.0.1`
+- `Version`: `2.1.0`
 - `Status`: `authoritative`
 - `Kind`: `architecture`
 - `Last Updated`: `2026-04-05`
@@ -12,7 +12,7 @@
 
 ## Overview
 
-Agentic Search is a generic entity-discovery system for the Agentic Search Challenge. It accepts a natural-language query, generates a plan, discovers candidate entities from the web, fills a structured table, and keeps each filled cell traceable to evidence.
+Agentic Search is a generic entity-discovery system for the Agentic Search Challenge. It accepts a natural-language query, generates a plan, discovers web pages, extracts candidate anchors, corroborates those anchors with a small evidence pack, and only then materializes structured rows whose cells stay traceable to evidence.
 
 Two things are true at once right now:
 
@@ -70,7 +70,13 @@ Mitigations in code: a monotonic sequence guard so superseded list responses are
 - Preview can come from fixtures or Gemini-backed planning depending on runtime mode and keys.
 - Discovery uses Brave in live mode and fixtures otherwise.
 - Fetch uses direct HTTP fetch + parse.
-- Extraction and verification use Gemini in live mode and fixtures otherwise.
+- Gemini-backed extraction is now split by source role:
+  - list/directory/forum pages emit anchors only
+  - entity-specific or official pages can emit grounded row fields
+- The default live path is now deterministic and corroboration-first:
+  - `discovery pages -> anchor extraction -> corroboration fetches -> finalization`
+  - supervisor/rewrite logic stays behind an experiment flag and is off by default
+- Validation is folded into corroboration and final ranking rather than handled as a separate late cleanup loop.
 
 ### Where The App Was Stalling
 
@@ -127,11 +133,13 @@ This remains one of the hardest correctness risks.
 
 Failure mode:
 - discovery returns pages
-- extraction/ranking sometimes preserves those pages as final rows instead of canonical entities
+- extraction can be tempted to preserve those pages as final rows instead of canonical entities
 
 Current mitigation:
 - rows now carry lineage
-- ranking rejects rows that still look like roundup pages, directories, or article titles instead of entities
+- list/directory/forum pages are candidate generators only and do not create visible rows by themselves
+- visible rows are created only after at least one grounding source exists
+- accepted rows require grounded evidence from one authoritative source or two corroborating sources
 
 This is a guardrail, not a complete solution.
 
@@ -164,8 +172,9 @@ The model is now explicitly:
   - `uncertain`
   - `conflict`
 - row processing state:
-  - `pending`
-  - `verifying`
+  - `fetching`
+  - `extracting_anchor`
+  - `corroborating`
   - `finalized`
   - `failed`
 
@@ -213,8 +222,9 @@ The separate debug workspace is intentionally engineer-facing and can remain ric
 - tool/function calls
 - raw payloads
 - checkpoint timeline
-- reasoning summaries
 - advanced eval/debug metrics
+
+The hot path now prefers compact machine-usable events over narrative payloads so the debug surface stays useful without dragging large synthetic reasoning blobs through normal execution.
 
 This surface is allowed to be noisy because it is now isolated from the main product story.
 
@@ -232,6 +242,13 @@ The runtime remains stage-driven:
 - ranking
 - export
 
+Within those stage boundaries, the default live loop is now logically:
+
+- discovery returns pages only
+- extraction on list-like pages produces anchors, not rows
+- corroboration fetches are launched immediately once plausible anchors exist
+- finalization ranks and labels only grounded rows
+
 The durable checkpoint boundaries that matter are:
 
 - `plan persisted`
@@ -246,7 +263,8 @@ The durable checkpoint boundaries that matter are:
 The backend must distinguish:
 
 - candidate document
-- candidate entity
+- anchor candidate
+- corroborated entity draft
 - accepted entity row
 
 Rows now carry lineage:
@@ -256,6 +274,13 @@ Rows now carry lineage:
 - `sourceOriginClass`
 
 This is the minimum contract needed to keep source pages from silently becoming final entities.
+
+Operational rules now treated as binding by the runtime:
+
+- `targetResults` means desired grounded final rows, not provisional candidates
+- the default row URL is the first backing source URL
+- website/entity URLs remain cell-level data until corroborated
+- no visible row should exist with `sourceCount = 0`
 
 ### Lighter Polling And Detail Loading
 

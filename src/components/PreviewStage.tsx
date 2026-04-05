@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { X, Plus, Play, Pencil } from "lucide-react";
+import { X, Plus, Play, Pencil, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,8 @@ const COLORS = ["hsl(220, 80%, 50%)", "hsl(142, 71%, 45%)", "hsl(38, 92%, 50%)",
 
 interface PreviewStageProps {
   thread: Thread;
+  isRefreshingPreview?: boolean;
+  isStartingRun?: boolean;
   onAddCriterion: (c: Criterion) => void;
   onRemoveCriterion: (id: string) => void;
   onAddEnrichment: (e: Enrichment) => void;
@@ -23,6 +25,8 @@ interface PreviewStageProps {
 
 export function PreviewStage({
   thread,
+  isRefreshingPreview = false,
+  isStartingRun = false,
   onAddCriterion,
   onRemoveCriterion,
   onAddEnrichment,
@@ -86,12 +90,18 @@ export function PreviewStage({
               <Button
                 size="sm"
                 variant="outline"
+                disabled={isRefreshingPreview}
                 onClick={() => {
                   onUpdateQuery(queryDraft);
                   setEditingQuery(false);
                 }}
               >
-                Save
+                {isRefreshingPreview ? (
+                  <>
+                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                    Refreshing…
+                  </>
+                ) : "Save"}
               </Button>
             </div>
           ) : (
@@ -103,6 +113,9 @@ export function PreviewStage({
               <Pencil className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 shrink-0 mt-1 transition-opacity" />
             </div>
           )}
+          {isRefreshingPreview ? (
+            <p className="text-xs text-muted-foreground">Refreshing preview…</p>
+          ) : null}
         </div>
 
         {/* Criteria */}
@@ -131,11 +144,12 @@ export function PreviewStage({
             <Input
               value={newCriterion}
               onChange={(e) => setNewCriterion(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAddCriterion()}
+              onKeyDown={(e) => e.key === "Enter" && !isRefreshingPreview && handleAddCriterion()}
               placeholder="Add a criterion…"
               className="text-xs h-8"
+              disabled={isRefreshingPreview}
             />
-            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs shrink-0" onClick={handleAddCriterion}>
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs shrink-0" onClick={handleAddCriterion} disabled={isRefreshingPreview}>
               <Plus className="h-3 w-3" />
               Add
             </Button>
@@ -161,11 +175,12 @@ export function PreviewStage({
             <Input
               value={newEnrichment}
               onChange={(e) => setNewEnrichment(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAddEnrichment()}
+              onKeyDown={(e) => e.key === "Enter" && !isRefreshingPreview && handleAddEnrichment()}
               placeholder='e.g. "Website", "License", "Location"'
               className="text-xs h-8"
+              disabled={isRefreshingPreview}
             />
-            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs shrink-0" onClick={handleAddEnrichment}>
+            <Button size="sm" variant="outline" className="h-8 gap-1 text-xs shrink-0" onClick={handleAddEnrichment} disabled={isRefreshingPreview}>
               <Plus className="h-3 w-3" />
               Add
             </Button>
@@ -179,6 +194,7 @@ export function PreviewStage({
             <Select
               value={String(thread.targetResults)}
               onValueChange={(v) => onUpdateTarget(Number(v))}
+              disabled={isRefreshingPreview || isStartingRun}
             >
               <SelectTrigger className="w-20 h-8 text-xs">
                 <SelectValue />
@@ -191,9 +207,13 @@ export function PreviewStage({
               </SelectContent>
             </Select>
           </div>
-          <Button onClick={onStartSearch} className="gap-2">
-            <Play className="h-3.5 w-3.5" />
-            Run Search
+          <Button onClick={onStartSearch} className="gap-2" disabled={isRefreshingPreview || isStartingRun}>
+            {isStartingRun ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Play className="h-3.5 w-3.5" />
+            )}
+            {isStartingRun ? "Starting research…" : "Run Search"}
           </Button>
         </div>
       </div>

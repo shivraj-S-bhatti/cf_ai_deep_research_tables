@@ -27,6 +27,7 @@ export type RuntimeConfig = {
   maxLlmExtractionsPerRun: number;
   maxVerificationsPerRun: number;
   maxSupervisorIterations: number;
+  enableSupervisorRefinement: boolean;
   fetchTextCharLimit: number;
   requestTimeoutMs: number;
   /** Stop live runs after this wall time (ms). 0 = no limit. */
@@ -51,6 +52,12 @@ function readNumber(env: RuntimeEnvLike, key: string, fallback: number): number 
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readBoolean(env: RuntimeEnvLike, key: string, fallback: boolean): boolean {
+  const value = readValue(env, key);
+  if (!value) return fallback;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
 export function resolveRuntimeConfig(env?: RuntimeEnvLike): RuntimeConfig {
@@ -85,6 +92,7 @@ export function resolveRuntimeConfig(env?: RuntimeEnvLike): RuntimeConfig {
     maxLlmExtractionsPerRun: readNumber(env, "MAX_LLM_EXTRACTIONS_PER_RUN", 6),
     maxVerificationsPerRun: readNumber(env, "MAX_VERIFICATIONS_PER_RUN", 3),
     maxSupervisorIterations: readNumber(env, "MAX_SUPERVISOR_ITERATIONS", 3),
+    enableSupervisorRefinement: readBoolean(env, "ENABLE_SUPERVISOR_REFINEMENT", false),
     fetchTextCharLimit: readNumber(env, "FETCH_TEXT_CHAR_LIMIT", 9000),
     requestTimeoutMs: readNumber(env, "PROVIDER_TIMEOUT_MS", 20000),
     maxRunWallClockMs: readNumber(env, "MAX_RUN_WALL_CLOCK_MS", 480_000),

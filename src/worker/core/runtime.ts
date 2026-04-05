@@ -30,9 +30,10 @@ import {
   hasExtractionBudgetRemaining,
 } from "./extraction-budget";
 import {
+  buildCorroborationQueries,
   collectFollowUpUrls,
   computeFetchBatchSize,
-  coerceRowStatusForSource,
+  isCandidateOnlySourceClass,
   isGroundingSourceClass,
   selectDiscoveryBatch,
   shouldStopExploration,
@@ -48,10 +49,7 @@ import { searchBraveWeb, type BraveWebResult } from "../providers/brave";
 import {
   extractDocumentWithGemini,
   planWithGemini,
-  rewriteQueries,
-  supervisorDecide,
   isJunkExtraction,
-  verifyWithGemini,
 } from "../providers/gemini";
 import { fetchAndParseDocument } from "../providers/fetch";
 import { dedupeAndMerge, normalizeName, type ExtractedEntityRow } from "../domain/dedup";
@@ -958,91 +956,676 @@ export class AgenticSearchRuntime {
     if (!thread) return;
 
     const criteriaByLabel = new Map(thread.criteria.map((criterion) => [criterion.label, criterion]));
+    type FetchedDoc = {
+      result: BraveWebResult;
+      parsed: Awaited<ReturnType<typeof fetchAndParseDocument>>;
+    };
+    type AnchorSourceMeta = {
+      url: string;
+      title: string;
+      snippet: string;
+      sourceClass: Awaited<ReturnType<typeof fetchAndParseDocument>>["sourceClass"];
+    };
+    type AnchorCandidate = {
+      key: string;
+      canonicalName: string;
+      candidateWebsite: string | null;
+      followUpUrls: Set<string>;
+      suggestedSources: Map<string, AnchorSourceMeta>;
+      sourceOriginClass: ResultRow["lineage"]["sourceOriginClass"];
+      bestScore: number;
+      rowSummary: string;
+      corroborationSearchIssued: boolean;
+      rowId: string | null;
+    };
+
     const discovered: BraveWebResult[] = [];
-    const fetchedDocs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }> = [];
+    const discoveredUrls = new Set<string>();
+    const fetchedDocs: FetchedDoc[] = [];
+    const fetchedUrls = new Set<string>();
     const failedUrls = new Set<string>();
-    const discoveredRowIdByUrl = new Map<string, string>();
     const prunedSourceUrls = new Set<string>();
     const prunedSourceSummaries = new Map<string, string>();
-    const followUpUrlQueue: string[] = [];
-    const followUpSeenUrls = new Set<string>();
-    const consumedFollowUpUrls = new Set<string>();
+    const anchorCandidates = new Map<string, AnchorCandidate>();
+    const queuedCorroborationUrls = new Map<string, string>();
     const extractionBudget = createExtractionBudget(this.config.maxLlmExtractionsPerRun);
-    const hasDiscoveredUrl = (url: string): boolean =>
-      discovered.some((entry) => this.normalizeUrl(entry.url) === url);
-    const enqueueDiscoveredCandidate = (candidate: BraveWebResult): string | null => {
+    const rowIdByName = new Map<string, string>();
+
+    const compactSourcePayload = (payload: Record<string, unknown>) => payload;
+    const visibleGroundedRows = (): ResultRow[] =>
+      this.store.listRows(runId).filter(
+        (row) =>
+          row.duplicateOfRowId === null
+          && row.lineage.groundedBySourceIds.length > 0
+          && row.processingState !== "failed"
+          && row.status !== "rejected",
+      );
+    const trustTierForSourceClass = (sourceClass: FetchedDoc["parsed"]["sourceClass"]) => {
+      if (sourceClass === "official_site") return "official" as const;
+      if (sourceClass === "entity_page" || sourceClass === "directory") return "primary_structured" as const;
+      if (sourceClass === "forum") return "weak_discovery" as const;
+      return "reputable_secondary" as const;
+    };
+    const registerDiscoveredResult = (candidate: BraveWebResult): string | null => {
       const normalizedUrl = this.normalizeUrl(candidate.url);
-      if (failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) return null;
-      if (hasDiscoveredUrl(normalizedUrl)) return null;
+      if (discoveredUrls.has(normalizedUrl) || failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) {
+        return null;
+      }
       discovered.push({
         ...candidate,
         url: normalizedUrl,
       });
+      discoveredUrls.add(normalizedUrl);
       return normalizedUrl;
     };
-    const enqueueFollowUpCandidate = (candidate: BraveWebResult): void => {
-      const normalizedUrl = enqueueDiscoveredCandidate(candidate);
-      if (!normalizedUrl || followUpSeenUrls.has(normalizedUrl)) return;
-      followUpSeenUrls.add(normalizedUrl);
-      followUpUrlQueue.push(normalizedUrl);
-    };
-    const activeUniqueRows = (): ResultRow[] =>
-      this.store
-        .listRows(runId)
-        .filter(
-          (row) =>
-            row.duplicateOfRowId === null
-            && row.status !== "rejected"
-            && (row.sourceCount > 0 || row.processingState !== "pending"),
-        );
-    const selectNextFetchUrls = (limit: number): string[] => {
+    const selectNextDiscoveryUrls = (limit: number): string[] => {
       if (limit <= 0) return [];
-      const selected = new Set<string>();
-      const nextUrls: string[] = [];
-      const canUseUrl = (url: string): boolean =>
-        !selected.has(url)
-        && !prunedSourceUrls.has(url)
-        && !failedUrls.has(url)
-        && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
-
-      for (const url of selectQueuedFollowUpUrls(limit, false)) {
-        if (!canUseUrl(url)) continue;
-        selected.add(url);
-        nextUrls.push(url);
-        if (nextUrls.length >= limit) return nextUrls;
-      }
-
-      const rankedFallback = selectDiscoveryBatch(
+      return selectDiscoveryBatch(
         thread.thread.queryRaw,
-        discovered.filter((candidate) => canUseUrl(this.normalizeUrl(candidate.url))),
-        limit - nextUrls.length,
-      );
-      for (const candidate of rankedFallback) {
-        const normalizedUrl = this.normalizeUrl(candidate.url);
-        if (!canUseUrl(normalizedUrl)) continue;
-        selected.add(normalizedUrl);
-        nextUrls.push(normalizedUrl);
-        if (nextUrls.length >= limit) break;
-      }
-
-      return nextUrls;
+        discovered.filter((candidate) => {
+          const normalizedUrl = this.normalizeUrl(candidate.url);
+          return !prunedSourceUrls.has(normalizedUrl)
+            && !failedUrls.has(normalizedUrl)
+            && !fetchedUrls.has(normalizedUrl);
+        }),
+        limit,
+      ).map((candidate) => this.normalizeUrl(candidate.url));
     };
-    const selectQueuedFollowUpUrls = (limit: number, consume = false): string[] => {
+    const queueCorroborationUrl = (rawUrl: string | null | undefined, anchorKey: string): void => {
+      if (!rawUrl) return;
+      const normalizedUrl = this.normalizeUrl(rawUrl);
+      if (
+        prunedSourceUrls.has(normalizedUrl)
+        || failedUrls.has(normalizedUrl)
+        || fetchedUrls.has(normalizedUrl)
+        || queuedCorroborationUrls.has(normalizedUrl)
+      ) {
+        return;
+      }
+      queuedCorroborationUrls.set(normalizedUrl, anchorKey);
+    };
+    const selectedCorroborationUrls = (limit: number): string[] => {
       if (limit <= 0) return [];
-      const nextUrls = followUpUrlQueue
-        .filter((url) => {
-          if (consumedFollowUpUrls.has(url)) return false;
-          return !prunedSourceUrls.has(url)
-            && !failedUrls.has(url)
-            && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
-        })
+      const urls: string[] = [];
+      for (const [url, anchorKey] of queuedCorroborationUrls.entries()) {
+        if (urls.length >= limit) break;
+        const anchor = anchorCandidates.get(anchorKey);
+        if (!anchor) {
+          queuedCorroborationUrls.delete(url);
+          continue;
+        }
+        if (failedUrls.has(url) || prunedSourceUrls.has(url) || fetchedUrls.has(url)) {
+          queuedCorroborationUrls.delete(url);
+          continue;
+        }
+        urls.push(url);
+      }
+      return urls;
+    };
+    const anchorNeedsCorroboration = (anchor: AnchorCandidate): boolean => {
+      if (!anchor.rowId) return true;
+      const row = this.store.getRow(runId, anchor.rowId);
+      const details = this.store.getRowDetails(runId, anchor.rowId);
+      if (!row || !details) return true;
+      const groundedSources = details.sources.filter((source) =>
+        row.lineage.groundedBySourceIds.includes(source.id),
+      );
+      const hasAuthoritativeGrounding = groundedSources.some(
+        (source) => source.trustTier === "official" || source.trustTier === "primary_structured",
+      );
+      return !(hasAuthoritativeGrounding || groundedSources.length >= 2);
+    };
+    const seedCorroborationSearches = async (limit = 2): Promise<void> => {
+      const anchors = [...anchorCandidates.values()]
+        .filter((anchor) => anchorNeedsCorroboration(anchor) && !anchor.corroborationSearchIssued)
         .slice(0, limit);
-      if (consume) {
-        for (const url of nextUrls) {
-          consumedFollowUpUrls.add(url);
+      for (const anchor of anchors) {
+        anchor.corroborationSearchIssued = true;
+        const queries = buildCorroborationQueries({
+          anchorName: anchor.canonicalName,
+          query: thread.thread.queryRaw,
+          entityType: thread.plan.entityType,
+          candidateWebsite: anchor.candidateWebsite,
+        });
+        for (const queryText of queries) {
+          this.assertRunActive(runId);
+          const searchQuery: SearchQuery = {
+            id: makeId("sq"),
+            text: queryText,
+          };
+          const startedAt = now();
+          const results = await searchBraveWeb(
+            this.config.braveApiKey!,
+            searchQuery,
+            Math.min(this.config.searchResultsPerQuery, 4),
+            this.requestControlForRun(runId),
+          );
+          const usage = usageRecord(runId, "search", "brave", "search_anchor_corroboration", 1, now() - startedAt, false, 0, 0, {
+            query: queryText,
+            anchor: anchor.canonicalName,
+            resultCount: results.length,
+          });
+          this.store.addUsage(runId, usage);
+          const selected = selectDiscoveryBatch(
+            queryText,
+            results.filter((result) => {
+              const normalizedUrl = this.normalizeUrl(result.url);
+              return !failedUrls.has(normalizedUrl)
+                && !prunedSourceUrls.has(normalizedUrl)
+                && !fetchedUrls.has(normalizedUrl);
+            }),
+            Math.min(2, this.config.maxSourcesPerRow),
+          );
+          for (const result of selected) {
+            registerDiscoveredResult(result);
+            queueCorroborationUrl(result.url, anchor.key);
+          }
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "refinement",
+              "completed",
+              `Corroboration search for ${anchor.canonicalName}: ${selected.length} targets.`,
+              compactSourcePayload({
+                actor: "corroboration",
+                title: "Anchor corroboration search",
+                anchor: anchor.canonicalName,
+                query: queryText,
+                urls: selected.map((entry) => this.normalizeUrl(entry.url)),
+              }),
+            ),
+          );
         }
       }
-      return nextUrls;
+    };
+    const registerAnchor = (merged: ExtractedEntityRow, sourceMeta: AnchorSourceMeta): void => {
+      const key = normalizeName(merged.canonicalName);
+      if (!key) return;
+      const existing = anchorCandidates.get(key) ?? {
+        key,
+        canonicalName: merged.canonicalName,
+        candidateWebsite: null,
+        followUpUrls: new Set<string>(),
+        suggestedSources: new Map<string, AnchorSourceMeta>(),
+        sourceOriginClass: classifySourceOrigin(sourceMeta.url, sourceMeta.title),
+        bestScore: merged.score,
+        rowSummary: merged.rowSummary,
+        corroborationSearchIssued: false,
+        rowId: null,
+      };
+      if (merged.score >= existing.bestScore) {
+        existing.canonicalName = merged.canonicalName;
+        existing.bestScore = merged.score;
+        existing.rowSummary = merged.rowSummary;
+      }
+      existing.candidateWebsite =
+        existing.candidateWebsite
+        ?? (merged.candidateWebsite ? this.normalizeUrl(merged.candidateWebsite) : null);
+      existing.suggestedSources.set(this.normalizeUrl(sourceMeta.url), sourceMeta);
+      for (const followUpUrl of collectFollowUpUrls(merged)) {
+        existing.followUpUrls.add(followUpUrl);
+        queueCorroborationUrl(followUpUrl, key);
+      }
+      anchorCandidates.set(key, existing);
+      this.store.addActivity(
+        runId,
+        stageEvent(
+          runId,
+          "extraction",
+          "completed",
+          `Anchor: ${existing.canonicalName}`,
+          compactSourcePayload({
+            actor: "anchor_extraction",
+            title: "Anchor extracted",
+            name: existing.canonicalName,
+            sourceUrl: sourceMeta.url,
+            followUpCount: existing.followUpUrls.size,
+          }),
+        ),
+      );
+    };
+    const buildStoredSource = (
+      meta: AnchorSourceMeta,
+      sourceClass: AnchorSourceMeta["sourceClass"],
+    ): SourceDocument => {
+      const normalizedUrl = this.normalizeUrl(meta.url);
+      const domain = (() => {
+        try {
+          return new URL(normalizedUrl).hostname;
+        } catch {
+          return "unknown";
+        }
+      })();
+      return {
+        id: makeId("src"),
+        runId,
+        url: normalizedUrl,
+        normalizedUrl,
+        domain,
+        title: meta.title || normalizedUrl,
+        fetchedAt: now(),
+        fetchStatus: 200,
+        contentType: "text/html",
+        contentHash: `${normalizedUrl}:${meta.snippet.length}`,
+        trustTier: trustTierForSourceClass(sourceClass),
+        cacheKey: `page:${normalizedUrl}`,
+        blobRef: null,
+        snippet: meta.snippet,
+        favicon: `https://www.google.com/s2/favicons?domain=${domain}&sz=16`,
+      };
+    };
+    const upsertGroundedRow = (merged: ExtractedEntityRow, entry: FetchedDoc): void => {
+      const key = normalizeName(merged.canonicalName);
+      if (!key) return;
+      const anchor = anchorCandidates.get(key);
+      const rowId = rowIdByName.get(key) ?? anchor?.rowId ?? makeId("row");
+      rowIdByName.set(key, rowId);
+      if (anchor) {
+        anchor.rowId = rowId;
+      }
+
+      const existing = this.store.getRow(runId, rowId);
+      const details = this.store.getRowDetails(runId, rowId);
+      const existingSourcesByUrl = new Map(
+        (details?.sources ?? []).map((source) => [this.normalizeUrl(source.url), source]),
+      );
+      const ensuredSources: SourceDocument[] = [];
+      const pushSource = (meta: AnchorSourceMeta) => {
+        const normalizedUrl = this.normalizeUrl(meta.url);
+        const existingSource = existingSourcesByUrl.get(normalizedUrl);
+        if (existingSource) {
+          ensuredSources.push(existingSource);
+          return existingSource;
+        }
+        const doc = buildStoredSource(meta, meta.sourceClass);
+        this.store.addSource(runId, rowId, doc);
+        existingSourcesByUrl.set(normalizedUrl, doc);
+        ensuredSources.push(doc);
+        return doc;
+      };
+
+      const groundingSource = pushSource(
+        {
+          url: entry.parsed.finalUrl,
+          title: entry.parsed.title || entry.result.title,
+          snippet: entry.parsed.description || entry.result.description || "",
+          sourceClass: entry.parsed.sourceClass,
+        },
+      );
+      if (anchor) {
+        for (const sourceMeta of anchor.suggestedSources.values()) {
+          pushSource(sourceMeta);
+        }
+      }
+
+      const suggestedBySourceIds = new Set(existing?.lineage.suggestedBySourceIds ?? []);
+      for (const source of ensuredSources) {
+        suggestedBySourceIds.add(source.id);
+      }
+      const groundedBySourceIds = new Set(existing?.lineage.groundedBySourceIds ?? []);
+      groundedBySourceIds.add(groundingSource.id);
+
+      this.store.upsertRow(runId, {
+        id: rowId,
+        runId,
+        canonicalName: merged.canonicalName,
+        canonicalUrl: existing?.canonicalUrl ?? groundingSource.url,
+        entityType: thread.plan.entityType,
+        status: "uncertain",
+        statusReasonCode: null,
+        statusReasonSummary: null,
+        processingState: "corroborating",
+        score: Math.max(existing?.score ?? 0, merged.score),
+        rank: existing?.rank ?? null,
+        sourceCount: suggestedBySourceIds.size,
+        duplicateOfRowId: existing?.duplicateOfRowId ?? null,
+        lineage: {
+          suggestedBySourceIds: [...suggestedBySourceIds],
+          groundedBySourceIds: [...groundedBySourceIds],
+          sourceOriginClass: anchor?.sourceOriginClass ?? classifySourceOrigin(groundingSource.url, groundingSource.title),
+        },
+      });
+
+      const existingCells = new Map((details?.cells ?? []).map((cell) => [cell.columnKey, cell]));
+      const existingEvaluations = new Map((details?.evaluations ?? []).map((evaluation) => [evaluation.criterionId, evaluation]));
+      const websiteValue =
+        anchor?.candidateWebsite
+        ?? merged.candidateWebsite
+        ?? (entry.parsed.sourceClass === "official_site" ? groundingSource.url : null);
+
+      for (const column of thread.columns) {
+        const extractedCell = merged.cells.find((cell) => cell.key === column.key);
+        const current = existingCells.get(column.key);
+        const fallbackWebsiteCell =
+          !extractedCell && column.key === "website" && websiteValue
+            ? {
+                key: column.key,
+                valueText: websiteValue,
+                state: "filled" as const,
+                confidence: 0.72,
+                reasonCode: null,
+                evidenceText: websiteValue,
+              }
+            : null;
+        const nextCell = extractedCell ?? fallbackWebsiteCell;
+        if (!nextCell) {
+          if (!current) {
+            this.store.upsertCell(runId, {
+              id: `${rowId}:${column.key}`,
+              rowId,
+              columnKey: column.key,
+              valueText: null,
+              valueJson: null,
+              state: "unsupported",
+              confidence: 0.1,
+              reasonCode: "model_omitted_field",
+              primaryEvidenceId: null,
+            });
+          }
+          continue;
+        }
+        if (current && current.confidence > nextCell.confidence) continue;
+        const evidence = nextCell.evidenceText
+          ? this.createEvidenceFromSource(runId, rowId, groundingSource.id, {
+              kind: "inferred_summary",
+              text: nextCell.evidenceText,
+              columnKey: column.key,
+            })
+          : null;
+        this.store.upsertCell(runId, {
+          id: `${rowId}:${column.key}`,
+          rowId,
+          columnKey: column.key,
+          valueText: nextCell.valueText,
+          valueJson: null,
+          state: nextCell.state,
+          confidence: nextCell.confidence,
+          reasonCode: nextCell.reasonCode,
+          primaryEvidenceId: evidence?.id ?? null,
+        });
+      }
+
+      for (const criterion of thread.criteria) {
+        const extractedCriterion = merged.criteria.find((item) => item.label === criterion.label);
+        if (!extractedCriterion) continue;
+        const criterionId = criteriaByLabel.get(criterion.label)?.id ?? criterion.id;
+        const current = existingEvaluations.get(criterionId);
+        if (current && current.confidence > extractedCriterion.confidence) continue;
+        const evidence = extractedCriterion.evidenceText
+          ? this.createEvidenceFromSource(runId, rowId, groundingSource.id, {
+              kind: "inferred_summary",
+              text: extractedCriterion.evidenceText,
+              columnKey: criterionId,
+            })
+          : null;
+        this.store.addEvaluation(runId, {
+          id: `${rowId}:${criterionId}`,
+          rowId,
+          criterionId,
+          verdict: extractedCriterion.verdict,
+          summary: extractedCriterion.summary,
+          confidence: extractedCriterion.confidence,
+          primaryEvidenceId: evidence?.id ?? null,
+        });
+      }
+
+      this.store.addActivity(
+        runId,
+        stageEvent(
+          runId,
+          "refinement",
+          "completed",
+          `Grounded ${merged.canonicalName} from ${groundingSource.domain}`,
+          compactSourcePayload({
+            actor: "corroboration",
+            title: "Grounded row",
+            rowId,
+            name: merged.canonicalName,
+            sourceUrl: groundingSource.url,
+            sourceCount: suggestedBySourceIds.size,
+          }),
+        ),
+      );
+    };
+    const processExtractedRows = (rows: ExtractedEntityRow[], docs: FetchedDoc[]) => {
+      const docsByUrl = new Map(docs.map((entry) => [this.normalizeUrl(entry.parsed.finalUrl), entry]));
+      const mergedRows = dedupeAndMerge(rows);
+      for (const merged of mergedRows) {
+        const doc = docsByUrl.get(this.normalizeUrl(merged.sourceUrl));
+        if (!doc) continue;
+        if (isCandidateOnlySourceClass(merged.sourceClass)) {
+          registerAnchor(merged, {
+            url: doc.parsed.finalUrl,
+            title: doc.parsed.title || doc.result.title,
+            snippet: doc.parsed.description || doc.result.description || "",
+            sourceClass: doc.parsed.sourceClass,
+          });
+          continue;
+        }
+        upsertGroundedRow(merged, doc);
+      }
+    };
+    const fetchByUrls = async (
+      urls: string[],
+      mode: "discovery" | "corroboration",
+    ): Promise<FetchedDoc[]> => {
+      const nextFetched: FetchedDoc[] = [];
+      const byUrl = new Map(discovered.map((result) => [this.normalizeUrl(result.url), result]));
+      for (const rawUrl of urls) {
+        if (this.failRunIfWallClockExceeded(runId)) return nextFetched;
+        this.assertRunActive(runId);
+        const normalizedUrl = this.normalizeUrl(rawUrl);
+        if (failedUrls.has(normalizedUrl) || fetchedUrls.has(normalizedUrl)) continue;
+
+        const anchorKey = queuedCorroborationUrls.get(normalizedUrl) ?? null;
+        queuedCorroborationUrls.delete(normalizedUrl);
+        const anchor = anchorKey ? anchorCandidates.get(anchorKey) : null;
+        if (anchor?.rowId) {
+          const row = this.store.getRow(runId, anchor.rowId);
+          if (row) {
+            this.store.upsertRow(runId, {
+              ...row,
+              processingState: "fetching",
+            });
+          }
+        }
+
+        const result = byUrl.get(normalizedUrl) ?? {
+          title: normalizedUrl,
+          url: normalizedUrl,
+          description: "",
+          age: "",
+        };
+
+        try {
+          const fetchStartedAt = now();
+          const parsed = await fetchAndParseDocument(normalizedUrl, this.config.fetchTextCharLimit, {
+            jinaApiKey: this.config.jinaApiKey,
+            entityType: thread.plan.entityType,
+            ...this.requestControlForRun(runId),
+          });
+          const fetchLatency = now() - fetchStartedAt;
+          const finalNorm = this.normalizeUrl(parsed.finalUrl);
+          if (fetchedUrls.has(finalNorm)) {
+            failedUrls.add(normalizedUrl);
+            continue;
+          }
+          const pruneDecision = classifySourceScopeDecision(
+            thread.thread.queryRaw,
+            {
+              title: parsed.title || result.title || "",
+              snippet: parsed.description || result.description || "",
+            },
+            finalNorm,
+          );
+          if (pruneDecision.eligibility === "out_of_scope_hard") {
+            if (pruneDecision.pruneKey) {
+              prunedSourceUrls.add(pruneDecision.pruneKey);
+              if (pruneDecision.reasonSummary) {
+                prunedSourceSummaries.set(pruneDecision.pruneKey, pruneDecision.reasonSummary);
+              }
+            }
+            failedUrls.add(normalizedUrl);
+            continue;
+          }
+
+          const usage = usageRecord(runId, "fetch", "http_fetch", "fetch_source", 1, fetchLatency, false, 0, 0, {
+            url: parsed.finalUrl,
+            mode,
+            sourceClass: parsed.sourceClass,
+          });
+          this.store.addUsage(runId, usage);
+          fetchedUrls.add(finalNorm);
+          const fetchedDoc = { result, parsed };
+          nextFetched.push(fetchedDoc);
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "fetch",
+              "completed",
+              `${mode === "corroboration" ? "Corroboration" : "Discovery"} fetch: ${parsed.title || finalNorm}`,
+              compactSourcePayload({
+                actor: "fetch",
+                title: "Fetched source",
+                sourceUrl: parsed.finalUrl,
+                sourceClass: parsed.sourceClass,
+                mode,
+              }),
+            ),
+          );
+        } catch (error) {
+          failedUrls.add(normalizedUrl);
+          queuedCorroborationUrls.delete(normalizedUrl);
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "fetch",
+              "failed",
+              error instanceof Error ? error.message : `Failed to fetch ${normalizedUrl}`,
+              compactSourcePayload({
+                actor: "fetch",
+                title: "Source fetch failed",
+                sourceUrl: normalizedUrl,
+                mode,
+              }),
+            ),
+          );
+        }
+      }
+      this.store.updateRun(runId, (current) => ({
+        ...current,
+        progress: {
+          ...current.progress,
+          sourcesFetched: fetchedUrls.size,
+        },
+      }));
+      return nextFetched;
+    };
+    const extractDocs = async (docs: FetchedDoc[]): Promise<ExtractedEntityRow[]> => {
+      const extracted: ExtractedEntityRow[] = [];
+      for (const entry of docs) {
+        if (this.failRunIfWallClockExceeded(runId)) return extracted;
+        const maybeAnchorKey = [...anchorCandidates.values()].find((anchor) =>
+          anchor.followUpUrls.has(this.normalizeUrl(entry.parsed.finalUrl))
+          || anchor.candidateWebsite === this.normalizeUrl(entry.parsed.finalUrl),
+        )?.key;
+        const anchor = maybeAnchorKey ? anchorCandidates.get(maybeAnchorKey) : null;
+        if (anchor?.rowId) {
+          const row = this.store.getRow(runId, anchor.rowId);
+          if (row) {
+            this.store.upsertRow(runId, {
+              ...row,
+              processingState: isGroundingSourceClass(entry.parsed.sourceClass) ? "corroborating" : "extracting_anchor",
+            });
+          }
+        }
+
+        const startedAt = now();
+        const providerResult = await extractDocumentWithGemini(
+          this.config,
+          {
+            query: thread.thread.queryRaw,
+            entityType: thread.plan.entityType,
+            criteria: thread.criteria.map((criterion) => ({
+              label: criterion.label,
+              kind: criterion.kind,
+            })),
+            columns: thread.columns.map((column) => ({
+              key: column.key,
+              label: column.label,
+              kind: column.kind,
+              valueType: column.valueType,
+            })),
+            url: entry.parsed.finalUrl,
+            title: entry.parsed.title || entry.result.title,
+            snippet: entry.parsed.description || entry.result.description,
+            bodyText: entry.parsed.text,
+          },
+          entry.parsed.sourceClass,
+          this.requestControlForRun(runId),
+        );
+        const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
+          backend: providerResult.meta.backend,
+          model: providerResult.meta.model,
+          sourceClass: entry.parsed.sourceClass,
+          url: entry.parsed.finalUrl,
+        });
+        this.store.addUsage(runId, usage);
+
+        const kept = providerResult.data.filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl));
+        for (const row of kept) {
+          extracted.push({
+            ...row,
+            sourceUrl: entry.parsed.finalUrl,
+            sourceClass: entry.parsed.sourceClass,
+          });
+        }
+
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "extraction",
+            "completed",
+            `${entry.parsed.sourceClass}: ${kept.length} ${kept.length === 1 ? "entity" : "entities"}`,
+            compactSourcePayload({
+              actor: entry.parsed.sourceClass === "entity_page" || entry.parsed.sourceClass === "official_site"
+                ? "corroboration"
+                : "anchor_extraction",
+              title: "Structured extraction",
+              sourceUrl: entry.parsed.finalUrl,
+              sourceClass: entry.parsed.sourceClass,
+              keptCount: kept.length,
+            }),
+          ),
+        );
+      }
+      return extracted;
+    };
+    const extractWithinBudget = async (docs: FetchedDoc[], context: string): Promise<ExtractedEntityRow[]> => {
+      const { allowedItems, skippedCount } = allocateExtractionBatch(extractionBudget, docs);
+      if (skippedCount > 0) {
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "extraction",
+            "skipped",
+            `Skipped ${skippedCount} sources (${context}).`,
+            compactSourcePayload({
+              actor: "extraction_budget",
+              title: "Extraction budget guard",
+              skippedSources: skippedCount,
+              remainingBudget: extractionBudget.remainingCalls,
+            }),
+          ),
+        );
+      }
+      if (allowedItems.length === 0) return [];
+      return extractDocs(allowedItems);
     };
 
     await this.runStage(runId, "planning", async () => {
@@ -1063,12 +1646,8 @@ export class AgenticSearchRuntime {
           actor: actorForStage("planning"),
           title: "Planning query",
           checkpoint: "plan persisted",
-          reasoning:
-            "The preview plan is already persisted, so the run starts from an explicit set of filters, columns, search queries, and budgets instead of re-planning blindly.",
-          rewards: [
-            { label: "entity_type", value: thread.plan.entityType },
-            { label: "search_queries", value: String(thread.plan.searchQueries.length) },
-          ],
+          entityType: thread.plan.entityType,
+          searchQueries: thread.plan.searchQueries.length,
         }),
       );
       await sleep(25);
@@ -1076,14 +1655,7 @@ export class AgenticSearchRuntime {
     if (this.shouldStop(runId)) return;
 
     await this.runStage(runId, "discovery", async () => {
-      const seenUrls = new Set<string>();
-      const searchResultCount = Math.min(
-        this.config.maxSourcesPerRun,
-        Math.max(this.config.searchResultsPerQuery, thread.thread.targetResults * 2),
-      );
-      let discoveryBudget = Math.min(this.config.maxSourcesPerRun, Math.max(thread.thread.targetResults * 3, 8));
       for (const query of thread.plan.searchQueries) {
-        if (discoveryBudget <= 0) break;
         this.assertRunActive(runId);
         const cacheKey = `search:${query.text}`;
         const cachedResults = this.cache.search.get(cacheKey) as BraveWebResult[] | undefined;
@@ -1097,7 +1669,7 @@ export class AgenticSearchRuntime {
           ?? await searchBraveWeb(
             this.config.braveApiKey!,
             query,
-            searchResultCount,
+            this.config.searchResultsPerQuery,
             this.requestControlForRun(runId),
           );
         const searchLatency = now() - searchStartedAt;
@@ -1133,609 +1705,37 @@ export class AgenticSearchRuntime {
             actor: actorForStage("discovery"),
             title: "Discovering candidates",
             checkpoint: "candidate rows created",
-            reasoning:
-              "Discovery stays broad. We would rather over-retrieve candidate documents here and let extraction plus verification narrow the table later.",
-            toolCalls: [
-              this.toolCallFromUsage(cacheUsage, "Check whether this search query was already cached.", {
-                input: cacheKey,
-                output: cachedResults ? "cache hit" : "cache miss",
-              }),
-              ...(searchUsage
-                ? [
-                    this.toolCallFromUsage(searchUsage, "Search the live web for candidate documents.", {
-                      input: query.text,
-                      output: `${searchResults.length} results`,
-                    }),
-                  ]
-                : []),
-            ],
+            query: query.text,
+            results: searchResults.length,
+            cacheHit: Boolean(cachedResults),
           }),
         );
 
         for (const result of searchResults) {
-          if (discoveryBudget <= 0) break;
-          const normalizedUrl = this.normalizeUrl(result.url);
-          if (failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) continue;
-          if (seenUrls.has(normalizedUrl)) continue;
-          seenUrls.add(normalizedUrl);
-          if (!enqueueDiscoveredCandidate(result)) continue;
-          discoveryBudget -= 1;
-          const provisionalRowId = makeId("row");
-          discoveredRowIdByUrl.set(normalizedUrl, provisionalRowId);
-          this.store.upsertRow(runId, {
-            id: provisionalRowId,
-            runId,
-            canonicalName: this.cleanTitle(result.title),
-              canonicalUrl: normalizedUrl,
-              entityType: thread.plan.entityType,
-              status: "uncertain",
-              statusReasonCode: null,
-              statusReasonSummary: null,
-              processingState: "pending",
-            score: 0.2,
-            rank: null,
-            sourceCount: 0,
-            duplicateOfRowId: null,
-            lineage: {
-              ...emptyLineage(classifySourceOrigin(normalizedUrl, result.title)),
-            },
-          });
-          for (const column of thread.columns) {
-            this.store.upsertCell(runId, {
-              id: `${provisionalRowId}:${column.key}`,
-              rowId: provisionalRowId,
-              columnKey: column.key,
-              valueText: null,
-              valueJson: null,
-              state: "pending",
-              confidence: 0,
-              reasonCode: null,
-              primaryEvidenceId: null,
-            });
-          }
+          registerDiscoveredResult(result);
         }
       }
     });
     if (this.shouldStop(runId)) return;
     if (this.failRunIfWallClockExceeded(runId)) return;
-
-    const fetchByUrls = async (urls: string[]): Promise<Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>> => {
-      const nextFetched: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }> = [];
-      const byUrl = new Map(discovered.map((result) => [this.normalizeUrl(result.url), result]));
-      for (const url of urls) {
-        if (this.failRunIfWallClockExceeded(runId)) return nextFetched;
-        this.assertRunActive(runId);
-        const normalizedUrl = this.normalizeUrl(url);
-        if (failedUrls.has(normalizedUrl)) continue;
-        if (fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === normalizedUrl)) continue;
-        const result = byUrl.get(normalizedUrl) ?? {
-          title: normalizedUrl,
-          url: normalizedUrl,
-          description: "",
-          age: "",
-        };
-
-        const provisionalRowId = discoveredRowIdByUrl.get(normalizedUrl);
-        if (provisionalRowId) {
-          const existingRow = this.store.getRow(runId, provisionalRowId);
-          if (existingRow) {
-            this.store.upsertRow(runId, { ...existingRow, processingState: "fetching" });
-          }
-        }
-
-        try {
-          const fetchStartedAt = now();
-          const parsed = await fetchAndParseDocument(normalizedUrl, this.config.fetchTextCharLimit, {
-            jinaApiKey: this.config.jinaApiKey,
-            entityType: thread.plan.entityType,
-            ...this.requestControlForRun(runId),
-          });
-          const fetchLatency = now() - fetchStartedAt;
-          const usage = usageRecord(runId, "fetch", "http_fetch", "fetch_source", 1, fetchLatency, false, 0, 0, {
-            url: parsed.finalUrl,
-            sourceClass: parsed.sourceClass,
-          });
-          this.store.addUsage(runId, usage);
-          const pruneDecision = classifySourceScopeDecision(
-            thread.thread.queryRaw,
-            {
-              title: parsed.title || result.title || "",
-              snippet: parsed.description || result.description || "",
-            },
-            this.normalizeUrl(parsed.finalUrl),
-          );
-          const finalNorm = this.normalizeUrl(parsed.finalUrl);
-          const alreadyFetchedFinalUrl =
-            fetchedDocs.some((entry) => this.normalizeUrl(entry.parsed.finalUrl) === finalNorm)
-            || nextFetched.some((entry) => this.normalizeUrl(entry.parsed.finalUrl) === finalNorm);
-          if (alreadyFetchedFinalUrl) {
-            failedUrls.add(normalizedUrl);
-            this.store.addActivity(
-              runId,
-              stageEvent(
-                runId,
-                "fetch",
-                "skipped",
-                `Skipped redirected duplicate source: ${parsed.finalUrl}`,
-                {
-                  actor: actorForStage("fetch"),
-                  title: "Source already fetched",
-                  checkpoint: "sources fetched",
-                  sourceUrl: finalNorm,
-                },
-              ),
-            );
-            continue;
-          }
-          if (pruneDecision.eligibility === "out_of_scope_hard") {
-            if (pruneDecision.pruneKey) {
-              prunedSourceUrls.add(pruneDecision.pruneKey);
-              if (pruneDecision.reasonSummary) {
-                prunedSourceSummaries.set(pruneDecision.pruneKey, pruneDecision.reasonSummary);
-              }
-            }
-            failedUrls.add(normalizedUrl);
-            if (pruneDecision.pruneKey) failedUrls.add(pruneDecision.pruneKey);
-            if (provisionalRowId) {
-              const existingRow = this.store.getRow(runId, provisionalRowId);
-              if (existingRow) {
-                this.store.upsertRow(runId, {
-                  ...existingRow,
-                  canonicalUrl: pruneDecision.pruneKey ?? existingRow.canonicalUrl,
-                  status: "rejected",
-                  statusReasonCode: pruneDecision.reasonCode,
-                  statusReasonSummary: pruneDecision.reasonSummary,
-                  processingState: "finalized",
-                  score: 0.05,
-                });
-              }
-            }
-            this.store.addActivity(
-              runId,
-              stageEvent(
-                runId,
-                "fetch",
-                "skipped",
-                `Pruned out-of-scope source: ${parsed.title || parsed.finalUrl}`,
-                {
-                  actor: actorForStage("fetch"),
-                  title: "Source scope gate",
-                  checkpoint: "sources fetched",
-                  reason: pruneDecision.reasonCode ?? "out_of_scope_hard",
-                  reasoning: pruneDecision.reasonSummary ?? undefined,
-                  sourceUrl: pruneDecision.pruneKey ?? this.normalizeUrl(parsed.finalUrl),
-                },
-              ),
-            );
-            continue;
-          }
-
-          nextFetched.push({ result, parsed });
-
-          if (provisionalRowId) {
-            discoveredRowIdByUrl.set(finalNorm, provisionalRowId);
-          }
-
-          const shortDomain = (() => { try { return new URL(parsed.finalUrl).hostname; } catch { return normalizedUrl; } })();
-          this.store.addActivity(
-            runId,
-            stageEvent(runId, "fetch", "completed", `Fetched ${shortDomain} (${parsed.sourceClass})`, {
-              actor: actorForStage("fetch"),
-              title: `Reading ${parsed.title || shortDomain}`,
-              checkpoint: "sources fetched",
-              toolCalls: [
-                this.toolCallFromUsage(usage, "Fetch and classify source page.", {
-                  input: normalizedUrl,
-                  output: `${parsed.sourceClass} · ${(parsed.text?.length ?? 0).toLocaleString()} chars`,
-                }),
-              ],
-            }),
-          );
-        } catch (error) {
-          failedUrls.add(normalizedUrl);
-          if (provisionalRowId) {
-            const existingRow = this.store.getRow(runId, provisionalRowId);
-            if (existingRow) {
-              this.store.upsertRow(runId, { ...existingRow, processingState: "failed" });
-            }
-          }
-          this.store.addActivity(
-            runId,
-            stageEvent(
-              runId,
-              "fetch",
-              "failed",
-              error instanceof Error ? error.message : `Failed to fetch ${normalizedUrl}`,
-              {
-                actor: actorForStage("fetch"),
-                title: "Fetching source document",
-                checkpoint: "sources fetched",
-              },
-            ),
-          );
-        }
-
-        this.store.updateRun(runId, (current) => ({
-          ...current,
-          progress: {
-            ...current.progress,
-            sourcesFetched: fetchedDocs.length + nextFetched.length,
-          },
-        }));
-      }
-      return nextFetched;
-    };
 
     await this.runStage(runId, "fetch", async () => {
       const initialFetchLimit = computeFetchBatchSize({
         iteration: 0,
         targetResults: thread.thread.targetResults,
-        currentRows: activeUniqueRows().length,
+        currentRows: visibleGroundedRows().length,
         remainingExtractionCalls: extractionBudget.remainingCalls,
         maxSourcesPerRun: this.config.maxSourcesPerRun,
       });
-      const fetched = await fetchByUrls(selectNextFetchUrls(initialFetchLimit));
+      const fetched = await fetchByUrls(selectNextDiscoveryUrls(initialFetchLimit), "discovery");
       fetchedDocs.push(...fetched);
     });
     if (this.shouldStop(runId)) return;
     if (this.failRunIfWallClockExceeded(runId)) return;
 
-    const extractFromFetched = async (
-      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
-    ): Promise<ExtractedEntityRow[]> => {
-      const extracted: ExtractedEntityRow[] = [];
-      for (const entry of docs) {
-        if (this.failRunIfWallClockExceeded(runId)) return extracted;
-        const normalizedUrl = this.normalizeUrl(entry.parsed.finalUrl);
-        const provisionalRowId = discoveredRowIdByUrl.get(normalizedUrl);
-        if (provisionalRowId) {
-          const existingRow = this.store.getRow(runId, provisionalRowId);
-          if (existingRow) {
-            this.store.upsertRow(runId, { ...existingRow, processingState: "extracting" });
-          }
-        }
-
-        const startedAt = now();
-        const providerResult = await extractDocumentWithGemini(
-          this.config,
-          {
-            query: thread.thread.queryRaw,
-            entityType: thread.plan.entityType,
-            criteria: thread.criteria.map((criterion) => ({
-              label: criterion.label,
-              kind: criterion.kind,
-            })),
-            columns: thread.columns.map((column) => ({
-              key: column.key,
-              label: column.label,
-              kind: column.kind,
-              valueType: column.valueType,
-            })),
-            url: entry.parsed.finalUrl,
-            title: entry.parsed.title || entry.result.title,
-            snippet: entry.parsed.description || entry.result.description,
-            bodyText: entry.parsed.text,
-          },
-          entry.parsed.sourceClass,
-          this.requestControlForRun(runId),
-        );
-        const extractLatency = now() - startedAt;
-        const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, extractLatency, false, 0, 0, {
-          backend: providerResult.meta.backend,
-          model: providerResult.meta.model,
-          sourceClass: entry.parsed.sourceClass,
-          url: entry.parsed.finalUrl,
-        });
-        this.store.addUsage(runId, usage);
-
-        let keptCount = 0;
-        for (const row of providerResult.data) {
-          if (isJunkExtraction(row, entry.parsed.finalUrl)) continue;
-          keptCount += 1;
-          extracted.push({
-            ...row,
-            sourceUrl: entry.parsed.finalUrl,
-            sourceClass: entry.parsed.sourceClass,
-          });
-        }
-
-        const shortDomain = (() => { try { return new URL(entry.parsed.finalUrl).hostname; } catch { return normalizedUrl; } })();
-        const entityNames = providerResult.data
-          .filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl))
-          .map((row) => row.canonicalName)
-          .slice(0, 5);
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "extraction",
-            "completed",
-            keptCount > 0
-              ? `Extracted ${keptCount} entit${keptCount === 1 ? "y" : "ies"} from ${shortDomain}: ${entityNames.join(", ")}`
-              : `No entities extracted from ${shortDomain}`,
-            {
-              actor: actorForStage("extraction"),
-              title: `Extracting from ${entry.parsed.title || shortDomain}`,
-              checkpoint: "entities extracted",
-              toolCalls: [
-                this.toolCallFromUsage(usage, "LLM structured extraction.", {
-                  input: `${entry.parsed.sourceClass} · ${entry.parsed.finalUrl}`,
-                  output: `${keptCount} entities kept (${providerResult.data.length} raw)`,
-                }),
-              ],
-            },
-          ),
-        );
-      }
-      return extracted;
-    };
-
-    const logExtractionBudgetSkip = (skippedCount: number, context: string): void => {
-      if (skippedCount <= 0) return;
-      this.store.addActivity(
-        runId,
-        stageEvent(
-          runId,
-          "extraction",
-          "skipped",
-          `Skipped ${skippedCount} source${skippedCount === 1 ? "" : "s"} because the extraction budget was exhausted (${context}).`,
-          {
-            actor: actorForStage("extraction"),
-            title: "Extraction budget guard",
-            reasoning:
-              "The live runtime caps LLM extraction calls per run so refinement cannot silently increase latency or cost beyond configured guardrails.",
-            rewards: [
-              { label: "remaining_budget", value: String(extractionBudget.remainingCalls) },
-              { label: "skipped_sources", value: String(skippedCount) },
-            ],
-          },
-        ),
-      );
-    };
-
-    const extractWithinBudget = async (
-      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
-      context: string,
-    ): Promise<ExtractedEntityRow[]> => {
-      const { allowedItems: allowedDocs, skippedCount } = allocateExtractionBatch(extractionBudget, docs);
-      logExtractionBudgetSkip(skippedCount, context);
-      if (allowedDocs.length === 0) return [];
-      return extractFromFetched(allowedDocs);
-    };
-
-    const upsertMergedRows = (
-      mergedRows: ExtractedEntityRow[],
-      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
-    ): void => {
-      const docsByUrl = new Map(docs.map((entry) => [this.normalizeUrl(entry.parsed.finalUrl), entry]));
-      const rows = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId);
-      const rowIdByName = new Map<string, string>();
-      for (const row of rows) {
-        const key = normalizeName(row.canonicalName);
-        if (key) rowIdByName.set(key, row.id);
-      }
-
-      for (const merged of mergedRows) {
-        const normalizedName = normalizeName(merged.canonicalName);
-        if (!normalizedName) continue;
-        const existingRowId = rowIdByName.get(normalizedName);
-        const rowId = existingRowId ?? discoveredRowIdByUrl.get(this.normalizeUrl(merged.sourceUrl)) ?? makeId("row");
-        rowIdByName.set(normalizedName, rowId);
-        const sourceEntry = docsByUrl.get(this.normalizeUrl(merged.sourceUrl));
-        const sourceDoc: SourceDocument = {
-          id: makeId("src"),
-          runId,
-          url: sourceEntry?.parsed.finalUrl ?? merged.sourceUrl,
-          normalizedUrl: this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl),
-          domain: (() => {
-            try {
-              return new URL(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl).hostname;
-            } catch {
-              return "unknown";
-            }
-          })(),
-          title: sourceEntry?.parsed.title ?? merged.canonicalName,
-          fetchedAt: now(),
-          fetchStatus: 200,
-          contentType: "text/html",
-          contentHash: `${this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl)}:${(sourceEntry?.parsed.text ?? "").length}`,
-          trustTier: merged.sourceClass === "directory" ? "primary_structured" : "reputable_secondary",
-          cacheKey: `page:${this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl)}`,
-          blobRef: null,
-          snippet: sourceEntry?.parsed.description ?? sourceEntry?.result.description ?? "",
-          favicon: sourceEntry
-            ? `https://www.google.com/s2/favicons?domain=${new URL(sourceEntry.parsed.finalUrl).hostname}&sz=16`
-            : null,
-        };
-        const existing = this.store.getRow(runId, rowId);
-        const groundsRow = isGroundingSourceClass(merged.sourceClass);
-        const nextStatus = coerceRowStatusForSource(merged.sourceClass, merged.rowStatus);
-        const terminalProcessing =
-          existing?.processingState === "verifying"
-          || existing?.processingState === "finalized"
-          || existing?.processingState === "failed";
-        const nextProcessingState = terminalProcessing
-          ? (existing?.processingState ?? "pending")
-          : "refining";
-        const suggestedBySourceIds = [
-          ...new Set([...(existing?.lineage.suggestedBySourceIds ?? []), sourceDoc.id]),
-        ];
-        const groundedBySourceIds = groundsRow
-          ? [...new Set([...(existing?.lineage.groundedBySourceIds ?? []), sourceDoc.id])]
-          : [...(existing?.lineage.groundedBySourceIds ?? [])];
-
-        this.store.upsertRow(runId, {
-          id: rowId,
-          runId,
-          canonicalName: merged.canonicalName,
-          canonicalUrl: existing?.canonicalUrl ?? sourceDoc.url,
-          entityType: thread.plan.entityType,
-          status: nextStatus,
-          statusReasonCode: null,
-          statusReasonSummary: null,
-          processingState: nextProcessingState,
-          score: merged.score,
-          rank: existing?.rank ?? null,
-          sourceCount: Math.max(existing?.sourceCount ?? 0, 1),
-          duplicateOfRowId: existing?.duplicateOfRowId ?? null,
-          lineage: {
-            suggestedBySourceIds,
-            groundedBySourceIds,
-            sourceOriginClass: classifySourceOrigin(sourceDoc.url, sourceDoc.title),
-          },
-        });
-        this.store.addSource(runId, rowId, sourceDoc);
-
-        for (const column of thread.columns) {
-          const extractedCell = merged.cells.find((cell) => cell.key === column.key);
-          const valueText = column.key === "evidence_count"
-            ? "1"
-            : extractedCell?.valueText ?? null;
-          const state: CellState = column.key === "evidence_count"
-            ? "filled"
-            : extractedCell?.state ?? "unsupported";
-          const evidenceText = column.key === "evidence_count"
-            ? "Resolved against 1 fetched source document."
-            : extractedCell?.evidenceText ?? null;
-          const evidence = evidenceText
-            ? this.createEvidenceFromSource(runId, rowId, sourceDoc.id, {
-              kind: "inferred_summary",
-              text: evidenceText,
-              columnKey: column.key,
-            })
-            : null;
-          this.store.upsertCell(runId, {
-            id: `${rowId}:${column.key}`,
-            rowId,
-            columnKey: column.key,
-            valueText,
-            valueJson: null,
-            state,
-            confidence: extractedCell?.confidence ?? (column.key === "evidence_count" ? 1 : 0.2),
-            reasonCode: extractedCell?.reasonCode ?? (state === "unsupported" ? "model_omitted_field" : null),
-            primaryEvidenceId: evidence?.id ?? null,
-          });
-        }
-
-        for (const criterion of thread.criteria) {
-          const extracted = merged.criteria.find((entry) => entry.label === criterion.label);
-          const evidence = extracted?.evidenceText
-            ? this.createEvidenceFromSource(runId, rowId, sourceDoc.id, {
-              kind: "inferred_summary",
-              text: extracted.evidenceText,
-              columnKey: criterion.id,
-            })
-            : null;
-          this.store.addEvaluation(runId, {
-            id: `${rowId}:${criterion.id}`,
-            rowId,
-            criterionId: criteriaByLabel.get(criterion.label)?.id ?? criterion.id,
-            verdict: extracted?.verdict ?? "uncertain",
-            summary: extracted?.summary ?? "Criterion could not be grounded from extracted evidence.",
-            confidence: extracted?.confidence ?? 0.25,
-            primaryEvidenceId: evidence?.id ?? null,
-          });
-        }
-
-        const followUpUrls = collectFollowUpUrls(merged);
-        for (const followUpUrl of followUpUrls) {
-          enqueueFollowUpCandidate({
-            title: merged.canonicalName,
-            url: followUpUrl,
-            description: merged.rowSummary,
-          });
-        }
-
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "extraction",
-            "completed",
-            `${groundsRow ? "Grounded" : "Queued"} row ${merged.canonicalName} from ${sourceDoc.domain}`,
-            {
-              actor: actorForStage("extraction"),
-              title: groundsRow ? "Row grounded" : "Row candidate queued",
-              checkpoint: groundsRow ? "row grounded" : "row candidate queued",
-              sourceUrl: sourceDoc.url,
-              sourceClass: merged.sourceClass,
-              rowName: merged.canonicalName,
-              rowUrl: existing?.canonicalUrl ?? sourceDoc.url,
-              followUpUrls,
-              grounded: groundsRow,
-            },
-          ),
-        );
-      }
-      const totalRows = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId).length;
-      this.store.updateRun(runId, (current) => ({
-        ...current,
-        progress: {
-          ...current.progress,
-          totalRows,
-          rowsCreated: totalRows,
-          sourcesFetched: fetchedDocs.length,
-          cellsResolved: this.store.listCells(runId).filter((cell) => cell.state !== "pending").length,
-        },
-      }));
-    };
-
     await this.runStage(runId, "extraction", async () => {
       const extracted = await extractWithinBudget(fetchedDocs, "initial extraction");
-      const merged = dedupeAndMerge(extracted);
-      upsertMergedRows(merged, fetchedDocs);
-
-      if (merged.length > 0 || extracted.length > 0) {
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "extraction",
-            "completed",
-            `Dedup: ${extracted.length} raw → ${merged.length} unique entit${merged.length === 1 ? "y" : "ies"}`,
-            {
-              actor: actorForStage("extraction"),
-              title: "Deduplication complete",
-              checkpoint: "entities deduplicated",
-            },
-          ),
-        );
-      }
-
-      const immediateFollowUpLimit = computeFetchBatchSize({
-        iteration: 1,
-        targetResults: thread.thread.targetResults,
-        currentRows: activeUniqueRows().length,
-        remainingExtractionCalls: extractionBudget.remainingCalls,
-        maxSourcesPerRun: this.config.maxSourcesPerRun,
-        preferFollowUps: true,
-      });
-      const immediateFollowUps = selectQueuedFollowUpUrls(immediateFollowUpLimit, true);
-      if (immediateFollowUps.length > 0) {
-        const followUpFetched = await fetchByUrls(immediateFollowUps);
-        if (followUpFetched.length > 0) {
-          fetchedDocs.push(...followUpFetched);
-          const followUpExtracted = await extractWithinBudget(followUpFetched, "immediate follow-up extraction");
-          const followUpMerged = dedupeAndMerge(followUpExtracted);
-          upsertMergedRows(followUpMerged, fetchedDocs);
-          this.store.addActivity(
-            runId,
-            stageEvent(
-              runId,
-              "refinement",
-              "completed",
-              `Chased ${followUpFetched.length} follow-up source${followUpFetched.length === 1 ? "" : "s"} immediately after list extraction.`,
-              {
-                actor: "Supervisor",
-                title: "Immediate follow-up fetch",
-                reasoning:
-                  "Entity/profile URLs extracted from list pages are higher-value than another broad search step, so the runtime follows a small batch immediately.",
-                sourceUrls: immediateFollowUps,
-              },
-            ),
-          );
-        }
-      }
+      processExtractedRows(extracted, fetchedDocs);
     });
     if (this.shouldStop(runId)) return;
     if (this.failRunIfWallClockExceeded(runId)) return;
@@ -1764,349 +1764,72 @@ export class AgenticSearchRuntime {
           });
         } else {
           seen.set(key, row.id);
+          rowIdByName.set(key, row.id);
         }
       }
     });
     if (this.shouldStop(runId)) return;
 
-    for (let iteration = 1; iteration <= this.config.maxSupervisorIterations; iteration += 1) {
-      if (this.shouldStop(runId)) return;
-      if (this.failRunIfWallClockExceeded(runId)) return;
-      if (!hasExtractionBudgetRemaining(extractionBudget)) {
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "refinement",
-            "skipped",
-            "Supervisor stopped because the extraction budget is exhausted.",
-            {
-              actor: "Supervisor",
-              title: "Refinement budget guard",
-              reasoning:
-                "Further discovery would only fetch more sources without the budget required to extract grounded rows from them.",
-            },
-          ),
-        );
-        break;
-      }
-
-      this.store.updateRun(runId, (current) => ({
-        ...current,
-        status: "running",
-        stage: "refinement",
-        metrics: {
-          ...current.metrics,
-          elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
-        },
-      }));
-
-      const activeRows = activeUniqueRows();
-      const groundedRowCount = activeRows.filter((row) => row.lineage.groundedBySourceIds.length > 0).length;
-      const hasPendingFollowUps = followUpUrlQueue.some((url) => {
-        if (consumedFollowUpUrls.has(url)) return false;
-        return !prunedSourceUrls.has(url)
-          && !failedUrls.has(url)
-          && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
-      });
-      if (
-        shouldStopExploration(activeRows.length, thread.thread.targetResults)
-        && (groundedRowCount >= thread.thread.targetResults || !hasPendingFollowUps)
-      ) {
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "refinement",
-            "completed",
-            `Stopped refinement after reaching the target row count (${activeRows.length}/${thread.thread.targetResults}).`,
-            {
-              actor: "Supervisor",
-              title: "Target row count reached",
-              reasoning:
-                "The loop is intentionally shallow per iteration. Once the candidate row target is reached, the run moves on to verification and ranking instead of spending more extraction budget.",
-            },
-          ),
-        );
-        break;
-      }
-      const summaries = thread.columns.map((column) => {
-        let filled = 0;
-        let confidence = 0;
-        for (const row of activeRows) {
-          const details = this.store.getRowDetails(runId, row.id);
-          const cell = details?.cells.find((entry) => entry.columnKey === column.key);
-          if (cell?.state === "filled") {
-            filled += 1;
-            confidence += cell.confidence;
-          }
+    await this.runStage(runId, "refinement", async () => {
+      let iteration = 1;
+      while (!this.shouldStop(runId) && hasExtractionBudgetRemaining(extractionBudget)) {
+        if (this.failRunIfWallClockExceeded(runId)) return;
+        const groundedCount = visibleGroundedRows().length;
+        if (shouldStopExploration(groundedCount, thread.thread.targetResults)) {
+          break;
         }
-        return {
-          label: column.label,
-          fillRate: activeRows.length > 0 ? filled / activeRows.length : 0,
-          avgConfidence: filled > 0 ? confidence / filled : 0,
-        };
-      });
 
-      const unfetchedUrls = selectNextFetchUrls(10);
+        const pendingAnchors = [...anchorCandidates.values()].filter((anchor) => anchorNeedsCorroboration(anchor));
+        const fetchLimit = computeFetchBatchSize({
+          iteration,
+          targetResults: thread.thread.targetResults,
+          currentRows: groundedCount,
+          remainingExtractionCalls: extractionBudget.remainingCalls,
+          maxSourcesPerRun: this.config.maxSourcesPerRun,
+          pendingAnchors: pendingAnchors.length,
+          preferFollowUps: pendingAnchors.length > 0,
+        });
+        let targetUrls = selectedCorroborationUrls(fetchLimit);
+        let mode: "discovery" | "corroboration" = "corroboration";
 
-      let decision: Awaited<ReturnType<typeof supervisorDecide>>["data"] = {
-        action: "done",
-        queries: [],
-        urls: [],
-        focusColumns: [],
-        reasoning: "",
-      };
-      try {
-          decision = (await supervisorDecide(this.config, {
-            query: thread.thread.queryRaw,
-            iteration,
-            maxIterations: this.config.maxSupervisorIterations,
-            totalRows: activeRows.length,
-            targetRows: thread.thread.targetResults,
-            columnSummaries: summaries,
-            unfetchedUrls,
-            prunedSources: [...prunedSourceSummaries.entries()].map(([url, reasonSummary]) => ({
-              url,
-              reasonSummary,
-            })),
-          }, this.requestControlForRun(runId))).data;
-      } catch (error) {
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "refinement",
-            "skipped",
-            `Supervisor skipped: ${error instanceof Error ? error.message : "unknown error"}`,
-          ),
-        );
-        break;
-      }
-
-      this.store.addActivity(
-        runId,
-        stageEvent(
-          runId,
-          "refinement",
-          decision.action === "done" ? "completed" : "started",
-          decision.action === "done"
-            ? `Supervisor: done (${activeRows.length} rows, iter ${iteration}/${this.config.maxSupervisorIterations})`
-            : `Supervisor iter ${iteration}: ${decision.action.replace(/_/g, " ")} — ${decision.reasoning || "expanding coverage"}`,
-          {
-            actor: "Supervisor",
-            title: decision.action === "done" ? "Research complete" : `Supervisor — ${decision.action.replace(/_/g, " ")}`,
-            reasoning: decision.reasoning || undefined,
-            rewards: [
-              { label: "action", value: decision.action },
-              { label: "iteration", value: `${iteration}/${this.config.maxSupervisorIterations}` },
-              { label: "rows", value: String(activeRows.length) },
-            ],
-          },
-        ),
-      );
-
-      if (decision.action === "done") {
-        break;
-      }
-
-      if (decision.action === "search_more") {
-        try {
-          const rewritten = await rewriteQueries(this.config, {
-            query: thread.thread.queryRaw,
-            gapColumns: decision.focusColumns,
-          }, this.requestControlForRun(runId));
-          for (const queryText of rewritten.data) {
-            const nextResults = await searchBraveWeb(
-              this.config.braveApiKey!,
-              { id: makeId("sq"), text: queryText },
-              Math.min(
-                this.config.maxSourcesPerRun,
-                Math.max(this.config.searchResultsPerQuery, thread.thread.targetResults * 2),
-              ),
-              this.requestControlForRun(runId),
-            );
-            for (const result of nextResults) {
-              const normalized = this.normalizeUrl(result.url);
-              if (failedUrls.has(normalized) || prunedSourceUrls.has(normalized)) continue;
-              enqueueDiscoveredCandidate(result);
-            }
-          }
-        } catch {
-          // Best effort only.
+        if (targetUrls.length === 0 && pendingAnchors.length > 0) {
+          await seedCorroborationSearches(Math.min(2, pendingAnchors.length));
+          targetUrls = selectedCorroborationUrls(fetchLimit);
         }
-      }
 
-      const refinementFetchLimit = computeFetchBatchSize({
-        iteration,
-        targetResults: thread.thread.targetResults,
-        currentRows: activeRows.length,
-        remainingExtractionCalls: extractionBudget.remainingCalls,
-        maxSourcesPerRun: this.config.maxSourcesPerRun,
-        preferFollowUps: followUpUrlQueue.some((url) => {
-          if (consumedFollowUpUrls.has(url)) return false;
-          return !prunedSourceUrls.has(url)
-            && !failedUrls.has(url)
-            && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
-        }),
-      });
-
-      const targetUrls = (decision.urls.length > 0 ? decision.urls : unfetchedUrls)
-        .map((url) => this.normalizeUrl(url))
-        .filter((url) => {
-          return !prunedSourceUrls.has(url);
-        })
-        .slice(0, refinementFetchLimit);
-      for (const targetUrl of targetUrls) {
-        if (followUpSeenUrls.has(targetUrl)) {
-          consumedFollowUpUrls.add(targetUrl);
+        if (targetUrls.length === 0) {
+          mode = "discovery";
+          targetUrls = selectNextDiscoveryUrls(fetchLimit);
         }
-      }
-      const newFetched = await fetchByUrls(targetUrls);
-      if (newFetched.length === 0) {
-        continue;
-      }
-      fetchedDocs.push(...newFetched);
-      const extracted = await extractWithinBudget(newFetched, `supervisor iteration ${iteration}`);
-      const merged = dedupeAndMerge(extracted);
-      upsertMergedRows(merged, fetchedDocs);
 
-      const totalAfter = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId).length;
-      this.store.addActivity(
-        runId,
-        stageEvent(
-          runId,
-          "extraction",
-          "completed",
-          `Supervisor iter ${iteration} done: +${merged.length} entit${merged.length === 1 ? "y" : "ies"}, ${totalAfter} total rows`,
-          {
-            actor: "Supervisor",
-            title: `Iteration ${iteration} complete`,
-            checkpoint: "supervisor iteration complete",
-          },
-        ),
-      );
+        if (targetUrls.length === 0) {
+          break;
+        }
 
-      if (this.shouldStop(runId)) return;
-    }
-
-    await this.runStage(runId, "verification", async () => {
-      let verificationsUsed = 0;
-
-      for (const row of this.store.listRows(runId).filter((candidateRow) => {
-        if (candidateRow.duplicateOfRowId) return false;
-        if (candidateRow.lineage.groundedBySourceIds.length === 0) return false;
-        const details = this.store.getRowDetails(runId, candidateRow.id);
-        const hasWeakCriterion = details?.evaluations.some(
-          (evaluation) => evaluation.verdict === "uncertain" || evaluation.verdict === "conflict",
-        );
-        return candidateRow.status === "uncertain" || candidateRow.status === "conflict" || hasWeakCriterion;
-      })) {
-        this.assertRunActive(runId);
-        if (verificationsUsed >= this.config.maxVerificationsPerRun) {
-          this.store.addActivity(
-            runId,
-            stageEvent(runId, "verification", "skipped", `Skipped extra verification for ${row.canonicalName}.`, {
-              actor: actorForStage("verification"),
-              title: "Verification budget guard",
-              reasoning:
-                "Verification is reserved for the most ambiguous rows once the budget is tight. Skipped rows retain their extracted state.",
-            }),
-          );
+        const newFetched = await fetchByUrls(targetUrls, mode);
+        if (newFetched.length === 0) {
+          iteration += 1;
           continue;
         }
+        fetchedDocs.push(...newFetched);
+        const extracted = await extractWithinBudget(newFetched, `${mode} iteration ${iteration}`);
+        processExtractedRows(extracted, newFetched);
+        iteration += 1;
+      }
 
-        this.store.upsertRow(runId, {
-          ...row,
-          processingState: "verifying",
-        });
-
-        const details = this.store.getRowDetails(runId, row.id);
-        if (!details) continue;
-        const startedAt = now();
-        const verificationResult = await verifyWithGemini(this.config, {
-          query: thread.thread.queryRaw,
-          rowName: row.canonicalName,
-          rowUrl: row.canonicalUrl,
-          rowStatus: row.status,
-          score: row.score,
-          criteria: details.evaluations.map((evaluation) => ({
-            label: details.criteria.find((criterion) => criterion.id === evaluation.criterionId)?.label ?? evaluation.criterionId,
-            kind: details.criteria.find((criterion) => criterion.id === evaluation.criterionId)?.kind ?? "hard_filter",
-            verdict: evaluation.verdict,
-            summary: evaluation.summary,
-          })),
-          columns: details.cells.map((cell) => ({
-            key: cell.columnKey,
-            label: thread.columns.find((column) => column.key === cell.columnKey)?.label ?? cell.columnKey,
-            state: cell.state,
-            valueText: cell.valueText,
-          })),
-          sourceEvidence: details.sources.map((source) => ({
-            title: source.title,
-            url: source.url,
-            snippet: source.snippet,
-          })),
-        }, this.requestControlForRun(runId));
-        const verification = verificationResult.data;
-        verificationsUsed += 1;
-        const usage = usageRecord(runId, "llm", "gemini", "verify_candidate", 1, now() - startedAt, false, 0, 0, {
-          rowId: row.id,
-          backend: verificationResult.meta.backend,
-          model: verificationResult.meta.model,
-        });
-        this.store.addUsage(runId, usage);
-
-        this.store.upsertRow(runId, {
-          ...row,
-          status: verification.rowStatus,
-          score: verification.score,
-          processingState: "verifying",
-        });
-
-        for (const criterion of verification.criteria) {
-          const criterionId =
-            criteriaByLabel.get(criterion.label)?.id
-            ?? thread.criteria.find((entry) => entry.label === criterion.label)?.id;
-          if (!criterionId) continue;
-          const sourceId = details.sources[0]?.id ?? null;
-          const evidence = sourceId && criterion.evidenceText
-            ? this.createEvidenceFromSource(runId, row.id, sourceId, {
-                kind: "inferred_summary",
-                text: criterion.evidenceText,
-                columnKey: criterionId,
-              })
-            : null;
-          this.store.addEvaluation(runId, {
-            id: `${row.id}:${criterionId}`,
-            rowId: row.id,
-            criterionId,
-            verdict: criterion.verdict,
-            summary: criterion.summary,
-            confidence: criterion.confidence,
-            primaryEvidenceId: evidence?.id ?? null,
-          });
-        }
-
+      if (this.config.enableSupervisorRefinement) {
         this.store.addActivity(
           runId,
-          stageEvent(runId, "verification", "completed", `Validated ambiguous row ${row.canonicalName}.`, {
-            actor: actorForStage("verification"),
-            title: "Validating row state",
-            checkpoint: "criteria evaluated",
-            reasoning:
-              "Only rows with ambiguity or weak criteria get the stronger verification pass. Clean rows do not spend extra budget.",
-            toolCalls: [
-              this.toolCallFromUsage(usage, "Re-check ambiguous rows with the higher-confidence verifier.", {
-                input: row.canonicalName,
-                output: `${verification.rowStatus} @ ${verification.score.toFixed(2)}`,
-              }),
-            ],
-            rewards: [
-              { label: "backend", value: verificationResult.meta.backend },
-              { label: "model", value: verificationResult.meta.model },
-            ],
-          }),
+          stageEvent(
+            runId,
+            "refinement",
+            "skipped",
+            "Supervisor experiment flag is enabled, but the simplified deterministic loop handled this run.",
+            compactSourcePayload({
+              actor: "corroboration",
+              title: "Supervisor skipped",
+            }),
+          ),
         );
       }
     });
@@ -2134,6 +1857,7 @@ export class AgenticSearchRuntime {
           entry.row,
           entry.details?.evaluations ?? [],
           thread.criteria,
+          entry.details?.sources ?? [],
           {
             rejectConfidenceMin: DEFAULT_REJECT_CONFIDENCE_MIN,
             acceptConfidenceMin: DEFAULT_ACCEPT_CONFIDENCE_MIN,
@@ -2157,10 +1881,7 @@ export class AgenticSearchRuntime {
           actor: actorForStage("ranking"),
           title: "Ranking and partitioning rows",
           checkpoint: "final ranking committed",
-          reasoning:
-            "Ranking is deterministic here: hard filter failures become rejects, surviving rows keep their extracted scores, and rejected candidates drop into the unmatched partition.",
-          rewards: this.computeRewardSignals(runId, thread.thread.targetResults),
-          metrics: this.store.getRun(runId)?.metrics.providerBreakdown ?? [],
+          rows: rankedRows.length,
         }),
       );
       await sleep(20);
@@ -2331,17 +2052,9 @@ export class AgenticSearchRuntime {
   private requestControlForRun(runId: string, timeoutMs = this.config.requestTimeoutMs): RequestControl {
     this.assertRunActive(runId);
     const controller = this.getOrCreateRunAbortController(runId);
-    const run = this.store.getRun(runId);
-    const remainingWallClockMs =
-      run?.startedAt && this.config.maxRunWallClockMs > 0
-        ? Math.max(1, run.startedAt + this.config.maxRunWallClockMs - now())
-        : null;
-
     return {
       signal: controller.signal,
-      timeoutMs: remainingWallClockMs
-        ? Math.min(timeoutMs, remainingWallClockMs)
-        : timeoutMs,
+      timeoutMs,
     };
   }
 

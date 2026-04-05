@@ -29,20 +29,20 @@ export function StatusBadge({
     );
   }
 
-  if (processingState === "extracting") {
+  if (processingState === "extracting" || processingState === "extracting_anchor") {
     return (
       <span className={`${baseClass} border-violet-200 bg-violet-50 text-violet-700`}>
         <Loader2 className="h-3 w-3 animate-spin" />
-        Extracting
+        {processingState === "extracting_anchor" ? "Extracting anchor" : "Extracting"}
       </span>
     );
   }
 
-  if (processingState === "refining") {
+  if (processingState === "refining" || processingState === "corroborating") {
     return (
       <span className={`${baseClass} border-emerald-200 bg-emerald-50 text-emerald-800`}>
         <Loader2 className="h-3 w-3 animate-spin opacity-60" />
-        Refining
+        {processingState === "corroborating" ? "Corroborating" : "Refining"}
       </span>
     );
   }

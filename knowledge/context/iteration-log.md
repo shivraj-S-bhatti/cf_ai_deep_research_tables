@@ -3,7 +3,7 @@
 ## Document Metadata
 
 - `Doc ID`: `context.iteration-log`
-- `Version`: `1.0.1`
+- `Version`: `1.1.0`
 - `Status`: `working`
 - `Kind`: `iteration-log`
 - `Last Updated`: `2026-04-05`
@@ -13,6 +13,59 @@
 ## Scope
 
 This file keeps non-binding project context, external critique, and iteration notes that we want to preserve for later reporting and analysis.
+
+## Devlog Entry — 2026-04-05 (Anchor-first live loop + explicit preview pending states)
+
+### Symptom
+
+- The live runtime was spending too much time creating and then cleaning up weak provisional rows.
+- Directory/list pages could dominate the budget before real corroborating pages were fetched.
+- Preview creation and run start looked inert for several seconds because the UI had no explicit pending state.
+
+### Logical error in the old loop
+
+The old live path was still shaped like:
+
+- discover pages
+- turn pages into provisional rows
+- validate ambiguous rows late
+- let supervisor/rewrite logic repair weak retrieval
+
+That model creates a lot of compensating heuristics because row identity is materialized too early. It also makes `targetResults` ambiguous because candidate count gets conflated with grounded output quality.
+
+### Simplification
+
+The default live loop is now treated as:
+
+- discovery returns pages only
+- list/directory/forum pages emit anchor candidates only
+- once an anchor exists, the next work is corroboration, not more broad search
+- visible rows are created only after at least one grounding source exists
+- final acceptance requires grounded evidence, not list-page optimism
+
+Operationally this means:
+
+- `targetResults` counts grounded final rows
+- row URL defaults to the first backing source URL
+- website/entity URLs remain cell-level until corroborated
+- the supervisor/rewrite path is no longer the default control loop
+
+### Preview UX fix
+
+The client store now exposes explicit pending flags for:
+
+- preview creation from home
+- preview refresh after query edits
+- run start from preview
+
+The main shell uses those flags to:
+
+- disable duplicate submits
+- show `Building preview…`
+- show `Refreshing preview…`
+- show `Starting research…`
+
+This does not shorten provider latency directly, but it makes the latency legible instead of looking broken.
 
 ## Devlog Entry — 2026-04-05 (Client thread store: `listThreads` vs `activeThreadId`)
 

@@ -105,6 +105,9 @@ export function useThreadStore() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadsLoaded, setThreadsLoaded] = useState(false);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [creatingPreviewThread, setCreatingPreviewThread] = useState(false);
+  const [refreshingPreviewThreadId, setRefreshingPreviewThreadId] = useState<string | null>(null);
+  const [startingRunThreadId, setStartingRunThreadId] = useState<string | null>(null);
   const threadsRef = useRef<Thread[]>(threads);
   const activeThreadIdRef = useRef<string | null>(null);
   const hydrateAbortRef = useRef<AbortController | null>(null);
@@ -235,52 +238,62 @@ export function useThreadStore() {
 
   const createThread = useCallback(
     async (query: string) => {
-      let preview: PreviewResponse;
+      setCreatingPreviewThread(true);
       try {
-        preview = await apiClient.previewQuery({
+        let preview: PreviewResponse;
+        try {
+          preview = await apiClient.previewQuery({
+            query,
+            targetResults: 10,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "planner failed";
+          throw new Error(`Could not generate criteria from planner: ${message}`);
+        }
+        const response = await apiClient.createThread({
           query,
           targetResults: 10,
+          criteria: preview.criteria,
+          columns: preview.columns,
+          preview,
         });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "planner failed";
-        throw new Error(`Could not generate criteria from planner: ${message}`);
+        const thread = await hydrateThread(response.threadId);
+        setActiveThreadId(response.threadId);
+        return thread;
+      } finally {
+        setCreatingPreviewThread(false);
       }
-      const response = await apiClient.createThread({
-        query,
-        targetResults: 10,
-        criteria: preview.criteria,
-        columns: preview.columns,
-        preview,
-      });
-      const thread = await hydrateThread(response.threadId);
-      setActiveThreadId(response.threadId);
-      return thread;
     },
     [hydrateThread],
   );
 
   const refreshQueryPlan = useCallback(
     async (threadId: string, query: string) => {
-      const thread = threads.find((entry) => entry.id === threadId);
-      const targetResults = clampTargetResults(thread?.targetResults ?? 10);
-      let preview: PreviewResponse;
+      setRefreshingPreviewThreadId(threadId);
       try {
-        preview = await apiClient.previewQuery({
+        const thread = threads.find((entry) => entry.id === threadId);
+        const targetResults = clampTargetResults(thread?.targetResults ?? 10);
+        let preview: PreviewResponse;
+        try {
+          preview = await apiClient.previewQuery({
+            query,
+            targetResults,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "planner failed";
+          throw new Error(`Could not refresh criteria from planner: ${message}`);
+        }
+        await apiClient.updateThreadConfig(threadId, {
           query,
           targetResults,
+          criteria: preview.criteria,
+          columns: preview.columns,
+          preview,
         });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "planner failed";
-        throw new Error(`Could not refresh criteria from planner: ${message}`);
+        return hydrateThread(threadId);
+      } finally {
+        setRefreshingPreviewThreadId((current) => (current === threadId ? null : current));
       }
-      await apiClient.updateThreadConfig(threadId, {
-        query,
-        targetResults,
-        criteria: preview.criteria,
-        columns: preview.columns,
-        preview,
-      });
-      return hydrateThread(threadId);
     },
     [hydrateThread, threads],
   );
@@ -325,8 +338,13 @@ export function useThreadStore() {
 
   const startRun = useCallback(
     async (threadId: string) => {
-      await apiClient.createRun(threadId);
-      return hydrateThread(threadId);
+      setStartingRunThreadId(threadId);
+      try {
+        await apiClient.createRun(threadId);
+        return hydrateThread(threadId);
+      } finally {
+        setStartingRunThreadId((current) => (current === threadId ? null : current));
+      }
     },
     [hydrateThread],
   );
@@ -419,6 +437,9 @@ export function useThreadStore() {
   return {
     threads,
     threadsLoaded,
+    creatingPreviewThread,
+    refreshingPreviewThreadId,
+    startingRunThreadId,
     activeThread,
     activeThreadId,
     activeRun,

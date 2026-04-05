@@ -3,7 +3,7 @@
 ## Document Metadata
 
 - `Doc ID`: `context.current-decisions`
-- `Version`: `1.4.1`
+- `Version`: `1.5.0`
 - `Status`: `authoritative`
 - `Kind`: `decision-record`
 - `Last Updated`: `2026-04-05`
@@ -24,6 +24,7 @@
 - Keep the local runtime hybrid: deterministic fixtures for tests, live Brave + Gemini for operator-driven local development when secrets are available.
 - Use D1 as the future source of truth and KV as cache only; never model live run state around KV semantics.
 - Treat progressive rendering as a binding contract: rows appear early, pending cells show loaders, weak terminal cells stay explicit, and dashes appear only for terminal blanks.
+- Refine progressive rendering so the main table only shows grounded rows; candidate anchors remain internal until at least one grounding source exists.
 - Expose observability and budget usage inside the app, not only in logs.
 - Keep the main product path restrained by default:
   - query
@@ -34,23 +35,29 @@
   - small execution summary
 - Keep the full execution trace, tool/function calls, provider ledger, raw payloads, and debug metrics in a separate engineer-facing debug workspace.
 - Use richer row processing states than a binary pending/finalized model:
-  - `pending`
-  - `verifying`
+  - `fetching`
+  - `extracting_anchor`
+  - `corroborating`
   - `finalized`
   - `failed`
 - Keep rejected rows visible in a dedicated unmatched section instead of mixing them into the accepted result partition.
 - Distinguish `not_found` from `unsupported` clearly in detail views even if both compact to a dash in the table.
 - Prefer stage/module language over anthropomorphic agent language in the product path.
 - Treat candidate-document vs candidate-entity separation as a core quality concern, not a later polish item.
+- Treat list/directory/forum pages as candidate generators only; they may emit anchors and follow-up URLs, but they do not directly produce accepted rows in the default live path.
 - Maintain row lineage explicitly:
   - suggesting sources
   - grounding sources
   - source origin class
+- Treat `targetResults` as grounded final rows, not provisional candidate count.
+- Treat the default row URL as the first backing source URL; website/entity URL stays a normal cell.
+- Fold validation into corroboration and finalization instead of running a separate late verifier loop in the default path.
+- Keep supervisor/rewrite refinement behind an experiment flag; the default live path is deterministic and corroboration-first.
 - Guard free-tier provider usage explicitly:
   - cap candidate fan-out per run
   - cap LLM extraction calls per run
-  - cap verification passes per run
-  - degrade rows into heuristic fallback states instead of crashing the run
+  - cap corroboration fan-out per source family
+  - prefer fewer, higher-value corroboration fetches over broad late cleanup
 - Never let a background run rejection kill the local dev server; terminal failure should be observable in-app and non-fatal to the shell.
 - Prefer a lean provider stack over agent sprawl:
   - Brave for search
@@ -67,4 +74,6 @@
   - no row-detail fan-out during active polling
   - no debug trace loading in the normal workspace
   - product path should poll compact summaries only
+- Preview creation, preview refresh, and run start must expose immediate pending UI so provider latency is visible to the user instead of looking inert.
+- Keep hot-path trace payloads compact and machine-readable; do not emit large narrative reasoning blobs by default.
 - Client thread list synchronization: guard overlapping `listThreads` results with a generation counter; avoid tying full-list refetch to every `activeThreadId` change when hydration and mutations already update `threads`; after `createThread`, hydrate (upsert) the new thread **before** setting `activeThreadId` so repair logic cannot repoint to an unrelated thread. Details: [ARCHITECTURE.md](../../ARCHITECTURE.md).

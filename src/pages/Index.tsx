@@ -35,6 +35,9 @@ const Index = () => {
   const {
     threads,
     threadsLoaded,
+    creatingPreviewThread,
+    refreshingPreviewThreadId,
+    startingRunThreadId,
     activeThread,
     activeThreadId,
     activeRun,
@@ -326,10 +329,12 @@ const Index = () => {
             </div>
           </div>
         ) : shellMode === "home" ? (
-          <InitialSearch onSearch={handleNewSearch} />
+          <InitialSearch onSearch={handleNewSearch} isSubmitting={creatingPreviewThread} />
         ) : shellMode === "preview" && activeThread ? (
           <PreviewStage
             thread={activeThread}
+            isRefreshingPreview={refreshingPreviewThreadId === activeThread.id}
+            isStartingRun={startingRunThreadId === activeThread.id}
             onAddCriterion={(c) => void addCriterion(activeThread.id, c)}
             onRemoveCriterion={(id) => void removeCriterion(activeThread.id, id)}
             onAddEnrichment={(e: Enrichment) => void addEnrichment(activeThread.id, e)}
@@ -386,7 +391,7 @@ const Index = () => {
             />
           </div>
         ) : (
-          <InitialSearch onSearch={handleNewSearch} />
+          <InitialSearch onSearch={handleNewSearch} isSubmitting={creatingPreviewThread} />
         )}
       </div>
 

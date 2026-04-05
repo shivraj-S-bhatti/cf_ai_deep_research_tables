@@ -48,6 +48,8 @@ type PlannerJson = {
 type ExtractionJson = {
   canonical_name?: string;
   canonical_url?: string;
+  candidate_website?: string | null;
+  follow_up_urls?: string[] | null;
   row_status?: "accepted" | "rejected" | "uncertain" | "conflict";
   score?: number;
   row_summary?: string;
@@ -143,7 +145,9 @@ export type LiveDocumentInput = {
 
 export type LiveDocumentExtraction = {
   canonicalName: string;
-  canonicalUrl: string;
+  canonicalUrl: string | null;
+  candidateWebsite: string | null;
+  followUpUrls: string[];
   rowStatus: "accepted" | "rejected" | "uncertain" | "conflict";
   score: number;
   rowSummary: string;
@@ -646,12 +650,13 @@ export async function extractDocumentWithGemini(
     ].join("\n")
     : sourceClass === "roundup" || sourceClass === "directory"
       ? [
-        "You extract multiple entities from roundup/list pages.",
+        "You extract multiple entity anchors from roundup/list pages.",
         "Return JSON only with an entities array.",
         "Each entity must be grounded in the provided text.",
-        "These pages are candidate generators, not final entity pages.",
-        "Do not invent company/profile URLs. Only emit canonical_url when the exact URL appears in the provided text.",
-        "Default row_status to uncertain for list or directory pages.",
+        "These pages are candidate generators, not final entity pages or final result rows.",
+        "Do not invent company/profile URLs.",
+        "Only emit candidate_website or follow_up_urls when the exact URL appears in the provided text.",
+        "Do not use row_status to accept or reject an entity from a list or directory page. Default it to uncertain.",
         "If no valid entities are present, return {\"entities\": []}.",
       ].join("\n")
       : [
@@ -679,7 +684,9 @@ export async function extractDocumentWithGemini(
     `{
   "entities": [{
   "canonical_name": "string",
-  "canonical_url": "https://...",
+  "canonical_url": "https://... or null",
+  "candidate_website": "https://... or null",
+  "follow_up_urls": ["https://..."],
   "row_status": "accepted|rejected|uncertain|conflict",
   "score": 0.0,
   "row_summary": "short explanation",
@@ -703,7 +710,12 @@ export async function extractDocumentWithGemini(
       : [];
   const rows = entities.map((json) => ({
     canonicalName: json.canonical_name?.trim() || input.title,
-    canonicalUrl: json.canonical_url?.trim() || input.url,
+    canonicalUrl: json.canonical_url?.trim() || null,
+    candidateWebsite: json.candidate_website?.trim() || json.canonical_url?.trim() || null,
+    followUpUrls: (json.follow_up_urls ?? [])
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim())
+      .slice(0, 5),
     rowStatus: json.row_status ?? "uncertain",
     score: typeof json.score === "number" ? Math.max(0, Math.min(1, json.score)) : 0.5,
     rowSummary: json.row_summary?.trim() || "Row extracted from live document evidence.",
@@ -743,10 +755,11 @@ export function isJunkExtraction(
     }
   })();
   const filledCells = row.cells.filter((cell) => cell.state === "filled").length;
+  const hasFollowUps = row.followUpUrls.length > 0 || Boolean(row.candidateWebsite);
   if (!normalizedName || normalizedName === "not_found") return true;
   if (normalizedName === sourceHost) return true;
   if (row.score <= 0) return true;
-  if (filledCells === 0) return true;
+  if (filledCells === 0 && !hasFollowUps) return true;
   return false;
 }
 

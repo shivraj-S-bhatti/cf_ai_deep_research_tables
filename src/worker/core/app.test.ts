@@ -619,32 +619,23 @@ describe("Worker API vertical slice", () => {
           canonicalUrl: string;
           status: string;
           processingState: string;
+          sourceCount: number;
           statusReasonCode?: string | null;
           statusReasonSummary?: string | null;
         }>;
       }>("GET", `/api/v1/runs/${started.runId}/results?include_rejected=true`, undefined, env);
 
-      expect(finalResults.rows).toHaveLength(2);
-      expect(finalResults.rows).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            canonicalName: "Vera Health",
-            canonicalUrl: "https://www.ycombinator.com/companies/w24",
-            status: "accepted",
-            processingState: "finalized",
-          }),
-          expect.objectContaining({
-            canonicalUrl: "https://www.ycombinator.com/companies/spring-2026",
-            status: "rejected",
-            processingState: "finalized",
-            statusReasonCode: "source_scope_pruned",
-          }),
-        ]),
+      expect(finalResults.rows).toHaveLength(1);
+      expect(finalResults.rows[0]).toEqual(
+        expect.objectContaining({
+          canonicalName: "Vera Health",
+          canonicalUrl: "https://verahealth.example.com/",
+          status: "accepted",
+          processingState: "finalized",
+        }),
       );
-
-      const prunedRow = finalResults.rows.find((row) => row.statusReasonCode === "source_scope_pruned");
-      expect(prunedRow?.statusReasonSummary).toContain("W24");
-      expect(prunedRow?.statusReasonSummary).toContain("S26");
+      expect(finalResults.rows.every((row) => row.sourceCount > 0)).toBe(true);
+      expect(finalResults.rows.some((row) => row.statusReasonCode === "source_scope_pruned")).toBe(false);
       expect(
         extractRequests.some(
           (request) =>
@@ -765,7 +756,7 @@ describe("Worker API vertical slice", () => {
         undefined,
         env,
       );
-      expect(finalResults.rows.length).toBeGreaterThan(0);
+      expect(finalResults.rows).toHaveLength(0);
       expect(finalResults.rows.every((row) => ["finalized", "failed"].includes(row.processingState))).toBe(true);
       expect(abortedFetches).toBeGreaterThan(0);
     } finally {

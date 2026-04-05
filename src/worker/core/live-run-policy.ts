@@ -16,6 +16,16 @@ function safeUrl(value: string | null | undefined): string | null {
   }
 }
 
+function hostFor(value: string | null | undefined): string {
+  const next = safeUrl(value);
+  if (!next) return "";
+  try {
+    return new URL(next).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
 function candidatePathPenalty(url: string): number {
   return DOCUMENT_PATH_HINT.test(url) ? 2 : 0;
 }
@@ -28,6 +38,10 @@ export function isGroundingSourceClass(sourceClass: SourceClass): boolean {
   return sourceClass === "entity_page" || sourceClass === "official_site";
 }
 
+export function isCandidateOnlySourceClass(sourceClass: SourceClass): boolean {
+  return !isGroundingSourceClass(sourceClass);
+}
+
 export function coerceRowStatusForSource(
   sourceClass: SourceClass,
   rowStatus: ExtractedEntityRow["rowStatus"],
@@ -37,7 +51,7 @@ export function coerceRowStatusForSource(
 }
 
 export function collectFollowUpUrls(
-  row: Pick<ExtractedEntityRow, "canonicalUrl" | "cells" | "sourceUrl" | "sourceClass">,
+  row: Pick<ExtractedEntityRow, "canonicalUrl" | "candidateWebsite" | "followUpUrls" | "cells" | "sourceUrl" | "sourceClass">,
 ): string[] {
   if (isGroundingSourceClass(row.sourceClass)) return [];
 
@@ -50,13 +64,39 @@ export function collectFollowUpUrls(
     urls.add(next);
   };
 
+  pushIfDistinct(row.candidateWebsite);
   pushIfDistinct(row.canonicalUrl);
+  for (const url of row.followUpUrls ?? []) {
+    pushIfDistinct(url);
+  }
   for (const cell of row.cells) {
     if (cell.state !== "filled") continue;
     pushIfDistinct(cell.valueText);
   }
 
-  return [...urls].slice(0, 3);
+  return [...urls].slice(0, 4);
+}
+
+export function buildCorroborationQueries(options: {
+  anchorName: string;
+  query: string;
+  entityType: string;
+  candidateWebsite?: string | null;
+}): string[] {
+  const { anchorName, query, entityType, candidateWebsite } = options;
+  const quotedName = `"${anchorName}"`;
+  const queries = new Set<string>([
+    `${quotedName}`,
+    `${quotedName} ${entityType}`,
+    `${quotedName} ${query}`,
+  ]);
+
+  const host = hostFor(candidateWebsite);
+  if (host) {
+    queries.add(`${quotedName} site:${host}`);
+  }
+
+  return [...queries].slice(0, 4);
 }
 
 export function rankDiscoveryCandidate(query: string, result: BraveWebResult): number {
@@ -85,13 +125,29 @@ export function selectDiscoveryBatch(
   candidates: BraveWebResult[],
   limit: number,
 ): BraveWebResult[] {
-  return [...candidates]
-    .sort((left, right) => {
-      const scoreDelta = rankDiscoveryCandidate(query, right) - rankDiscoveryCandidate(query, left);
-      if (scoreDelta !== 0) return scoreDelta;
-      return left.url.localeCompare(right.url);
-    })
-    .slice(0, Math.max(0, limit));
+  const ranked = [...candidates].sort((left, right) => {
+    const scoreDelta = rankDiscoveryCandidate(query, right) - rankDiscoveryCandidate(query, left);
+    if (scoreDelta !== 0) return scoreDelta;
+    return left.url.localeCompare(right.url);
+  });
+  const selected: BraveWebResult[] = [];
+  const seenDomains = new Set<string>();
+
+  for (const candidate of ranked) {
+    const domain = hostFor(candidate.url) || candidate.url;
+    if (seenDomains.has(domain)) continue;
+    selected.push(candidate);
+    seenDomains.add(domain);
+    if (selected.length >= Math.max(0, limit)) return selected;
+  }
+
+  for (const candidate of ranked) {
+    if (selected.includes(candidate)) continue;
+    selected.push(candidate);
+    if (selected.length >= Math.max(0, limit)) break;
+  }
+
+  return selected;
 }
 
 export function computeFetchBatchSize(options: {
@@ -100,6 +156,7 @@ export function computeFetchBatchSize(options: {
   currentRows: number;
   remainingExtractionCalls: number;
   maxSourcesPerRun: number;
+  pendingAnchors?: number;
   preferFollowUps?: boolean;
 }): number {
   const {
@@ -108,14 +165,15 @@ export function computeFetchBatchSize(options: {
     currentRows,
     remainingExtractionCalls,
     maxSourcesPerRun,
+    pendingAnchors = 0,
     preferFollowUps = false,
   } = options;
   if (remainingExtractionCalls <= 0 || maxSourcesPerRun <= 0) return 0;
 
   const remainingRows = Math.max(0, targetResults - currentRows);
   const baseLimit = iteration === 0
-    ? Math.max(2, Math.min(4, Math.ceil(Math.max(1, Math.min(targetResults, 12)) / 3)))
-    : preferFollowUps
+    ? Math.max(3, Math.min(5, Math.ceil(Math.max(1, Math.min(targetResults, 12)) / 3)))
+    : preferFollowUps || pendingAnchors > 0
       ? 2
       : 3;
   const desired = remainingRows > 0

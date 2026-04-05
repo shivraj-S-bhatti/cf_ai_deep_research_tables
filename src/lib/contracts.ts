@@ -26,7 +26,9 @@ export type ProcessingState =
   | "pending"
   | "fetching"
   | "extracting"
+  | "extracting_anchor"
   | "refining"
+  | "corroborating"
   | "verifying"
   | "finalized"
   | "failed";

@@ -524,6 +524,122 @@ describe("Worker API vertical slice", () => {
     }
   });
 
+  it("aborts in-flight fetches when the live run wall clock expires", async () => {
+    const originalFetch = globalThis.fetch;
+    let abortedFetches = 0;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("api.search.brave.com")) {
+        return new Response(JSON.stringify({
+          web: {
+            results: [
+              {
+                title: "Best Pizza Williamsburg",
+                url: "https://example.com/best-pizza-williamsburg",
+                description: "Candidate source",
+              },
+            ],
+          },
+        }), { status: 200 });
+      }
+      if (url.includes("r.jina.ai/")) {
+        return await new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          const onAbort = () => {
+            abortedFetches += 1;
+            reject(signal?.reason ?? new DOMException("Request aborted.", "AbortError"));
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      return new Response("Not mocked", { status: 404 });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      const criteria = [
+        {
+          id: "preview:criterion:relevance",
+          label: "Entity appears relevant to \"Top pizza places in Brooklyn\"",
+          kind: "hard_filter" as const,
+          color: "hsl(220, 80%, 50%)",
+          orderIndex: 0,
+        },
+      ];
+      const columns = [
+        {
+          id: "preview:column:website",
+          key: "website",
+          label: "Website",
+          kind: "identity" as const,
+          valueType: "url" as const,
+          preferredSources: ["official"],
+          requiresVerification: true,
+          allowInference: false,
+          nullPolicy: "dash" as const,
+          orderIndex: 0,
+        },
+      ];
+      const env = {
+        AGENTIC_RUNTIME_MODE: "live",
+        BRAVE_API_KEY: "test-brave",
+        GEMINI_API_KEY: "test-gemini",
+        MAX_RUN_WALL_CLOCK_MS: "80",
+        PROVIDER_TIMEOUT_MS: "1000",
+      };
+
+      const created = await apiJson<{ threadId: string }>("POST", "/api/v1/threads", {
+        query: "Top pizza places in Brooklyn",
+        targetResults: 5,
+        criteria,
+        columns,
+        preview: {
+          entityType: "business",
+          criteria,
+          columns,
+          searchQueries: [{ id: "sq-1", text: "top pizza places in brooklyn" }],
+          budgets: { searchBudget: 1, fetchBudget: 2, verificationBudget: 1 },
+          notes: "mock plan",
+        },
+      }, env);
+
+      const started = await apiJson<{ runId: string }>(
+        "POST",
+        `/api/v1/threads/${created.threadId}/runs`,
+        undefined,
+        env,
+      );
+      const finalRun = await waitForRun(started.runId);
+      expect(finalRun.status).toBe("failed");
+
+      const runDetails = await apiJson<{ errorCode: string | null }>(
+        "GET",
+        `/api/v1/runs/${started.runId}`,
+        undefined,
+        env,
+      );
+      expect(runDetails.errorCode).toBe("wall_clock_exceeded");
+
+      const finalResults = await apiJson<{
+        rows: Array<{ processingState: string }>;
+      }>(
+        "GET",
+        `/api/v1/runs/${started.runId}/results?include_rejected=true`,
+        undefined,
+        env,
+      );
+      expect(finalResults.rows.length).toBeGreaterThan(0);
+      expect(finalResults.rows.every((row) => ["finalized", "failed"].includes(row.processingState))).toBe(true);
+      expect(abortedFetches).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("fails preview when live planner returns no criteria", async () => {
     const originalFetch = globalThis.fetch;
     const geminiPayload = (json: unknown) => ({

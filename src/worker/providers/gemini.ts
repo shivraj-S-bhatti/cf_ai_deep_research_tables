@@ -9,6 +9,12 @@ import type {
 import type { GeminiBackend, RuntimeConfig } from "../core/config";
 import { isValidPreviewResponse, normalizeSearchQuery } from "../core/config";
 import type { SourceClass } from "./fetch";
+import {
+  createRequestSignal,
+  delayWithSignal,
+  isAbortLikeError,
+  type RequestControl,
+} from "./request-control";
 
 type GeminiResponse = {
   candidates?: Array<{
@@ -358,6 +364,7 @@ async function generateStructuredJson<T>(
   operation: GeminiOperation,
   system: string,
   user: string,
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<T>> {
   const backends = resolveBackendOrder(config);
   let lastError: Error | null = null;
@@ -368,6 +375,7 @@ async function generateStructuredJson<T>(
     for (const model of modelChain(primaryModel)) {
       const endpoint = buildEndpoint(backend, apiKey, model);
       for (let attempt = 0; attempt < 6; attempt += 1) {
+        const { signal, cleanup } = createRequestSignal(control);
         try {
           const response = await fetch(endpoint, {
             method: "POST",
@@ -389,6 +397,7 @@ async function generateStructuredJson<T>(
                 responseMimeType: "application/json",
               },
             }),
+            signal,
           });
 
           if (!response.ok) {
@@ -402,7 +411,7 @@ async function generateStructuredJson<T>(
             );
             if (response.status === 429 || response.status === 503) {
               const retryMs = requestError.retryDelayMs ?? Math.min(90000, 8000 + attempt * 14000);
-              await new Promise((resolve) => setTimeout(resolve, retryMs));
+              await delayWithSignal(retryMs, signal);
               continue;
             }
             throw requestError;
@@ -415,10 +424,15 @@ async function generateStructuredJson<T>(
           };
         } catch (error) {
           lastError = error instanceof Error ? error : new Error("Unexpected Gemini request failure.");
+          if (isAbortLikeError(lastError)) {
+            throw lastError;
+          }
           if (attempt < 5) {
-            await new Promise((resolve) => setTimeout(resolve, 3000 + attempt * 2000));
+            await delayWithSignal(3000 + attempt * 2000, signal);
             continue;
           }
+        } finally {
+          cleanup();
         }
       }
     }
@@ -521,6 +535,7 @@ export function fallbackPreview(input: LivePlannerInput): PreviewResponse {
 export async function planWithGemini(
   config: RuntimeConfig,
   input: LivePlannerInput,
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<LivePlannerOutput>> {
   const system = [
     "You are planning a grounded entity discovery run.",
@@ -547,7 +562,7 @@ export async function planWithGemini(
 }`,
   ].join("\n");
 
-  const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", system, user);
+  const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", system, user, control);
   const preview: PreviewResponse = {
     entityType: json.entity_type ?? heuristicEntityType(input.query),
     criteria: [
@@ -613,6 +628,7 @@ export async function extractDocumentWithGemini(
   config: RuntimeConfig,
   input: LiveDocumentInput,
   sourceClass: SourceClass = "entity_page",
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<LiveDocumentExtraction[]>> {
   const operation: GeminiOperation =
     sourceClass === "roundup" || sourceClass === "directory"
@@ -673,6 +689,7 @@ export async function extractDocumentWithGemini(
     operation,
     system,
     user,
+    control,
   );
   const entities: ExtractionJson[] = Array.isArray(raw)
     ? raw
@@ -731,6 +748,7 @@ export function isJunkExtraction(
 export async function supervisorDecide(
   config: RuntimeConfig,
   input: SupervisorDecisionInput,
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<SupervisorDecisionOutput>> {
   const system = [
     "You are a research supervisor for a grounded entity discovery pipeline.",
@@ -770,6 +788,7 @@ export async function supervisorDecide(
     "supervisor",
     system,
     user,
+    control,
   );
   return {
     data: {
@@ -786,6 +805,7 @@ export async function supervisorDecide(
 export async function rewriteQueries(
   config: RuntimeConfig,
   input: RewriteQueriesInput,
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<string[]>> {
   const system = [
     "You rewrite search queries for entity discovery.",
@@ -805,6 +825,7 @@ export async function rewriteQueries(
     "rewriter",
     system,
     user,
+    control,
   );
   return {
     data: (data.queries ?? [])
@@ -817,6 +838,7 @@ export async function rewriteQueries(
 export async function verifyWithGemini(
   config: RuntimeConfig,
   input: LiveVerificationInput,
+  control?: RequestControl,
 ): Promise<GeminiProviderResult<LiveVerificationOutput>> {
   const system = [
     "You are verifying an already-extracted row from a grounded entity discovery pipeline.",
@@ -844,7 +866,7 @@ export async function verifyWithGemini(
   ].join("\n");
 
   try {
-    const { data: json, meta } = await generateStructuredJson<VerifyJson>(config, "verifier", system, user);
+    const { data: json, meta } = await generateStructuredJson<VerifyJson>(config, "verifier", system, user, control);
     return {
       data: {
         rowStatus: json.row_status ?? input.rowStatus,

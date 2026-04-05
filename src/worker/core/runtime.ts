@@ -43,6 +43,10 @@ import {
 import { fetchAndParseDocument } from "../providers/fetch";
 import { dedupeAndMerge, normalizeName, type ExtractedEntityRow } from "../domain/dedup";
 import { estimateOperationCost } from "../providers/price-catalog";
+import {
+  createAbortError,
+  type RequestControl,
+} from "../providers/request-control";
 import { MemoryResearchStore, emptyMetrics, emptyProgress } from "../storage/memory-store";
 import { makeId, sleep } from "../utils/ids";
 import {
@@ -236,6 +240,8 @@ type TraceToolCall = {
 export class AgenticSearchRuntime {
   private readonly store = new MemoryResearchStore();
   private readonly inflightRuns = new Map<string, Promise<void>>();
+  private readonly runAbortControllers = new Map<string, AbortController>();
+  private readonly runDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private config: RuntimeConfig;
   private readonly cache: RuntimeCache = {
     preview: new Map(),
@@ -264,14 +270,9 @@ export class AgenticSearchRuntime {
     const cached = this.cache.preview.get(cacheKey);
     if (cached) return structuredClone(cached);
     const response = shouldUseLiveProviders(this.config)
-      ? await (async () => {
-          const timeoutMs = Math.min(this.config.requestTimeoutMs, 2500);
-          const timeoutPromise = new Promise<PreviewResponse>((_, reject) => {
-            setTimeout(() => reject(new Error(`Planner timeout after ${timeoutMs}ms.`)), timeoutMs);
-          });
-          const livePromise = planWithGemini(this.config, input).then((result) => result.data);
-          return await Promise.race([livePromise, timeoutPromise]);
-        })()
+      ? await planWithGemini(this.config, input, {
+          timeoutMs: Math.min(this.config.requestTimeoutMs, 2500),
+        }).then((result) => result.data)
       : previewQuery(input);
     this.cache.preview.set(cacheKey, structuredClone(response));
     return response;
@@ -355,7 +356,14 @@ export class AgenticSearchRuntime {
   }
 
   cancelRun(runId: string): ResearchRun | null {
-    return this.store.cancelRun(runId);
+    const current = this.store.getRun(runId);
+    if (!current) return null;
+    if (["complete", "failed", "canceled"].includes(current.status)) return current;
+    const canceled = this.store.cancelRun(runId);
+    this.clearRunDeadline(runId);
+    this.markNonTerminalRowsFailed(runId);
+    this.abortRunRequests(runId, "Run canceled.");
+    return canceled;
   }
 
   deleteThread(threadId: string): boolean {
@@ -433,6 +441,7 @@ export class AgenticSearchRuntime {
         // does not crash on an unhandled rejection while background work is still observable in-app.
       })
       .finally(() => {
+        this.clearRunControl(runId);
         this.inflightRuns.delete(runId);
       });
     this.inflightRuns.set(runId, promise);
@@ -983,7 +992,12 @@ export class AgenticSearchRuntime {
 
         const searchStartedAt = now();
         const searchResults = cachedResults
-          ?? await searchBraveWeb(this.config.braveApiKey!, query, this.config.searchResultsPerQuery);
+          ?? await searchBraveWeb(
+            this.config.braveApiKey!,
+            query,
+            this.config.searchResultsPerQuery,
+            this.requestControlForRun(runId),
+          );
         const searchLatency = now() - searchStartedAt;
 
         if (!cachedResults) {
@@ -1115,6 +1129,7 @@ export class AgenticSearchRuntime {
           const parsed = await fetchAndParseDocument(normalizedUrl, this.config.fetchTextCharLimit, {
             jinaApiKey: this.config.jinaApiKey,
             entityType: thread.plan.entityType,
+            ...this.requestControlForRun(runId),
           });
           const fetchLatency = now() - fetchStartedAt;
           const usage = usageRecord(runId, "fetch", "http_fetch", "fetch_source", 1, fetchLatency, false, 0, 0, {
@@ -1274,6 +1289,7 @@ export class AgenticSearchRuntime {
             bodyText: entry.parsed.text,
           },
           entry.parsed.sourceClass,
+          this.requestControlForRun(runId),
         );
         const extractLatency = now() - startedAt;
         const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, extractLatency, false, 0, 0, {
@@ -1585,7 +1601,7 @@ export class AgenticSearchRuntime {
               url,
               reasonSummary,
             })),
-          })).data;
+          }, this.requestControlForRun(runId))).data;
       } catch (error) {
         this.store.addActivity(
           runId,
@@ -1630,12 +1646,13 @@ export class AgenticSearchRuntime {
           const rewritten = await rewriteQueries(this.config, {
             query: thread.thread.queryRaw,
             gapColumns: decision.focusColumns,
-          });
+          }, this.requestControlForRun(runId));
           for (const queryText of rewritten.data) {
             const nextResults = await searchBraveWeb(
               this.config.braveApiKey!,
               { id: makeId("sq"), text: queryText },
               this.config.searchResultsPerQuery,
+              this.requestControlForRun(runId),
             );
             for (const result of nextResults) {
               const normalized = this.normalizeUrl(result.url);
@@ -1739,7 +1756,7 @@ export class AgenticSearchRuntime {
             url: source.url,
             snippet: source.snippet,
           })),
-        });
+        }, this.requestControlForRun(runId));
         const verification = verificationResult.data;
         verificationsUsed += 1;
         const usage = usageRecord(runId, "llm", "gemini", "verify_candidate", 1, now() - startedAt, false, 0, 0, {
@@ -1937,7 +1954,7 @@ export class AgenticSearchRuntime {
     }
     const stageCheckpoint = checkpointForStage(stage);
     this.assertRunActive(runId);
-    this.store.updateRun(runId, (run) => {
+    const updatedRun = this.store.updateRun(runId, (run) => {
       const startedAt = run.startedAt ?? now();
       return {
         ...run,
@@ -1950,6 +1967,9 @@ export class AgenticSearchRuntime {
         },
       };
     });
+    if (updatedRun?.startedAt) {
+      this.armRunDeadline(runId, updatedRun.startedAt);
+    }
     this.store.addActivity(
       runId,
       stageEvent(runId, stage, "started", `${stage} started.`, {
@@ -1962,7 +1982,8 @@ export class AgenticSearchRuntime {
     try {
       await work();
       this.store.setRunStageDuration(runId, stage, now() - stageStart);
-      if (this.store.getRun(runId)?.status === "canceled") return;
+      const terminalStatus = this.store.getRun(runId)?.status;
+      if (terminalStatus === "canceled" || terminalStatus === "failed") return;
       this.store.updateRun(runId, (run) => ({
         ...run,
         metrics: {
@@ -2003,8 +2024,107 @@ export class AgenticSearchRuntime {
           elapsedMs: run.startedAt ? now() - run.startedAt : run.metrics.elapsedMs,
         },
       }));
+      this.markNonTerminalRowsFailed(runId);
       throw error;
     }
+  }
+
+  private getOrCreateRunAbortController(runId: string): AbortController {
+    const existing = this.runAbortControllers.get(runId);
+    if (existing && !existing.signal.aborted) return existing;
+    const controller = new AbortController();
+    this.runAbortControllers.set(runId, controller);
+    return controller;
+  }
+
+  private requestControlForRun(runId: string, timeoutMs = this.config.requestTimeoutMs): RequestControl {
+    this.assertRunActive(runId);
+    const controller = this.getOrCreateRunAbortController(runId);
+    const run = this.store.getRun(runId);
+    const remainingWallClockMs =
+      run?.startedAt && this.config.maxRunWallClockMs > 0
+        ? Math.max(1, run.startedAt + this.config.maxRunWallClockMs - now())
+        : null;
+
+    return {
+      signal: controller.signal,
+      timeoutMs: remainingWallClockMs
+        ? Math.min(timeoutMs, remainingWallClockMs)
+        : timeoutMs,
+    };
+  }
+
+  private armRunDeadline(runId: string, startedAt: number): void {
+    if (this.config.maxRunWallClockMs <= 0) return;
+    if (this.runDeadlineTimers.has(runId)) return;
+    const remainingMs = Math.max(0, startedAt + this.config.maxRunWallClockMs - now());
+    const timeoutId = setTimeout(() => {
+      this.failRunForWallClockExceeded(runId);
+    }, remainingMs);
+    this.runDeadlineTimers.set(runId, timeoutId);
+  }
+
+  private clearRunDeadline(runId: string): void {
+    const timeoutId = this.runDeadlineTimers.get(runId);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      this.runDeadlineTimers.delete(runId);
+    }
+  }
+
+  private clearRunControl(runId: string): void {
+    this.clearRunDeadline(runId);
+    this.runAbortControllers.delete(runId);
+  }
+
+  private abortRunRequests(runId: string, message: string): void {
+    const controller = this.runAbortControllers.get(runId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createAbortError(message));
+    }
+  }
+
+  private markNonTerminalRowsFailed(runId: string): void {
+    for (const row of this.store.listRows(runId)) {
+      if (row.processingState === "finalized" || row.processingState === "failed") continue;
+      this.store.upsertRow(runId, {
+        ...row,
+        processingState: "failed",
+      });
+    }
+  }
+
+  private failRunForWallClockExceeded(runId: string): boolean {
+    const run = this.store.getRun(runId);
+    if (!run?.startedAt) return false;
+    if (run.status === "failed" && run.errorCode === "wall_clock_exceeded") return true;
+    if (run.status === "complete" || run.status === "canceled" || run.status === "failed") return false;
+
+    const stage = (run.stage === "idle" ? "planning" : run.stage) as ActivityStage;
+    const message = `Run exceeded maximum wall time (${Math.round(this.config.maxRunWallClockMs / 60_000)} min).`;
+    this.store.updateRun(runId, (current) => ({
+      ...current,
+      status: "failed",
+      finishedAt: now(),
+      errorCode: "wall_clock_exceeded",
+      errorMessage: message,
+      metrics: {
+        ...current.metrics,
+        elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
+      },
+    }));
+    this.markNonTerminalRowsFailed(runId);
+    this.store.addActivity(
+      runId,
+      stageEvent(runId, stage, "failed", message, {
+        actor: "runtime",
+        title: "Wall clock limit",
+        checkpoint: "run terminated",
+      }),
+    );
+    this.clearRunDeadline(runId);
+    this.abortRunRequests(runId, message);
+    return true;
   }
 
   private createEvidenceFromSource(
@@ -2044,35 +2164,16 @@ export class AgenticSearchRuntime {
     const run = this.store.getRun(runId);
     if (!run?.startedAt) return false;
     if (now() - run.startedAt <= this.config.maxRunWallClockMs) return false;
-    const stage = (run.stage === "idle" ? "planning" : run.stage) as ActivityStage;
-    const message = `Run exceeded maximum wall time (${Math.round(this.config.maxRunWallClockMs / 60_000)} min).`;
-    this.store.updateRun(runId, (current) => ({
-      ...current,
-      status: "failed",
-      finishedAt: now(),
-      errorCode: "wall_clock_exceeded",
-      errorMessage: message,
-      metrics: {
-        ...current.metrics,
-        elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
-      },
-    }));
-    this.store.addActivity(
-      runId,
-      stageEvent(runId, stage, "failed", message, {
-        actor: "runtime",
-        title: "Wall clock limit",
-        checkpoint: "run terminated",
-      }),
-    );
-    return true;
+    return this.failRunForWallClockExceeded(runId);
   }
 
   private assertRunActive(runId: string): void {
     const run = this.store.getRun(runId);
-    if (!run || run.status === "canceled") {
+    if (!run) {
       throw new Error("Run canceled");
     }
+    if (run.status === "canceled") throw new Error("Run canceled");
+    if (run.status === "failed") throw new Error(run.errorMessage ?? "Run failed");
   }
 
   private shouldStop(runId: string): boolean {

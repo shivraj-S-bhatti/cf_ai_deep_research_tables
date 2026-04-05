@@ -53,6 +53,12 @@ export async function handleApiRequest(
         return jsonResponse(thread, 200, { "x-request-id": requestId });
       }
 
+      if (request.method === "DELETE" && parts.length === 4) {
+        const ok = runtime.deleteThread(threadId);
+        if (!ok) return errorResponse(requestId, 404, "thread_not_found", "Thread not found.");
+        return jsonResponse({ deleted: true }, 200, { "x-request-id": requestId });
+      }
+
       if (request.method === "PATCH" && parts[4] === "config") {
         const body = await readJson<UpdateThreadConfigRequest>(request);
         const thread = runtime.updateThreadConfig(threadId, body);
@@ -78,6 +84,20 @@ export async function handleApiRequest(
         const run = runtime.getRun(runId);
         if (!run) return errorResponse(requestId, 404, "run_not_found", "Run not found.");
         return jsonResponse(run, 200, { "x-request-id": requestId });
+      }
+
+      if (request.method === "GET" && parts[4] === "debug" && parts.length === 5) {
+        const debug = runtime.getRunDebug(runId);
+        if (!debug) return errorResponse(requestId, 404, "run_not_found", "Run not found.");
+        return jsonResponse(debug, 200, { "x-request-id": requestId });
+      }
+
+      if (request.method === "GET" && parts[4] === "debug" && parts[5] === "trace") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+        const pageSize = Number(url.searchParams.get("page_size") ?? "50");
+        const trace = runtime.getRunTrace(runId, page, pageSize);
+        if (!trace) return errorResponse(requestId, 404, "run_not_found", "Run not found.");
+        return jsonResponse(trace, 200, { "x-request-id": requestId });
       }
 
       if (request.method === "GET" && parts[4] === "events") {

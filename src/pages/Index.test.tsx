@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import Index from "./Index";
@@ -199,7 +199,7 @@ describe("Index", () => {
       startingRunThreadId: null,
       activeRun: null,
       setActiveThreadId: vi.fn(),
-      createThread: vi.fn(),
+      createThread: vi.fn(() => new Promise<string>(() => undefined)),
       fetchRowDetails: vi.fn(),
       refreshQueryPlan: vi.fn(),
       updateTarget: vi.fn(),
@@ -225,5 +225,112 @@ describe("Index", () => {
 
     expect(screen.getByText("Building structured preview")).toBeInTheDocument();
     expect(screen.getByText("Top pizza places in Brooklyn")).toBeInTheDocument();
+  });
+
+  it("navigates from the draft route to the hydrated preview thread even if submission state flips during create", async () => {
+    const thread = {
+      ...makeThread(),
+      id: "thread-preview",
+      query: "Open source LLM projects with >1k stars",
+      phase: "preview",
+      latestRunId: null,
+      latestRun: null,
+      criteria: [
+        {
+          id: "c1",
+          label: "Project is open source",
+          kind: "hard_filter" as const,
+          color: "hsl(220, 80%, 50%)",
+        },
+      ],
+      columns: [
+        {
+          id: "col1",
+          key: "name",
+          label: "Project Name",
+          kind: "identity" as const,
+          valueType: "string" as const,
+          preferredSources: ["official"],
+          requiresVerification: true,
+          allowInference: false,
+          nullPolicy: "dash" as const,
+          orderIndex: 0,
+        },
+      ],
+      statusSummary: "Plan refreshed. Review criteria and columns before running.",
+    } satisfies Thread;
+
+    const storeState: ReturnType<typeof useThreadStore> = {
+      threads: [],
+      threadsLoaded: true,
+      activeThread: null,
+      activeThreadId: null,
+      creatingPreviewThread: false,
+      refreshingPreviewThreadId: null,
+      startingRunThreadId: null,
+      activeRun: null,
+      setActiveThreadId: vi.fn(),
+      createThread: vi.fn(),
+      fetchRowDetails: vi.fn(),
+      refreshQueryPlan: vi.fn(),
+      updateTarget: vi.fn(),
+      startRun: vi.fn(),
+      cancelRun: vi.fn(),
+      deleteThread: vi.fn(),
+      hydrateThread: vi.fn(),
+      addCriterion: vi.fn(),
+      removeCriterion: vi.fn(),
+      addEnrichment: vi.fn(),
+      removeEnrichment: vi.fn(),
+    };
+
+    let rerenderApp: (() => void) | null = null;
+    let resolveCreateThread: ((value: string) => void) | null = null;
+    const renderApp = () => (
+      <MemoryRouter initialEntries={["/threads/new?query=Open%20source%20LLM%20projects%20with%20%3E1k%20stars"]}>
+        <Routes>
+          <Route path="/" element={<Index />} />
+          <Route path="/threads/:threadId" element={<Index />} />
+          <Route path="/threads/new" element={<Index />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    storeState.setActiveThreadId = vi.fn((id: string | null) => {
+      storeState.activeThreadId = id;
+      storeState.activeThread = id === thread.id ? thread : null;
+    });
+    storeState.createThread = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCreateThread = resolve;
+    }));
+
+    mockedUseThreadStore.mockImplementation(() => storeState);
+
+    const rendered = render(renderApp());
+    rerenderApp = () => rendered.rerender(renderApp());
+
+    await waitFor(() => {
+      expect(storeState.createThread).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      storeState.creatingPreviewThread = true;
+      rerenderApp?.();
+    });
+
+    await act(async () => {
+      storeState.creatingPreviewThread = false;
+      storeState.threads = [thread];
+      resolveCreateThread?.(thread.id);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      rerenderApp?.();
+      expect(screen.getByText("Preview Stage")).toBeInTheDocument();
+    });
+
+    expect(storeState.createThread).toHaveBeenCalledTimes(1);
+    expect(storeState.setActiveThreadId).toHaveBeenCalledWith(thread.id);
   });
 });

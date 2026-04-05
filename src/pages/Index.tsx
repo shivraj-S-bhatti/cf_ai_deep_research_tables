@@ -150,7 +150,7 @@ const Index = () => {
       return;
     }
     const flowKey = `${draftQuery.toLowerCase()}::${draftRetryNonce}`;
-    if (startedDraftRef.current === flowKey || creatingPreviewThread) return;
+    if (startedDraftRef.current === flowKey) return;
     startedDraftRef.current = flowKey;
     setDraftPreviewError(null);
 
@@ -170,7 +170,7 @@ const Index = () => {
     return () => {
       canceled = true;
     };
-  }, [createThread, creatingPreviewThread, draftQuery, draftRetryNonce, navigate, routeMode]);
+  }, [createThread, draftQuery, draftRetryNonce, navigate, routeMode]);
 
   useEffect(() => {
     if (!activeThread?.latestRunId || !selectedId) {

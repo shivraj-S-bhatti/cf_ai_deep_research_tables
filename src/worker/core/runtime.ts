@@ -25,6 +25,11 @@ import type {
 import { buildThreadBundle, previewQuery, rebuildThreadBundle } from "../domain/planner";
 import { findScenario } from "../fixtures/scenarios";
 import {
+  allocateExtractionBatch,
+  createExtractionBudget,
+  hasExtractionBudgetRemaining,
+} from "./extraction-budget";
+import {
   hasLiveProviders,
   resolveRuntimeConfig,
   shouldUseLiveProviders,
@@ -34,15 +39,27 @@ import {
 import { searchBraveWeb, type BraveWebResult } from "../providers/brave";
 import {
   extractDocumentWithGemini,
-  fallbackPreview,
   planWithGemini,
+  rewriteQueries,
+  supervisorDecide,
+  isJunkExtraction,
   verifyWithGemini,
-  type LiveDocumentExtraction,
 } from "../providers/gemini";
 import { fetchAndParseDocument } from "../providers/fetch";
+import { dedupeAndMerge, normalizeName, type ExtractedEntityRow } from "../domain/dedup";
 import { estimateOperationCost } from "../providers/price-catalog";
+import {
+  createAbortError,
+  type RequestControl,
+} from "../providers/request-control";
 import { MemoryResearchStore, emptyMetrics, emptyProgress } from "../storage/memory-store";
 import { makeId, sleep } from "../utils/ids";
+import {
+  classifySourceScopeDecision,
+  DEFAULT_ACCEPT_CONFIDENCE_MIN,
+  DEFAULT_REJECT_CONFIDENCE_MIN,
+  deriveFinalStatus,
+} from "../../lib/runtime-policy";
 
 type RuntimeCache = {
   preview: Map<string, PreviewResponse>;
@@ -75,23 +92,25 @@ function stageEvent(
 function actorForStage(stage: ActivityStage): string {
   switch (stage) {
     case "planning":
-      return "Planner Agent";
+      return "planner";
     case "discovery":
-      return "Search Agent";
+      return "discovery";
     case "fetch":
-      return "Retriever Agent";
+      return "fetch";
     case "extraction":
-      return "Extractor Agent";
+      return "extraction";
     case "evaluation":
-      return "Evaluator Agent";
+      return "evaluation";
     case "canonicalization":
-      return "Canonicalizer Agent";
+      return "canonicalization";
+    case "refinement":
+      return "supervisor";
     case "verification":
-      return "Validator Agent";
+      return "verification";
     case "ranking":
-      return "Ranking Agent";
+      return "ranking";
     case "export":
-      return "Exporter Agent";
+      return "export";
   }
 }
 
@@ -109,6 +128,8 @@ function titleForStage(stage: ActivityStage): string {
       return "Evaluating criteria";
     case "canonicalization":
       return "Canonicalizing entities";
+    case "refinement":
+      return "Refining coverage";
     case "verification":
       return "Validating ambiguous rows";
     case "ranking":
@@ -130,6 +151,8 @@ function checkpointForStage(stage: ActivityStage): string | undefined {
       return "cells extracted";
     case "evaluation":
       return "criteria evaluated";
+    case "refinement":
+      return "supervisor iteration";
     case "ranking":
       return "final ranking committed";
     default:
@@ -166,6 +189,42 @@ function usageRecord(
   };
 }
 
+function classifySourceOrigin(url: string, title: string): ResultRow["lineage"]["sourceOriginClass"] {
+  const normalized = `${url} ${title}`.toLowerCase();
+  if (
+    normalized.includes("reddit.com")
+    || normalized.includes("quora.com")
+    || normalized.includes("stackexchange.com")
+    || normalized.includes("news.ycombinator.com")
+  ) {
+    return "forum";
+  }
+  if (normalized.includes("ycombinator.com/companies") || normalized.includes("/directory")) {
+    return "directory";
+  }
+  if (normalized.includes("github.com") || normalized.includes("schema.org") || normalized.includes("api")) {
+    return "structured";
+  }
+  if (
+    normalized.includes("top ") ||
+    normalized.includes("best ") ||
+    normalized.includes("list of") ||
+    normalized.includes("roundup") ||
+    normalized.includes("guide")
+  ) {
+    return "roundup";
+  }
+  return normalized.includes("official") ? "official" : "secondary";
+}
+
+function emptyLineage(sourceOriginClass: ResultRow["lineage"]["sourceOriginClass"] = "secondary") {
+  return {
+    suggestedBySourceIds: [] as string[],
+    groundedBySourceIds: [] as string[],
+    sourceOriginClass,
+  };
+}
+
 function csvEscape(value: string): string {
   if (/[,"\n]/.test(value)) {
     return `"${value.replace(/"/g, '""')}"`;
@@ -183,21 +242,11 @@ type TraceToolCall = {
   cacheHit?: boolean;
 };
 
-type LiveDiscoveredCandidate = {
-  rowId: string;
-  queryText: string;
-  result: BraveWebResult;
-};
-
-type LiveFetchedSource = {
-  rowId: string;
-  source: SourceDocument;
-  bodyText: string;
-};
-
 export class AgenticSearchRuntime {
   private readonly store = new MemoryResearchStore();
   private readonly inflightRuns = new Map<string, Promise<void>>();
+  private readonly runAbortControllers = new Map<string, AbortController>();
+  private readonly runDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private config: RuntimeConfig;
   private readonly cache: RuntimeCache = {
     preview: new Map(),
@@ -226,7 +275,7 @@ export class AgenticSearchRuntime {
     const cached = this.cache.preview.get(cacheKey);
     if (cached) return structuredClone(cached);
     const response = shouldUseLiveProviders(this.config)
-      ? (await planWithGemini(this.config, input)).data
+      ? await this.buildLivePreview(input)
       : previewQuery(input);
     this.cache.preview.set(cacheKey, structuredClone(response));
     return response;
@@ -234,6 +283,7 @@ export class AgenticSearchRuntime {
 
   createThread(input: CreateThreadRequest): CreateThreadResponse {
     const bundle = buildThreadBundle(input);
+    this.store.pruneOldestThreadsIfOver(this.config.maxStoredThreads);
     this.store.createThread(bundle);
     return {
       threadId: bundle.thread.id,
@@ -292,6 +342,14 @@ export class AgenticSearchRuntime {
     };
   }
 
+  getRunDebug(runId: string) {
+    return this.store.getDebugSummary(runId);
+  }
+
+  getRunTrace(runId: string, page = 1, pageSize = 50) {
+    return this.store.getTrace(runId, page, pageSize);
+  }
+
   getRunResults(runId: string, includeRejected = false) {
     return this.store.listResults(runId, includeRejected);
   }
@@ -301,7 +359,25 @@ export class AgenticSearchRuntime {
   }
 
   cancelRun(runId: string): ResearchRun | null {
-    return this.store.cancelRun(runId);
+    const current = this.store.getRun(runId);
+    if (!current) return null;
+    if (["complete", "failed", "canceled"].includes(current.status)) return current;
+    const canceled = this.store.cancelRun(runId);
+    this.clearRunDeadline(runId);
+    this.markNonTerminalRowsFailed(runId);
+    this.abortRunRequests(runId, "Run canceled.");
+    return canceled;
+  }
+
+  deleteThread(threadId: string): boolean {
+    const snapshot = this.store.getThreadSnapshot(threadId);
+    if (!snapshot) return false;
+    const runId = snapshot.latestRun?.id;
+    if (runId && (snapshot.latestRun?.status === "queued" || snapshot.latestRun?.status === "running")) {
+      this.cancelRun(runId);
+      this.inflightRuns.delete(runId);
+    }
+    return this.store.deleteThread(threadId);
   }
 
   exportRun(runId: string, format: "csv" | "json"): ExportArtifact | null {
@@ -368,9 +444,17 @@ export class AgenticSearchRuntime {
         // does not crash on an unhandled rejection while background work is still observable in-app.
       })
       .finally(() => {
+        this.clearRunControl(runId);
         this.inflightRuns.delete(runId);
       });
     this.inflightRuns.set(runId, promise);
+  }
+
+  private async buildLivePreview(input: PreviewRequest): Promise<PreviewResponse> {
+    const providerResult = await planWithGemini(this.config, input, {
+      timeoutMs: this.config.requestTimeoutMs,
+    });
+    return providerResult.data;
   }
 
   private async executeRun(runId: string): Promise<void> {
@@ -496,6 +580,14 @@ export class AgenticSearchRuntime {
             rank: null,
             sourceCount: 0,
             duplicateOfRowId: null,
+            lineage: {
+              suggestedBySourceIds: candidate.sources.map((source) => source.id),
+              groundedBySourceIds: [],
+              sourceOriginClass: classifySourceOrigin(
+                candidate.sources[0]?.url ?? candidate.url,
+                candidate.sources[0]?.title ?? candidate.name,
+              ),
+            },
           };
           this.store.upsertRow(runId, row);
           for (const column of thread.columns) {
@@ -783,6 +875,7 @@ export class AgenticSearchRuntime {
           ...row,
           processingState: "finalized",
           rank: row.status === "rejected" ? null : rank,
+          lineage: this.withGroundedLineage(runId, row),
         };
         if (row.status !== "rejected") rank += 1;
         this.store.upsertRow(runId, finalized);
@@ -857,15 +950,13 @@ export class AgenticSearchRuntime {
     if (!thread) return;
 
     const criteriaByLabel = new Map(thread.criteria.map((criterion) => [criterion.label, criterion]));
-    const discovered: LiveDiscoveredCandidate[] = [];
-    const fetchedByRow = new Map<string, LiveFetchedSource[]>();
-    const extractedCriteria = new Map<string, Array<{
-      label: string;
-      verdict: "pass" | "fail" | "uncertain" | "conflict";
-      summary: string;
-      confidence: number;
-      evidenceText: string | null;
-    }>>();
+    const discovered: BraveWebResult[] = [];
+    const fetchedDocs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }> = [];
+    const failedUrls = new Set<string>();
+    const discoveredRowIdByUrl = new Map<string, string>();
+    const prunedSourceUrls = new Set<string>();
+    const prunedSourceSummaries = new Map<string, string>();
+    const extractionBudget = createExtractionBudget(this.config.maxLlmExtractionsPerRun);
 
     await this.runStage(runId, "planning", async () => {
       this.store.updateRun(runId, (current) => ({
@@ -899,14 +990,7 @@ export class AgenticSearchRuntime {
 
     await this.runStage(runId, "discovery", async () => {
       const seenUrls = new Set<string>();
-      let discoveryBudget = Math.min(
-        this.config.maxSourcesPerRun,
-        Math.max(
-          thread.thread.targetResults + 2,
-          Math.min(thread.plan.fetchBudget, thread.thread.targetResults + 4),
-        ),
-      );
-
+      let discoveryBudget = Math.min(this.config.maxSourcesPerRun, Math.max(thread.thread.targetResults + 4, 6));
       for (const query of thread.plan.searchQueries) {
         if (discoveryBudget <= 0) break;
         this.assertRunActive(runId);
@@ -919,7 +1003,12 @@ export class AgenticSearchRuntime {
 
         const searchStartedAt = now();
         const searchResults = cachedResults
-          ?? await searchBraveWeb(this.config.braveApiKey!, query, this.config.searchResultsPerQuery);
+          ?? await searchBraveWeb(
+            this.config.braveApiKey!,
+            query,
+            this.config.searchResultsPerQuery,
+            this.requestControlForRun(runId),
+          );
         const searchLatency = now() - searchStartedAt;
 
         if (!cachedResults) {
@@ -975,30 +1064,38 @@ export class AgenticSearchRuntime {
         for (const result of searchResults) {
           if (discoveryBudget <= 0) break;
           const normalizedUrl = this.normalizeUrl(result.url);
+          if (failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) continue;
           if (seenUrls.has(normalizedUrl)) continue;
           seenUrls.add(normalizedUrl);
           discoveryBudget -= 1;
-
-          const rowId = makeId("row");
-          const provisionalRow: ResultRow = {
-            id: rowId,
+          discovered.push({
+            ...result,
+            url: normalizedUrl,
+          });
+          const provisionalRowId = makeId("row");
+          discoveredRowIdByUrl.set(normalizedUrl, provisionalRowId);
+          this.store.upsertRow(runId, {
+            id: provisionalRowId,
             runId,
             canonicalName: this.cleanTitle(result.title),
-            canonicalUrl: normalizedUrl,
-            entityType: thread.plan.entityType,
-            status: "uncertain",
-            processingState: "pending",
-            score: 0.35,
+              canonicalUrl: normalizedUrl,
+              entityType: thread.plan.entityType,
+              status: "uncertain",
+              statusReasonCode: null,
+              statusReasonSummary: null,
+              processingState: "pending",
+            score: 0.2,
             rank: null,
             sourceCount: 0,
             duplicateOfRowId: null,
-          };
-
-          this.store.upsertRow(runId, provisionalRow);
+            lineage: {
+              ...emptyLineage(classifySourceOrigin(normalizedUrl, result.title)),
+            },
+          });
           for (const column of thread.columns) {
             this.store.upsertCell(runId, {
-              id: `${rowId}:${column.key}`,
-              rowId,
+              id: `${provisionalRowId}:${column.key}`,
+              rowId: provisionalRowId,
               columnKey: column.key,
               valueText: null,
               valueJson: null,
@@ -1008,113 +1105,137 @@ export class AgenticSearchRuntime {
               primaryEvidenceId: null,
             });
           }
-
-          discovered.push({
-            rowId,
-            queryText: query.text,
-            result: {
-              ...result,
-              url: normalizedUrl,
-            },
-          });
-
-          this.store.addActivity(
-            runId,
-            stageEvent(runId, "discovery", "completed", `Created provisional row for ${this.cleanTitle(result.title)}.`, {
-              actor: actorForStage("discovery"),
-              title: "Created candidate row",
-              rowId,
-              reasoning:
-                "Create the row immediately from the search result so the table can start filling while document fetch and extraction continue.",
-              rewards: [
-                { label: "query", value: query.text },
-                { label: "provisional_status", value: "uncertain" },
-              ],
-            }),
-          );
-          await sleep(35);
         }
       }
     });
     if (this.shouldStop(runId)) return;
+    if (this.failRunIfWallClockExceeded(runId)) return;
 
-    await this.runStage(runId, "fetch", async () => {
-      for (const candidate of discovered) {
+    const fetchByUrls = async (urls: string[]): Promise<Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>> => {
+      const nextFetched: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }> = [];
+      const byUrl = new Map(discovered.map((result) => [this.normalizeUrl(result.url), result]));
+      for (const url of urls) {
+        if (this.failRunIfWallClockExceeded(runId)) return nextFetched;
         this.assertRunActive(runId);
+        const normalizedUrl = this.normalizeUrl(url);
+        if (failedUrls.has(normalizedUrl)) continue;
+        if (fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === normalizedUrl)) continue;
+        const result = byUrl.get(normalizedUrl) ?? {
+          title: normalizedUrl,
+          url: normalizedUrl,
+          description: "",
+          age: "",
+        };
+
+        const provisionalRowId = discoveredRowIdByUrl.get(normalizedUrl);
+        if (provisionalRowId) {
+          const existingRow = this.store.getRow(runId, provisionalRowId);
+          if (existingRow) {
+            this.store.upsertRow(runId, { ...existingRow, processingState: "fetching" });
+          }
+        }
+
         try {
           const fetchStartedAt = now();
-          const parsed = await fetchAndParseDocument(candidate.result.url, this.config.fetchTextCharLimit);
+          const parsed = await fetchAndParseDocument(normalizedUrl, this.config.fetchTextCharLimit, {
+            jinaApiKey: this.config.jinaApiKey,
+            entityType: thread.plan.entityType,
+            ...this.requestControlForRun(runId),
+          });
           const fetchLatency = now() - fetchStartedAt;
-          const source: SourceDocument = {
-            id: makeId("src"),
-            runId,
-            url: parsed.finalUrl,
-            normalizedUrl: this.normalizeUrl(parsed.finalUrl),
-            domain: new URL(parsed.finalUrl).hostname,
-            title: parsed.title || candidate.result.title,
-            fetchedAt: now(),
-            fetchStatus: 200,
-            contentType: "text/html",
-            contentHash: `${this.normalizeUrl(parsed.finalUrl)}:${parsed.text.length}`,
-            trustTier: "reputable_secondary",
-            cacheKey: `page:${this.normalizeUrl(parsed.finalUrl)}`,
-            blobRef: null,
-            snippet: parsed.description || candidate.result.description || parsed.text.slice(0, 280),
-            favicon: `https://www.google.com/s2/favicons?domain=${new URL(parsed.finalUrl).hostname}&sz=16`,
-          };
-
           const usage = usageRecord(runId, "fetch", "http_fetch", "fetch_source", 1, fetchLatency, false, 0, 0, {
             url: parsed.finalUrl,
+            sourceClass: parsed.sourceClass,
           });
           this.store.addUsage(runId, usage);
-          this.store.addSource(runId, candidate.rowId, source);
-          this.cache.pages.set(source.cacheKey ?? source.normalizedUrl, source);
-
-          const fetched = fetchedByRow.get(candidate.rowId) ?? [];
-          fetched.push({
-            rowId: candidate.rowId,
-            source,
-            bodyText: parsed.text,
-          });
-          fetchedByRow.set(candidate.rowId, fetched);
-
-          const row = this.store.getRow(runId, candidate.rowId);
-          if (row) {
-            this.store.upsertRow(runId, {
-              ...row,
-              sourceCount: fetched.length,
-            });
+          const pruneDecision = classifySourceScopeDecision(
+            thread.thread.queryRaw,
+            {
+              title: parsed.title || result.title || "",
+              snippet: parsed.description || result.description || "",
+            },
+            this.normalizeUrl(parsed.finalUrl),
+          );
+          if (pruneDecision.eligibility === "out_of_scope_hard") {
+            if (pruneDecision.pruneKey) {
+              prunedSourceUrls.add(pruneDecision.pruneKey);
+              if (pruneDecision.reasonSummary) {
+                prunedSourceSummaries.set(pruneDecision.pruneKey, pruneDecision.reasonSummary);
+              }
+            }
+            failedUrls.add(normalizedUrl);
+            if (pruneDecision.pruneKey) failedUrls.add(pruneDecision.pruneKey);
+            if (provisionalRowId) {
+              const existingRow = this.store.getRow(runId, provisionalRowId);
+              if (existingRow) {
+                this.store.upsertRow(runId, {
+                  ...existingRow,
+                  canonicalUrl: pruneDecision.pruneKey ?? existingRow.canonicalUrl,
+                  status: "rejected",
+                  statusReasonCode: pruneDecision.reasonCode,
+                  statusReasonSummary: pruneDecision.reasonSummary,
+                  processingState: "finalized",
+                  score: 0.05,
+                });
+              }
+            }
+            this.store.addActivity(
+              runId,
+              stageEvent(
+                runId,
+                "fetch",
+                "skipped",
+                `Pruned out-of-scope source: ${parsed.title || parsed.finalUrl}`,
+                {
+                  actor: actorForStage("fetch"),
+                  title: "Source scope gate",
+                  checkpoint: "sources fetched",
+                  reason: pruneDecision.reasonCode ?? "out_of_scope_hard",
+                  reasoning: pruneDecision.reasonSummary ?? undefined,
+                  sourceUrl: pruneDecision.pruneKey ?? this.normalizeUrl(parsed.finalUrl),
+                },
+              ),
+            );
+            continue;
           }
 
+          nextFetched.push({ result, parsed });
+
+          const finalNorm = this.normalizeUrl(parsed.finalUrl);
+          if (provisionalRowId) {
+            discoveredRowIdByUrl.set(finalNorm, provisionalRowId);
+          }
+
+          const shortDomain = (() => { try { return new URL(parsed.finalUrl).hostname; } catch { return normalizedUrl; } })();
           this.store.addActivity(
             runId,
-            stageEvent(runId, "fetch", "completed", `Fetched ${source.title}.`, {
+            stageEvent(runId, "fetch", "completed", `Fetched ${shortDomain} (${parsed.sourceClass})`, {
               actor: actorForStage("fetch"),
-              title: "Fetching source document",
+              title: `Reading ${parsed.title || shortDomain}`,
               checkpoint: "sources fetched",
-              reasoning:
-                "The fetched page is retained as the grounding substrate for cell extraction, criterion evaluation, and post-run debugging.",
               toolCalls: [
-                this.toolCallFromUsage(usage, "Fetch and bound-read the source document.", {
-                  input: candidate.result.url,
-                  output: source.snippet,
+                this.toolCallFromUsage(usage, "Fetch and classify source page.", {
+                  input: normalizedUrl,
+                  output: `${parsed.sourceClass} · ${(parsed.text?.length ?? 0).toLocaleString()} chars`,
                 }),
-              ],
-              rewards: [
-                { label: "domain", value: source.domain },
-                { label: "source_count", value: String(fetched.length) },
               ],
             }),
           );
-          await sleep(20);
         } catch (error) {
+          failedUrls.add(normalizedUrl);
+          if (provisionalRowId) {
+            const existingRow = this.store.getRow(runId, provisionalRowId);
+            if (existingRow) {
+              this.store.upsertRow(runId, { ...existingRow, processingState: "failed" });
+            }
+          }
           this.store.addActivity(
             runId,
             stageEvent(
               runId,
               "fetch",
               "failed",
-              error instanceof Error ? error.message : `Failed to fetch ${candidate.result.url}`,
+              error instanceof Error ? error.message : `Failed to fetch ${normalizedUrl}`,
               {
                 actor: actorForStage("fetch"),
                 title: "Fetching source document",
@@ -1123,140 +1244,246 @@ export class AgenticSearchRuntime {
             ),
           );
         }
+
+        this.store.updateRun(runId, (current) => ({
+          ...current,
+          progress: {
+            ...current.progress,
+            sourcesFetched: fetchedDocs.length + nextFetched.length,
+          },
+        }));
       }
+      return nextFetched;
+    };
+
+    await this.runStage(runId, "fetch", async () => {
+      const fetched = await fetchByUrls(discovered.slice(0, this.config.maxSourcesPerRun).map((result) => result.url));
+      fetchedDocs.push(...fetched);
     });
     if (this.shouldStop(runId)) return;
+    if (this.failRunIfWallClockExceeded(runId)) return;
 
-    await this.runStage(runId, "extraction", async () => {
-      let llmExtractionsUsed = 0;
-      const llmExtractionBudget = Math.max(
-        1,
-        Math.min(this.config.maxLlmExtractionsPerRun, thread.thread.targetResults + 1),
-      );
-
-      for (const candidate of discovered) {
-        this.assertRunActive(runId);
-        const row = this.store.getRow(runId, candidate.rowId);
-        if (!row) continue;
-        const fetchedSources = (fetchedByRow.get(candidate.rowId) ?? []).slice(0, this.config.maxSourcesPerRow);
-        if (fetchedSources.length === 0) {
-          this.finalizeMissingRow(runId, thread.criteria, thread.columns, row, candidate.result.description);
-          continue;
-        }
-
-        const promptBody = fetchedSources
-          .map((entry, index) => [
-            `Source ${index + 1}: ${entry.source.title}`,
-            `URL: ${entry.source.url}`,
-            `Snippet: ${entry.source.snippet}`,
-            entry.bodyText,
-          ].join("\n"))
-          .join("\n\n");
-
-        let extraction: LiveDocumentExtraction;
-        let usage: UsageRecord | null = null;
-        let extractionMode = "live_llm";
-
-        if (llmExtractionsUsed >= llmExtractionBudget) {
-          extractionMode = "budget_guard";
-          extraction = this.buildFallbackExtraction(
-            thread.thread.queryRaw,
-            thread.criteria,
-            thread.columns,
-            candidate,
-            fetchedSources,
-            "LLM extraction budget was exhausted, so this row was compacted into a heuristic fallback.",
-          );
-        } else {
-          try {
-            const startedAt = now();
-            const providerResult = await extractDocumentWithGemini(this.config, {
-              query: thread.thread.queryRaw,
-              entityType: thread.plan.entityType,
-              criteria: thread.criteria.map((criterion) => ({
-                label: criterion.label,
-                kind: criterion.kind,
-              })),
-              columns: thread.columns.map((column) => ({
-                key: column.key,
-                label: column.label,
-                kind: column.kind,
-                valueType: column.valueType,
-              })),
-              url: candidate.result.url,
-              title: candidate.result.title,
-              snippet: candidate.result.description,
-              bodyText: promptBody,
-            });
-            extraction = providerResult.data;
-            llmExtractionsUsed += 1;
-            usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
-              rowId: candidate.rowId,
-              sourceCount: fetchedSources.length,
-              backend: providerResult.meta.backend,
-              model: providerResult.meta.model,
-            });
-            this.store.addUsage(runId, usage);
-          } catch (error) {
-            extractionMode = "fallback_after_error";
-            extraction = this.buildFallbackExtraction(
-              thread.thread.queryRaw,
-              thread.criteria,
-              thread.columns,
-              candidate,
-              fetchedSources,
-              error instanceof Error ? error.message : "LLM extraction failed.",
-            );
-            this.store.addActivity(
-              runId,
-              stageEvent(runId, "extraction", "failed", `Fell back for ${row.canonicalName}.`, {
-                actor: actorForStage("extraction"),
-                title: "Extractor fallback",
-                checkpoint: "cells extracted",
-                reasoning:
-                  "A provider failure should degrade the row quality, not crash the whole run. This row keeps compact heuristic values and explicit abstentions.",
-                error: error instanceof Error ? error.message : "Unexpected extraction failure",
-              }),
-            );
+    const extractFromFetched = async (
+      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
+    ): Promise<ExtractedEntityRow[]> => {
+      const extracted: ExtractedEntityRow[] = [];
+      for (const entry of docs) {
+        if (this.failRunIfWallClockExceeded(runId)) return extracted;
+        const normalizedUrl = this.normalizeUrl(entry.parsed.finalUrl);
+        const provisionalRowId = discoveredRowIdByUrl.get(normalizedUrl);
+        if (provisionalRowId) {
+          const existingRow = this.store.getRow(runId, provisionalRowId);
+          if (existingRow) {
+            this.store.upsertRow(runId, { ...existingRow, processingState: "extracting" });
           }
         }
 
-        this.store.upsertRow(runId, {
-          ...row,
-          canonicalName: extraction.canonicalName || row.canonicalName,
-          canonicalUrl: this.ensureHttpUrl(extraction.canonicalUrl || row.canonicalUrl),
-          status: extraction.rowStatus,
-          score: extraction.score,
-          sourceCount: fetchedSources.length,
+        const startedAt = now();
+        const providerResult = await extractDocumentWithGemini(
+          this.config,
+          {
+            query: thread.thread.queryRaw,
+            entityType: thread.plan.entityType,
+            criteria: thread.criteria.map((criterion) => ({
+              label: criterion.label,
+              kind: criterion.kind,
+            })),
+            columns: thread.columns.map((column) => ({
+              key: column.key,
+              label: column.label,
+              kind: column.kind,
+              valueType: column.valueType,
+            })),
+            url: entry.parsed.finalUrl,
+            title: entry.parsed.title || entry.result.title,
+            snippet: entry.parsed.description || entry.result.description,
+            bodyText: entry.parsed.text,
+          },
+          entry.parsed.sourceClass,
+          this.requestControlForRun(runId),
+        );
+        const extractLatency = now() - startedAt;
+        const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, extractLatency, false, 0, 0, {
+          backend: providerResult.meta.backend,
+          model: providerResult.meta.model,
+          sourceClass: entry.parsed.sourceClass,
+          url: entry.parsed.finalUrl,
         });
+        this.store.addUsage(runId, usage);
 
-        const resolvedColumns: string[] = [];
+        let keptCount = 0;
+        for (const row of providerResult.data) {
+          if (isJunkExtraction(row, entry.parsed.finalUrl)) continue;
+          keptCount += 1;
+          extracted.push({
+            ...row,
+            sourceUrl: entry.parsed.finalUrl,
+            sourceClass: entry.parsed.sourceClass,
+          });
+        }
+
+        const shortDomain = (() => { try { return new URL(entry.parsed.finalUrl).hostname; } catch { return normalizedUrl; } })();
+        const entityNames = providerResult.data
+          .filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl))
+          .map((row) => row.canonicalName)
+          .slice(0, 5);
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "extraction",
+            "completed",
+            keptCount > 0
+              ? `Extracted ${keptCount} entit${keptCount === 1 ? "y" : "ies"} from ${shortDomain}: ${entityNames.join(", ")}`
+              : `No entities extracted from ${shortDomain}`,
+            {
+              actor: actorForStage("extraction"),
+              title: `Extracting from ${entry.parsed.title || shortDomain}`,
+              checkpoint: "entities extracted",
+              toolCalls: [
+                this.toolCallFromUsage(usage, "LLM structured extraction.", {
+                  input: `${entry.parsed.sourceClass} · ${entry.parsed.finalUrl}`,
+                  output: `${keptCount} entities kept (${providerResult.data.length} raw)`,
+                }),
+              ],
+            },
+          ),
+        );
+      }
+      return extracted;
+    };
+
+    const logExtractionBudgetSkip = (skippedCount: number, context: string): void => {
+      if (skippedCount <= 0) return;
+      this.store.addActivity(
+        runId,
+        stageEvent(
+          runId,
+          "extraction",
+          "skipped",
+          `Skipped ${skippedCount} source${skippedCount === 1 ? "" : "s"} because the extraction budget was exhausted (${context}).`,
+          {
+            actor: actorForStage("extraction"),
+            title: "Extraction budget guard",
+            reasoning:
+              "The live runtime caps LLM extraction calls per run so refinement cannot silently increase latency or cost beyond configured guardrails.",
+            rewards: [
+              { label: "remaining_budget", value: String(extractionBudget.remainingCalls) },
+              { label: "skipped_sources", value: String(skippedCount) },
+            ],
+          },
+        ),
+      );
+    };
+
+    const extractWithinBudget = async (
+      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
+      context: string,
+    ): Promise<ExtractedEntityRow[]> => {
+      const { allowedItems: allowedDocs, skippedCount } = allocateExtractionBatch(extractionBudget, docs);
+      logExtractionBudgetSkip(skippedCount, context);
+      if (allowedDocs.length === 0) return [];
+      return extractFromFetched(allowedDocs);
+    };
+
+    const upsertMergedRows = (
+      mergedRows: ExtractedEntityRow[],
+      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
+    ): void => {
+      const docsByUrl = new Map(docs.map((entry) => [this.normalizeUrl(entry.parsed.finalUrl), entry]));
+      const rows = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId);
+      const rowIdByName = new Map<string, string>();
+      for (const row of rows) {
+        const key = normalizeName(row.canonicalName);
+        if (key) rowIdByName.set(key, row.id);
+      }
+
+      for (const merged of mergedRows) {
+        const normalizedName = normalizeName(merged.canonicalName);
+        if (!normalizedName) continue;
+        const existingRowId = rowIdByName.get(normalizedName);
+        const rowId = existingRowId ?? discoveredRowIdByUrl.get(this.normalizeUrl(merged.sourceUrl)) ?? makeId("row");
+        rowIdByName.set(normalizedName, rowId);
+        const sourceEntry = docsByUrl.get(this.normalizeUrl(merged.sourceUrl));
+        const sourceDoc: SourceDocument = {
+          id: makeId("src"),
+          runId,
+          url: sourceEntry?.parsed.finalUrl ?? merged.sourceUrl,
+          normalizedUrl: this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl),
+          domain: (() => {
+            try {
+              return new URL(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl).hostname;
+            } catch {
+              return "unknown";
+            }
+          })(),
+          title: sourceEntry?.parsed.title ?? merged.canonicalName,
+          fetchedAt: now(),
+          fetchStatus: 200,
+          contentType: "text/html",
+          contentHash: `${this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl)}:${(sourceEntry?.parsed.text ?? "").length}`,
+          trustTier: merged.sourceClass === "directory" ? "primary_structured" : "reputable_secondary",
+          cacheKey: `page:${this.normalizeUrl(sourceEntry?.parsed.finalUrl ?? merged.sourceUrl)}`,
+          blobRef: null,
+          snippet: sourceEntry?.parsed.description ?? sourceEntry?.result.description ?? "",
+          favicon: sourceEntry
+            ? `https://www.google.com/s2/favicons?domain=${new URL(sourceEntry.parsed.finalUrl).hostname}&sz=16`
+            : null,
+        };
+        const existing = this.store.getRow(runId, rowId);
+        const terminalProcessing =
+          existing?.processingState === "verifying"
+          || existing?.processingState === "finalized"
+          || existing?.processingState === "failed";
+        const nextProcessingState = terminalProcessing
+          ? (existing?.processingState ?? "pending")
+          : "refining";
+
+        this.store.upsertRow(runId, {
+          id: rowId,
+          runId,
+          canonicalName: merged.canonicalName,
+          canonicalUrl: this.ensureHttpUrl(merged.canonicalUrl),
+          entityType: thread.plan.entityType,
+          status: merged.rowStatus,
+          statusReasonCode: null,
+          statusReasonSummary: null,
+          processingState: nextProcessingState,
+          score: merged.score,
+          rank: existing?.rank ?? null,
+          sourceCount: Math.max(existing?.sourceCount ?? 0, 1),
+          duplicateOfRowId: existing?.duplicateOfRowId ?? null,
+          lineage: {
+            suggestedBySourceIds: existing?.lineage.suggestedBySourceIds?.length
+              ? existing.lineage.suggestedBySourceIds
+              : [sourceDoc.id],
+            groundedBySourceIds: existing?.lineage.groundedBySourceIds ?? [],
+            sourceOriginClass: classifySourceOrigin(sourceDoc.url, sourceDoc.title),
+          },
+        });
+        this.store.addSource(runId, rowId, sourceDoc);
+
         for (const column of thread.columns) {
-          const extractedCell = extraction.cells.find((cell) => cell.key === column.key);
-          const valueText =
-            column.key === "evidence_count"
-              ? String(fetchedSources.length)
-              : extractedCell?.valueText ?? null;
-          const state: CellState =
-            column.key === "evidence_count"
-              ? "filled"
-              : extractedCell?.state ?? "unsupported";
-          const evidenceText =
-            column.key === "evidence_count"
-              ? `Resolved against ${fetchedSources.length} fetched source documents.`
-              : extractedCell?.evidenceText ?? null;
-          const primarySource = fetchedSources[0]?.source ?? null;
-          const evidence = primarySource && evidenceText
-            ? this.createEvidenceFromSource(runId, candidate.rowId, primarySource.id, {
-                kind: "inferred_summary",
-                text: evidenceText,
-                columnKey: column.key,
-              })
+          const extractedCell = merged.cells.find((cell) => cell.key === column.key);
+          const valueText = column.key === "evidence_count"
+            ? "1"
+            : extractedCell?.valueText ?? null;
+          const state: CellState = column.key === "evidence_count"
+            ? "filled"
+            : extractedCell?.state ?? "unsupported";
+          const evidenceText = column.key === "evidence_count"
+            ? "Resolved against 1 fetched source document."
+            : extractedCell?.evidenceText ?? null;
+          const evidence = evidenceText
+            ? this.createEvidenceFromSource(runId, rowId, sourceDoc.id, {
+              kind: "inferred_summary",
+              text: evidenceText,
+              columnKey: column.key,
+            })
             : null;
-
           this.store.upsertCell(runId, {
-            id: `${candidate.rowId}:${column.key}`,
-            rowId: candidate.rowId,
+            id: `${rowId}:${column.key}`,
+            rowId,
             columnKey: column.key,
             valueText,
             valueJson: null,
@@ -1265,109 +1492,275 @@ export class AgenticSearchRuntime {
             reasonCode: extractedCell?.reasonCode ?? (state === "unsupported" ? "model_omitted_field" : null),
             primaryEvidenceId: evidence?.id ?? null,
           });
-          if (state !== "pending") {
-            resolvedColumns.push(`${column.label}:${state}`);
-          }
         }
 
-        extractedCriteria.set(candidate.rowId, extraction.criteria);
-        this.store.addActivity(
-          runId,
-          stageEvent(runId, "extraction", "completed", `Resolved ${resolvedColumns.length} cells for ${extraction.canonicalName}.`, {
-            actor: actorForStage("extraction"),
-            title: "Extracting row cells",
-            checkpoint: "cells extracted",
-            reasoning:
-              "The extractor can abstain. Cells stay blank or weak when the document does not support a grounded value strongly enough.",
-            toolCalls: [
-              ...(usage
-                ? [
-                    this.toolCallFromUsage(usage, "Extract row cells and provisional row status from fetched documents.", {
-                      input: extraction.canonicalName,
-                      output: resolvedColumns.join("\n"),
-                    }),
-                  ]
-                : []),
-            ],
-            rewards: [
-              { label: "row_status", value: extraction.rowStatus },
-              { label: "score", value: extraction.score.toFixed(2) },
-              { label: "mode", value: extractionMode },
-            ],
-          }),
-        );
-      }
-    });
-    if (this.shouldStop(runId)) return;
-
-    await this.runStage(runId, "evaluation", async () => {
-      for (const candidate of discovered) {
-        this.assertRunActive(runId);
-        const evaluations = extractedCriteria.get(candidate.rowId) ?? [];
         for (const criterion of thread.criteria) {
-          const extracted = evaluations.find((entry) => entry.label === criterion.label);
-          const sourceId = (fetchedByRow.get(candidate.rowId) ?? [])[0]?.source.id ?? null;
-          const evidence = sourceId && extracted?.evidenceText
-            ? this.createEvidenceFromSource(runId, candidate.rowId, sourceId, {
-                kind: "inferred_summary",
-                text: extracted.evidenceText,
-                columnKey: criterion.id,
-              })
+          const extracted = merged.criteria.find((entry) => entry.label === criterion.label);
+          const evidence = extracted?.evidenceText
+            ? this.createEvidenceFromSource(runId, rowId, sourceDoc.id, {
+              kind: "inferred_summary",
+              text: extracted.evidenceText,
+              columnKey: criterion.id,
+            })
             : null;
           this.store.addEvaluation(runId, {
-            id: `${candidate.rowId}:${criterion.id}`,
-            rowId: candidate.rowId,
+            id: `${rowId}:${criterion.id}`,
+            rowId,
             criterionId: criteriaByLabel.get(criterion.label)?.id ?? criterion.id,
             verdict: extracted?.verdict ?? "uncertain",
-            summary: extracted?.summary ?? "Criterion could not be grounded from the extracted sources.",
+            summary: extracted?.summary ?? "Criterion could not be grounded from extracted evidence.",
             confidence: extracted?.confidence ?? 0.25,
             primaryEvidenceId: evidence?.id ?? null,
           });
         }
+      }
+      const totalRows = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId).length;
+      this.store.updateRun(runId, (current) => ({
+        ...current,
+        progress: {
+          ...current.progress,
+          totalRows,
+          rowsCreated: totalRows,
+          sourcesFetched: fetchedDocs.length,
+          cellsResolved: this.store.listCells(runId).filter((cell) => cell.state !== "pending").length,
+        },
+      }));
+    };
 
+    await this.runStage(runId, "extraction", async () => {
+      const extracted = await extractWithinBudget(fetchedDocs, "initial extraction");
+      const merged = dedupeAndMerge(extracted);
+      upsertMergedRows(merged, fetchedDocs);
+
+      if (merged.length > 0 || extracted.length > 0) {
         this.store.addActivity(
           runId,
-          stageEvent(runId, "evaluation", "completed", `Evaluated ${candidate.result.title} against ${thread.criteria.length} criteria.`, {
-            actor: actorForStage("evaluation"),
-            title: "Evaluating criteria",
-            checkpoint: "criteria evaluated",
-            reasoning:
-              "Hard filters gate whether the row can survive into the accepted set. Soft signals may remain weaker and influence ordering instead.",
-            rewards: [
-              { label: "criteria_count", value: String(thread.criteria.length) },
-            ],
-          }),
+          stageEvent(
+            runId,
+            "extraction",
+            "completed",
+            `Dedup: ${extracted.length} raw → ${merged.length} unique entit${merged.length === 1 ? "y" : "ies"}`,
+            {
+              actor: actorForStage("extraction"),
+              title: "Deduplication complete",
+              checkpoint: "entities deduplicated",
+            },
+          ),
         );
       }
     });
     if (this.shouldStop(runId)) return;
+    if (this.failRunIfWallClockExceeded(runId)) return;
+
+    await this.runStage(runId, "evaluation", async () => {
+      this.store.addActivity(
+        runId,
+        stageEvent(runId, "evaluation", "completed", "Criteria are captured during extraction and merged per entity.", {
+          actor: actorForStage("evaluation"),
+          title: "Evaluating criteria",
+          checkpoint: "criteria evaluated",
+        }),
+      );
+    });
+    if (this.shouldStop(runId)) return;
 
     await this.runStage(runId, "canonicalization", async () => {
-      const seenCanonical = new Map<string, string>();
-      for (const row of this.store.listRows(runId)) {
-        const canonical = this.normalizeUrl(row.canonicalUrl);
-        if (seenCanonical.has(canonical)) {
+      const rows = this.store.listRows(runId).filter((row) => row.duplicateOfRowId === null);
+      const seen = new Map<string, string>();
+      for (const row of rows) {
+        const key = normalizeName(row.canonicalName) || this.normalizeUrl(row.canonicalUrl);
+        if (seen.has(key)) {
           this.store.upsertRow(runId, {
             ...row,
-            duplicateOfRowId: seenCanonical.get(canonical) ?? null,
+            duplicateOfRowId: seen.get(key) ?? null,
           });
         } else {
-          seenCanonical.set(canonical, row.id);
+          seen.set(key, row.id);
         }
+      }
+    });
+    if (this.shouldStop(runId)) return;
+
+    for (let iteration = 1; iteration <= this.config.maxSupervisorIterations; iteration += 1) {
+      if (this.shouldStop(runId)) return;
+      if (this.failRunIfWallClockExceeded(runId)) return;
+      if (!hasExtractionBudgetRemaining(extractionBudget)) {
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "refinement",
+            "skipped",
+            "Supervisor stopped because the extraction budget is exhausted.",
+            {
+              actor: "Supervisor",
+              title: "Refinement budget guard",
+              reasoning:
+                "Further discovery would only fetch more sources without the budget required to extract grounded rows from them.",
+            },
+          ),
+        );
+        break;
+      }
+
+      this.store.updateRun(runId, (current) => ({
+        ...current,
+        status: "running",
+        stage: "refinement",
+        metrics: {
+          ...current.metrics,
+          elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
+        },
+      }));
+
+      const activeRows = this.store
+        .listRows(runId)
+        .filter((row) => row.duplicateOfRowId === null && row.status !== "rejected");
+      const summaries = thread.columns.map((column) => {
+        let filled = 0;
+        let confidence = 0;
+        for (const row of activeRows) {
+          const details = this.store.getRowDetails(runId, row.id);
+          const cell = details?.cells.find((entry) => entry.columnKey === column.key);
+          if (cell?.state === "filled") {
+            filled += 1;
+            confidence += cell.confidence;
+          }
+        }
+        return {
+          label: column.label,
+          fillRate: activeRows.length > 0 ? filled / activeRows.length : 0,
+          avgConfidence: filled > 0 ? confidence / filled : 0,
+        };
+      });
+
+      const unfetchedUrls = discovered
+        .map((result) => this.normalizeUrl(result.url))
+        .filter((url) => {
+          return !prunedSourceUrls.has(url);
+        })
+        .filter((url) => !failedUrls.has(url))
+        .filter((url) => !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url))
+        .slice(0, 10);
+
+      let decision: Awaited<ReturnType<typeof supervisorDecide>>["data"] = {
+        action: "done",
+        queries: [],
+        urls: [],
+        focusColumns: [],
+        reasoning: "",
+      };
+      try {
+          decision = (await supervisorDecide(this.config, {
+            query: thread.thread.queryRaw,
+            iteration,
+            maxIterations: this.config.maxSupervisorIterations,
+            totalRows: activeRows.length,
+            targetRows: thread.thread.targetResults,
+            columnSummaries: summaries,
+            unfetchedUrls,
+            prunedSources: [...prunedSourceSummaries.entries()].map(([url, reasonSummary]) => ({
+              url,
+              reasonSummary,
+            })),
+          }, this.requestControlForRun(runId))).data;
+      } catch (error) {
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "refinement",
+            "skipped",
+            `Supervisor skipped: ${error instanceof Error ? error.message : "unknown error"}`,
+          ),
+        );
+        break;
       }
 
       this.store.addActivity(
         runId,
-        stageEvent(runId, "canonicalization", "completed", "Canonicalized rows and folded duplicate URLs together.", {
-          actor: actorForStage("canonicalization"),
-          title: "Canonicalizing entities",
-          reasoning:
-            "Canonicalization keeps the result table from double-counting the same entity across multiple search queries or source variants.",
-        }),
+        stageEvent(
+          runId,
+          "refinement",
+          decision.action === "done" ? "completed" : "started",
+          decision.action === "done"
+            ? `Supervisor: done (${activeRows.length} rows, iter ${iteration}/${this.config.maxSupervisorIterations})`
+            : `Supervisor iter ${iteration}: ${decision.action.replace(/_/g, " ")} — ${decision.reasoning || "expanding coverage"}`,
+          {
+            actor: "Supervisor",
+            title: decision.action === "done" ? "Research complete" : `Supervisor — ${decision.action.replace(/_/g, " ")}`,
+            reasoning: decision.reasoning || undefined,
+            rewards: [
+              { label: "action", value: decision.action },
+              { label: "iteration", value: `${iteration}/${this.config.maxSupervisorIterations}` },
+              { label: "rows", value: String(activeRows.length) },
+            ],
+          },
+        ),
       );
-      await sleep(20);
-    });
-    if (this.shouldStop(runId)) return;
+
+      if (decision.action === "done") {
+        break;
+      }
+
+      if (decision.action === "search_more") {
+        try {
+          const rewritten = await rewriteQueries(this.config, {
+            query: thread.thread.queryRaw,
+            gapColumns: decision.focusColumns,
+          }, this.requestControlForRun(runId));
+          for (const queryText of rewritten.data) {
+            const nextResults = await searchBraveWeb(
+              this.config.braveApiKey!,
+              { id: makeId("sq"), text: queryText },
+              this.config.searchResultsPerQuery,
+              this.requestControlForRun(runId),
+            );
+            for (const result of nextResults) {
+              const normalized = this.normalizeUrl(result.url);
+              if (failedUrls.has(normalized) || prunedSourceUrls.has(normalized)) continue;
+              if (discovered.some((entry) => this.normalizeUrl(entry.url) === normalized)) continue;
+              discovered.push({ ...result, url: normalized });
+            }
+          }
+        } catch {
+          // Best effort only.
+        }
+      }
+
+      const targetUrls = (decision.urls.length > 0 ? decision.urls : unfetchedUrls)
+        .map((url) => this.normalizeUrl(url))
+        .filter((url) => {
+          return !prunedSourceUrls.has(url);
+        })
+        .slice(0, 4);
+      const newFetched = await fetchByUrls(targetUrls);
+      if (newFetched.length === 0) {
+        continue;
+      }
+      fetchedDocs.push(...newFetched);
+      const extracted = await extractWithinBudget(newFetched, `supervisor iteration ${iteration}`);
+      const merged = dedupeAndMerge(extracted);
+      upsertMergedRows(merged, fetchedDocs);
+
+      const totalAfter = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId).length;
+      this.store.addActivity(
+        runId,
+        stageEvent(
+          runId,
+          "extraction",
+          "completed",
+          `Supervisor iter ${iteration} done: +${merged.length} entit${merged.length === 1 ? "y" : "ies"}, ${totalAfter} total rows`,
+          {
+            actor: "Supervisor",
+            title: `Iteration ${iteration} complete`,
+            checkpoint: "supervisor iteration complete",
+          },
+        ),
+      );
+
+      if (this.shouldStop(runId)) return;
+    }
 
     await this.runStage(runId, "verification", async () => {
       let verificationsUsed = 0;
@@ -1425,7 +1818,7 @@ export class AgenticSearchRuntime {
             url: source.url,
             snippet: source.snippet,
           })),
-        });
+        }, this.requestControlForRun(runId));
         const verification = verificationResult.data;
         verificationsUsed += 1;
         const usage = usageRecord(runId, "llm", "gemini", "verify_candidate", 1, now() - startedAt, false, 0, 0, {
@@ -1502,12 +1895,28 @@ export class AgenticSearchRuntime {
 
       let rank = 1;
       for (const entry of rankedRows) {
-        const finalStatus = this.deriveFinalStatus(entry.row, entry.details?.evaluations ?? [], thread.criteria);
+        const details = entry.details;
+        const filledCount = details?.cells.filter((cell) => cell.state === "filled").length ?? 0;
+        const avgCellConfidence = details && details.cells.length > 0
+          ? details.cells.reduce((sum, cell) => sum + cell.confidence, 0) / details.cells.length
+          : 0;
+        const enrichedScore = Math.max(entry.row.score, Math.min(1, 0.6 * entry.row.score + 0.25 * avgCellConfidence + 0.15 * Math.min(1, filledCount / Math.max(1, thread.columns.length))));
+        const finalStatus = deriveFinalStatus(
+          entry.row,
+          entry.details?.evaluations ?? [],
+          thread.criteria,
+          {
+            rejectConfidenceMin: DEFAULT_REJECT_CONFIDENCE_MIN,
+            acceptConfidenceMin: DEFAULT_ACCEPT_CONFIDENCE_MIN,
+          },
+        );
         const finalized: ResultRow = {
           ...entry.row,
           status: finalStatus,
           processingState: "finalized",
+          score: enrichedScore,
           rank: finalStatus === "rejected" ? null : rank,
+          lineage: this.withGroundedLineage(runId, entry.row),
         };
         if (finalStatus !== "rejected") rank += 1;
         this.store.upsertRow(runId, finalized);
@@ -1556,144 +1965,6 @@ export class AgenticSearchRuntime {
     }));
   }
 
-  private finalizeMissingRow(
-    runId: string,
-    criteria: Criterion[],
-    columns: Array<{ key: string; label: string }>,
-    row: ResultRow,
-    summary: string,
-  ): void {
-    this.store.upsertRow(runId, {
-      ...row,
-      status: "rejected",
-      score: 0.1,
-      processingState: "pending",
-    });
-
-    for (const column of columns) {
-      this.store.upsertCell(runId, {
-        id: `${row.id}:${column.key}`,
-        rowId: row.id,
-        columnKey: column.key,
-        valueText: null,
-        valueJson: null,
-        state: "unsupported",
-        confidence: 0.1,
-        reasonCode: "fetch_failed_or_empty",
-        primaryEvidenceId: null,
-      });
-    }
-
-    for (const criterion of criteria) {
-      this.store.addEvaluation(runId, {
-        id: `${row.id}:${criterion.id}`,
-        rowId: row.id,
-        criterionId: criterion.id,
-        verdict: "uncertain",
-        summary: summary || "No fetchable evidence was available for this row.",
-        confidence: 0.1,
-        primaryEvidenceId: null,
-      });
-    }
-  }
-
-  private buildFallbackExtraction(
-    query: string,
-    criteria: Criterion[],
-    columns: Array<{ key: string; label: string }>,
-    candidate: LiveDiscoveredCandidate,
-    fetchedSources: LiveFetchedSource[],
-    reason: string,
-  ): LiveDocumentExtraction {
-    const primarySource = fetchedSources[0]?.source;
-    const summaryText =
-      primarySource?.snippet
-      || candidate.result.description
-      || candidate.result.title
-      || "No grounded summary was available.";
-    const canonicalName = this.cleanTitle(primarySource?.title || candidate.result.title);
-    const canonicalUrl = primarySource?.url || candidate.result.url;
-    const lowerSummary = `${canonicalName} ${summaryText} ${query}`.toLowerCase();
-
-    return {
-      canonicalName,
-      canonicalUrl,
-      rowStatus: "uncertain",
-      score: 0.18,
-      rowSummary: reason,
-      cells: columns.map((column) => {
-        const key = column.key.toLowerCase();
-        if (/(^name$|headline|company|project)/.test(key)) {
-          return {
-            key: column.key,
-            valueText: canonicalName,
-            state: "filled",
-            confidence: 0.55,
-            reasonCode: "heuristic_identity",
-            evidenceText: canonicalName,
-          };
-        }
-        if (/(^url$|website|repo|source_url)/.test(key)) {
-          return {
-            key: column.key,
-            valueText: canonicalUrl,
-            state: "filled",
-            confidence: 0.55,
-            reasonCode: "heuristic_identity",
-            evidenceText: canonicalUrl,
-          };
-        }
-        if (/(description|summary|headline|about)/.test(key)) {
-          return {
-            key: column.key,
-            valueText: summaryText,
-            state: "filled",
-            confidence: 0.45,
-            reasonCode: "heuristic_summary",
-            evidenceText: summaryText,
-          };
-        }
-        if (key === "evidence_count") {
-          return {
-            key: column.key,
-            valueText: String(fetchedSources.length),
-            state: "filled",
-            confidence: 1,
-            reasonCode: "source_count",
-            evidenceText: `Resolved against ${fetchedSources.length} fetched source documents.`,
-          };
-        }
-        return {
-          key: column.key,
-          valueText: null,
-          state: "unsupported" as const,
-          confidence: 0.1,
-          reasonCode: "llm_budget_guard",
-          evidenceText: null,
-        };
-      }),
-      criteria: criteria.map((criterion) => {
-        const label = criterion.label.toLowerCase();
-        const verdict: CriterionEvaluation["verdict"] =
-          label.includes("open source") && /(open source|github|license)/.test(lowerSummary)
-            ? "pass"
-            : label.includes("database") && /(database|sql|postgres|mysql|sqlite|mongo)/.test(lowerSummary)
-              ? "pass"
-              : "uncertain";
-        return {
-          label: criterion.label,
-          verdict,
-          summary:
-            verdict === "pass"
-              ? `Heuristic fallback matched '${criterion.label}' against visible source text.`
-              : reason,
-          confidence: verdict === "pass" ? 0.45 : 0.18,
-          evidenceText: verdict === "pass" ? summaryText : null,
-        };
-      }),
-    };
-  }
-
   private cleanTitle(title: string): string {
     return title
       .replace(/\s+[|\-–:]\s+.*$/, "")
@@ -1717,20 +1988,21 @@ export class AgenticSearchRuntime {
     }
   }
 
-  private deriveFinalStatus(
-    row: ResultRow,
-    evaluations: CriterionEvaluation[],
-    criteria: Criterion[],
-  ): ResultRow["status"] {
-    const hardCriteriaIds = new Set(
-      criteria.filter((criterion) => criterion.kind === "hard_filter").map((criterion) => criterion.id),
-    );
-    const hardEvaluations = evaluations.filter((evaluation) => hardCriteriaIds.has(evaluation.criterionId));
+  private withGroundedLineage(runId: string, row: ResultRow): ResultRow["lineage"] {
+    const details = this.store.getRowDetails(runId, row.id);
+    const groundedBySourceIds = details
+      ? [...new Set(details.evidence.map((evidence) => evidence.sourceDocumentId))]
+      : row.lineage.groundedBySourceIds;
+    const sourceOriginClass =
+      details?.sources[0]
+        ? classifySourceOrigin(details.sources[0].url, details.sources[0].title)
+        : row.lineage.sourceOriginClass;
 
-    if (hardEvaluations.some((evaluation) => evaluation.verdict === "conflict")) return "conflict";
-    if (hardEvaluations.some((evaluation) => evaluation.verdict === "uncertain")) return "uncertain";
-    if (hardEvaluations.some((evaluation) => evaluation.verdict === "fail")) return "rejected";
-    return row.status;
+    return {
+      suggestedBySourceIds: row.lineage.suggestedBySourceIds,
+      groundedBySourceIds,
+      sourceOriginClass,
+    };
   }
 
   private async runStage(
@@ -1738,9 +2010,13 @@ export class AgenticSearchRuntime {
     stage: ActivityStage,
     work: () => Promise<void>,
   ): Promise<void> {
+    const currentRun = this.store.getRun(runId);
+    if (!currentRun || currentRun.status === "canceled" || currentRun.status === "failed") {
+      return;
+    }
     const stageCheckpoint = checkpointForStage(stage);
     this.assertRunActive(runId);
-    this.store.updateRun(runId, (run) => {
+    const updatedRun = this.store.updateRun(runId, (run) => {
       const startedAt = run.startedAt ?? now();
       return {
         ...run,
@@ -1753,6 +2029,9 @@ export class AgenticSearchRuntime {
         },
       };
     });
+    if (updatedRun?.startedAt) {
+      this.armRunDeadline(runId, updatedRun.startedAt);
+    }
     this.store.addActivity(
       runId,
       stageEvent(runId, stage, "started", `${stage} started.`, {
@@ -1765,7 +2044,8 @@ export class AgenticSearchRuntime {
     try {
       await work();
       this.store.setRunStageDuration(runId, stage, now() - stageStart);
-      if (this.store.getRun(runId)?.status === "canceled") return;
+      const terminalStatus = this.store.getRun(runId)?.status;
+      if (terminalStatus === "canceled" || terminalStatus === "failed") return;
       this.store.updateRun(runId, (run) => ({
         ...run,
         metrics: {
@@ -1783,6 +2063,7 @@ export class AgenticSearchRuntime {
       );
     } catch (error) {
       if (this.store.getRun(runId)?.status === "canceled") return;
+      if (this.store.getRun(runId)?.status === "failed") return;
       const message = error instanceof Error ? error.message : "Unexpected run failure";
       this.store.setRunStageDuration(runId, stage, now() - stageStart);
       this.store.addActivity(
@@ -1805,8 +2086,107 @@ export class AgenticSearchRuntime {
           elapsedMs: run.startedAt ? now() - run.startedAt : run.metrics.elapsedMs,
         },
       }));
+      this.markNonTerminalRowsFailed(runId);
       throw error;
     }
+  }
+
+  private getOrCreateRunAbortController(runId: string): AbortController {
+    const existing = this.runAbortControllers.get(runId);
+    if (existing && !existing.signal.aborted) return existing;
+    const controller = new AbortController();
+    this.runAbortControllers.set(runId, controller);
+    return controller;
+  }
+
+  private requestControlForRun(runId: string, timeoutMs = this.config.requestTimeoutMs): RequestControl {
+    this.assertRunActive(runId);
+    const controller = this.getOrCreateRunAbortController(runId);
+    const run = this.store.getRun(runId);
+    const remainingWallClockMs =
+      run?.startedAt && this.config.maxRunWallClockMs > 0
+        ? Math.max(1, run.startedAt + this.config.maxRunWallClockMs - now())
+        : null;
+
+    return {
+      signal: controller.signal,
+      timeoutMs: remainingWallClockMs
+        ? Math.min(timeoutMs, remainingWallClockMs)
+        : timeoutMs,
+    };
+  }
+
+  private armRunDeadline(runId: string, startedAt: number): void {
+    if (this.config.maxRunWallClockMs <= 0) return;
+    if (this.runDeadlineTimers.has(runId)) return;
+    const remainingMs = Math.max(0, startedAt + this.config.maxRunWallClockMs - now());
+    const timeoutId = setTimeout(() => {
+      this.failRunForWallClockExceeded(runId);
+    }, remainingMs);
+    this.runDeadlineTimers.set(runId, timeoutId);
+  }
+
+  private clearRunDeadline(runId: string): void {
+    const timeoutId = this.runDeadlineTimers.get(runId);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      this.runDeadlineTimers.delete(runId);
+    }
+  }
+
+  private clearRunControl(runId: string): void {
+    this.clearRunDeadline(runId);
+    this.runAbortControllers.delete(runId);
+  }
+
+  private abortRunRequests(runId: string, message: string): void {
+    const controller = this.runAbortControllers.get(runId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createAbortError(message));
+    }
+  }
+
+  private markNonTerminalRowsFailed(runId: string): void {
+    for (const row of this.store.listRows(runId)) {
+      if (row.processingState === "finalized" || row.processingState === "failed") continue;
+      this.store.upsertRow(runId, {
+        ...row,
+        processingState: "failed",
+      });
+    }
+  }
+
+  private failRunForWallClockExceeded(runId: string): boolean {
+    const run = this.store.getRun(runId);
+    if (!run?.startedAt) return false;
+    if (run.status === "failed" && run.errorCode === "wall_clock_exceeded") return true;
+    if (run.status === "complete" || run.status === "canceled" || run.status === "failed") return false;
+
+    const stage = (run.stage === "idle" ? "planning" : run.stage) as ActivityStage;
+    const message = `Run exceeded maximum wall time (${Math.round(this.config.maxRunWallClockMs / 60_000)} min).`;
+    this.store.updateRun(runId, (current) => ({
+      ...current,
+      status: "failed",
+      finishedAt: now(),
+      errorCode: "wall_clock_exceeded",
+      errorMessage: message,
+      metrics: {
+        ...current.metrics,
+        elapsedMs: current.startedAt ? now() - current.startedAt : current.metrics.elapsedMs,
+      },
+    }));
+    this.markNonTerminalRowsFailed(runId);
+    this.store.addActivity(
+      runId,
+      stageEvent(runId, stage, "failed", message, {
+        actor: "runtime",
+        title: "Wall clock limit",
+        checkpoint: "run terminated",
+      }),
+    );
+    this.clearRunDeadline(runId);
+    this.abortRunRequests(runId, message);
+    return true;
   }
 
   private createEvidenceFromSource(
@@ -1840,11 +2220,22 @@ export class AgenticSearchRuntime {
     return evidence;
   }
 
+  /** Returns true if the run was marked failed (wall clock). */
+  private failRunIfWallClockExceeded(runId: string): boolean {
+    if (this.config.maxRunWallClockMs <= 0) return false;
+    const run = this.store.getRun(runId);
+    if (!run?.startedAt) return false;
+    if (now() - run.startedAt <= this.config.maxRunWallClockMs) return false;
+    return this.failRunForWallClockExceeded(runId);
+  }
+
   private assertRunActive(runId: string): void {
     const run = this.store.getRun(runId);
-    if (!run || run.status === "canceled") {
+    if (!run) {
       throw new Error("Run canceled");
     }
+    if (run.status === "canceled") throw new Error("Run canceled");
+    if (run.status === "failed") throw new Error(run.errorMessage ?? "Run failed");
   }
 
   private shouldStop(runId: string): boolean {

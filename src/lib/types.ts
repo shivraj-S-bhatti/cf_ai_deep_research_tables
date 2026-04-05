@@ -6,15 +6,18 @@ import type {
   Criterion,
   CriterionVerdict,
   ProcessingState,
+  RunDebugSummary,
   ResearchRun,
   ResultCell,
   ResultRow,
   RowStatus,
+  RunTraceResponse,
   RunMetrics,
   SourceDocument,
   ThreadPhase,
   UsageSummary,
 } from "./contracts";
+import { summarizeProductCounts } from "./runtime-policy";
 
 export type SearchStatus = RowStatus;
 export type SearchProcessingState = ProcessingState;
@@ -95,7 +98,6 @@ export type Thread = {
   criteria: Criterion[];
   columns: ColumnDefinition[];
   results: SearchResult[];
-  agentSteps: AgentStep[];
   targetResults: number;
   createdAt: number;
   updatedAt: number;
@@ -134,7 +136,9 @@ export type {
   ResearchRun,
   ResultCell,
   ResultRow,
+  RunDebugSummary,
   RunMetrics,
+  RunTraceResponse,
   SourceDocument,
   UsageSummary,
 };
@@ -184,6 +188,8 @@ function titleForStage(stage: ActivityStage): string {
       return "Evaluating criteria";
     case "canonicalization":
       return "Canonicalizing entities";
+    case "refinement":
+      return "Refining coverage";
     case "verification":
       return "Verifying evidence";
     case "ranking":
@@ -196,23 +202,25 @@ function titleForStage(stage: ActivityStage): string {
 function actorForStage(stage: ActivityStage): string {
   switch (stage) {
     case "planning":
-      return "Planner Agent";
+      return "planner";
     case "discovery":
-      return "Search Agent";
+      return "discovery";
     case "fetch":
-      return "Retriever Agent";
+      return "fetch";
     case "extraction":
-      return "Extractor Agent";
+      return "extraction";
     case "evaluation":
-      return "Evaluator Agent";
+      return "evaluation";
     case "canonicalization":
-      return "Canonicalizer Agent";
+      return "canonicalization";
+    case "refinement":
+      return "supervisor";
     case "verification":
-      return "Validator Agent";
+      return "verification";
     case "ranking":
-      return "Ranking Agent";
+      return "ranking";
     case "export":
-      return "Exporter Agent";
+      return "export";
   }
 }
 
@@ -241,5 +249,5 @@ export function isWeakTerminalCell(cell: SearchCell | undefined): boolean {
 }
 
 export function rowAcceptedCount(rows: SearchResult[]): number {
-  return rows.filter((row) => row.status === "accepted").length;
+  return summarizeProductCounts(rows).accepted;
 }

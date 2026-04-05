@@ -1,15 +1,13 @@
-import { useState, useEffect, useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  Activity,
-  AlertTriangle,
   Check,
   ChevronDown,
   ChevronRight,
   ExternalLink,
   Globe,
+  Loader2,
   Plus,
   Search as SearchIcon,
-  Wrench,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -26,6 +24,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { RowDetailsResponse } from "@/lib/contracts";
+import { summarizeProductCounts } from "@/lib/runtime-policy";
 import {
   isBlankTerminalCell,
   isPendingCell,
@@ -45,73 +45,12 @@ const COLORS = [
   "hsl(350, 70%, 50%)",
 ];
 
-const CHECKPOINTS = [
-  "plan persisted",
-  "candidate rows created",
-  "sources fetched",
-  "cells extracted",
-  "criteria evaluated",
-  "final ranking committed",
-] as const;
-
-const TOOL_SCHEMAS: Record<
-  string,
-  {
-    args: string;
-    returns: string;
-    description: string;
-  }
-> = {
-  plan_query: {
-    args: "query: string",
-    returns: "entity_type, filters, columns, search_queries, budgets",
-    description: "Normalize the raw research question into a structured run plan.",
-  },
-  cache_lookup: {
-    args: "cache_key: string",
-    returns: "cache hit | cache miss",
-    description: "Check whether a reusable search or page artifact already exists.",
-  },
-  search_query: {
-    args: "query: string",
-    returns: "candidate documents",
-    description: "Issue a discovery query and retrieve broad candidate documents.",
-  },
-  fetch_source: {
-    args: "url: string",
-    returns: "normalized source document",
-    description: "Fetch, normalize, and retain the source needed for grounding.",
-  },
-  extract_candidate: {
-    args: "row_id: string",
-    returns: "cell values + null states + evidence links",
-    description: "Resolve row cells from the retrieved source set.",
-  },
-  evaluate_candidate: {
-    args: "row_id: string",
-    returns: "criterion verdicts",
-    description: "Score hard filters and soft signals against grounded evidence.",
-  },
-  verify_candidate: {
-    args: "row_id: string",
-    returns: "validated row state",
-    description: "Run a second pass for uncertain or conflicting candidates.",
-  },
-  rank_results: {
-    args: "rows: ResultRow[]",
-    returns: "ranked accepted + unmatched partitions",
-    description: "Finalize the result table and unmatched section.",
-  },
-  export_results: {
-    args: "run_id: string",
-    returns: "csv, json",
-    description: "Serialize the final accepted set into export artifacts.",
-  },
-};
-
 interface WorkspaceSidebarProps {
   thread: Thread;
   selectedResult: SearchResult | null;
+  selectedRowDetail: RowDetailsResponse | null;
+  selectedRowLoading: boolean;
+  debugHref: string | null;
   onUpdateThreadQueryAndCriteria: (query: string) => void;
   onAddCriterion: (c: Criterion) => void;
   onRemoveCriterion: (id: string) => void;
@@ -121,40 +60,46 @@ interface WorkspaceSidebarProps {
   onClearSelection: () => void;
 }
 
-type RewardSignal = {
-  label: string;
-  value: string;
-  hint?: string;
-};
-
-type AggregatedToolCall = {
-  name: string;
-  count: number;
-  totalCostUsd: number;
-  avgLatencyMs: number;
-  cacheHits: number;
-  summary: string;
-};
-
 function formatDuration(ms: number | null | undefined) {
   if (!ms || ms < 1000) return `${ms ?? 0} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
+}
+
+/** Matches default server `MAX_RUN_WALL_CLOCK_MS` (8 min) for honest “time left” copy. */
+const SERVER_RUN_BUDGET_MS = 480_000;
+
+function formatClock(ms: number) {
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}m ${r}s` : `${r}s`;
 }
 
 function formatUsd(value: number | null | undefined) {
   return `$${(value ?? 0).toFixed(4)}`;
 }
 
-function summarizeCellState(cell: SearchCell | undefined): {
-  label: string;
-  detail: string;
-  value: ReactNode;
-  tone: string;
-} {
+function buildSourceLookups(detail: RowDetailsResponse | null) {
+  const sourcesById = new Map(detail?.sources.map((source) => [source.id, source]) ?? []);
+  const evidenceById = new Map(detail?.evidence.map((evidence) => [evidence.id, evidence]) ?? []);
+  return { sourcesById, evidenceById };
+}
+
+function sourcesForEvidence(detail: RowDetailsResponse | null, evidenceId: string | null) {
+  if (!detail || !evidenceId) return [];
+  const { sourcesById, evidenceById } = buildSourceLookups(detail);
+  const evidence = evidenceById.get(evidenceId);
+  if (!evidence) return [];
+  const source = sourcesById.get(evidence.sourceDocumentId);
+  return source ? [source] : [];
+}
+
+function summarizeCellState(cell: SearchCell | undefined) {
   if (!cell || cell.state === "pending") {
     return {
       label: "Pending",
-      detail: "This cell is still in-flight and may resolve as more evidence lands.",
+      detail: "This cell is still gathering evidence and may resolve as the run advances.",
       value: "Pending…",
       tone: "text-muted-foreground italic",
     };
@@ -163,7 +108,7 @@ function summarizeCellState(cell: SearchCell | undefined): {
   if (cell.state === "not_found") {
     return {
       label: "Not found",
-      detail: "The system looked through the retrieved evidence and did not find a grounded value for this field.",
+      detail: "The system looked for this field and did not find enough grounded evidence to fill it.",
       value: "—",
       tone: "text-muted-foreground",
     };
@@ -172,7 +117,7 @@ function summarizeCellState(cell: SearchCell | undefined): {
   if (cell.state === "unsupported") {
     return {
       label: "Unsupported",
-      detail: "This field is not reasonably groundable for this entity/query with the current source strategy.",
+      detail: "This field is not reasonably groundable for this entity or query with the current source strategy.",
       value: "—",
       tone: "text-muted-foreground",
     };
@@ -181,7 +126,7 @@ function summarizeCellState(cell: SearchCell | undefined): {
   if (cell.state === "uncertain") {
     return {
       label: "Uncertain",
-      detail: "The system found a possible value, but the supporting evidence is too weak to promote it confidently.",
+      detail: "A possible value exists, but the evidence remains too weak to promote confidently.",
       value: cell.valueText ?? "Uncertain",
       tone: "text-amber-600",
     };
@@ -190,7 +135,7 @@ function summarizeCellState(cell: SearchCell | undefined): {
   if (cell.state === "conflict") {
     return {
       label: "Conflict",
-      detail: "Multiple credible sources disagree on this value, so the field is kept explicitly conflicted.",
+      detail: "Credible sources disagree, so the value is kept explicitly conflicted.",
       value: cell.valueText ?? "Conflict",
       tone: "text-amber-600",
     };
@@ -198,85 +143,27 @@ function summarizeCellState(cell: SearchCell | undefined): {
 
   return {
     label: "Filled",
-    detail: "This value is grounded to at least one retained evidence snippet.",
+    detail: "This value is grounded to retained evidence and visible in the row detail view.",
     value: cell.valueText ?? "—",
     tone: "text-foreground font-medium",
   };
 }
 
-function buildRewardSignals(thread: Thread): RewardSignal[] {
-  const stepRewards = [...thread.agentSteps].reverse().find((step) => step.rewards?.length)?.rewards;
-  if (stepRewards && stepRewards.length > 0) {
-    return stepRewards;
-  }
-
-  const allCells = thread.results.flatMap((result) => Object.values(result.cells));
-  const resolvedCells = allCells.filter((cell) => cell.state !== "pending");
-  const filledCells = resolvedCells.filter((cell) => cell.state === "filled");
-  const blankCells = resolvedCells.filter(
-    (cell) => cell.state === "not_found" || cell.state === "unsupported",
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded border bg-background/80 px-2 py-1.5">
+      <div className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</div>
+      <div className="mt-0.5 font-mono text-[11px]">{value}</div>
+    </div>
   );
-  const weakCells = resolvedCells.filter(
-    (cell) => cell.state === "uncertain" || cell.state === "conflict",
-  );
-  const finalizedRows = thread.results.filter((row) => row.processingState === "finalized");
-  const accepted = finalizedRows.filter((row) => row.status === "accepted").length;
-  const rejected = finalizedRows.filter((row) => row.status === "rejected").length;
-
-  const groundedCellRate =
-    resolvedCells.length > 0 ? `${Math.round((filledCells.length / resolvedCells.length) * 100)}%` : "0%";
-  const abstentionRate =
-    resolvedCells.length > 0 ? `${Math.round((blankCells.length / resolvedCells.length) * 100)}%` : "0%";
-  const weakStateRate =
-    resolvedCells.length > 0 ? `${Math.round((weakCells.length / resolvedCells.length) * 100)}%` : "0%";
-  const targetCoverage =
-    thread.targetResults > 0 ? `${Math.round((accepted / thread.targetResults) * 100)}%` : "0%";
-  const selectivity =
-    finalizedRows.length > 0 ? `${Math.round((rejected / finalizedRows.length) * 100)}%` : "0%";
-
-  return [
-    { label: "grounded_cell_rate", value: groundedCellRate, hint: "Filled cells over resolved cells." },
-    { label: "abstention_rate", value: abstentionRate, hint: "Explicit not_found or unsupported cells." },
-    { label: "weak_state_rate", value: weakStateRate, hint: "Uncertain or conflict cells." },
-    { label: "target_coverage", value: targetCoverage, hint: "Accepted rows against requested results." },
-    { label: "selectivity", value: selectivity, hint: "Rejected rows over finalized candidates." },
-  ];
-}
-
-function aggregateToolCalls(thread: Thread): AggregatedToolCall[] {
-  const summary = new Map<string, AggregatedToolCall>();
-
-  for (const step of thread.agentSteps) {
-    for (const tool of step.toolCalls ?? []) {
-      const current = summary.get(tool.name) ?? {
-        name: tool.name,
-        count: 0,
-        totalCostUsd: 0,
-        avgLatencyMs: 0,
-        cacheHits: 0,
-        summary: tool.summary,
-      };
-
-      const totalLatency = current.avgLatencyMs * current.count + (tool.latencyMs ?? 0);
-      current.count += 1;
-      current.totalCostUsd += tool.costUsd ?? 0;
-      current.avgLatencyMs = current.count > 0 ? totalLatency / current.count : 0;
-      current.cacheHits += tool.cacheHit ? 1 : 0;
-      current.summary = tool.summary;
-      summary.set(tool.name, current);
-    }
-  }
-
-  return [...summary.values()].sort((left, right) => right.count - left.count);
-}
-
-function checkpointReached(thread: Thread, checkpoint: string) {
-  return thread.agentSteps.some((step) => step.checkpoint === checkpoint);
 }
 
 export function WorkspaceSidebar({
   thread,
   selectedResult,
+  selectedRowDetail,
+  selectedRowLoading,
+  debugHref,
   onUpdateThreadQueryAndCriteria,
   onAddCriterion,
   onRemoveCriterion,
@@ -289,10 +176,25 @@ export function WorkspaceSidebar({
   const [newCriterion, setNewCriterion] = useState("");
   const [newEnrichment, setNewEnrichment] = useState("");
   const [expandedSources, setExpandedSources] = useState(true);
+  const [, setRunClockTick] = useState(0);
 
   useEffect(() => {
     setQueryDraft(thread.query);
   }, [thread.id, thread.query]);
+
+  const run = thread.latestRun;
+  const runIsActive = Boolean(run && (run.status === "queued" || run.status === "running"));
+  useEffect(() => {
+    if (!runIsActive) return;
+    const id = window.setInterval(() => setRunClockTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [runIsActive]);
+
+  const elapsedLiveMs =
+    runIsActive && run?.startedAt
+      ? Date.now() - run.startedAt
+      : (thread.metrics?.elapsedMs ?? run?.metrics?.elapsedMs ?? 0);
+  const budgetRemainingMs = Math.max(0, SERVER_RUN_BUDGET_MS - elapsedLiveMs);
 
   const handleQueryBlur = () => {
     const q = queryDraft.trim();
@@ -330,10 +232,11 @@ export function WorkspaceSidebar({
     setNewEnrichment("");
   };
 
-  const acceptedCount = thread.results.filter((r) => r.status === "accepted").length;
-  const rejectedCount = thread.results.filter((r) => r.status === "rejected").length;
-  const unresolvedCount = thread.results.filter((r) => r.status === "uncertain" || r.status === "conflict").length;
-  const analyzed = thread.latestRun?.progress.totalRows ?? thread.results.length;
+  const productCounts = summarizeProductCounts(thread.results);
+  const acceptedCount = productCounts.accepted;
+  const rejectedCount = productCounts.rejected;
+  const unresolvedCount = productCounts.uncertain + productCounts.conflict;
+  const analyzed = productCounts.finalizedCount;
   const target = thread.targetResults;
   const progressPct =
     target > 0 ? Math.min(100, Math.round((analyzed / target) * 100)) : analyzed > 0 ? 100 : 0;
@@ -341,48 +244,47 @@ export function WorkspaceSidebar({
   const cacheHitRate =
     cacheLookups > 0 ? Math.round(((thread.metrics?.cacheHits ?? 0) / cacheLookups) * 100) : 0;
 
-  const rewardSignals = useMemo(() => buildRewardSignals(thread), [thread]);
-  const toolCalls = useMemo(() => aggregateToolCalls(thread), [thread]);
-  const actorSummary = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const step of thread.agentSteps) {
-      counts.set(step.actor, (counts.get(step.actor) ?? 0) + 1);
-    }
-    return [...counts.entries()].map(([actor, count]) => ({ actor, count }));
-  }, [thread.agentSteps]);
-  const reasoningTrail = useMemo(
-    () => thread.agentSteps.filter((step) => step.reasoning).slice(-6).reverse(),
-    [thread.agentSteps],
-  );
+  const detailCells = useMemo(() => {
+    if (!selectedResult) return [];
+    return thread.columns.map((column) => {
+      const detailCell = selectedRowDetail?.cells.find((entry) => entry.columnKey === column.key);
+      const baseCell = selectedResult.cells[column.key];
+      const cell = detailCell
+        ? {
+            ...baseCell,
+            ...detailCell,
+            label: column.label,
+            sources: sourcesForEvidence(selectedRowDetail, detailCell.primaryEvidenceId).map((source) => ({
+              id: source.id,
+              url: source.url,
+              title: source.title,
+              snippet: source.snippet,
+              favicon: source.favicon,
+              visitedAt: new Date(source.fetchedAt).toISOString(),
+              trustTier: source.trustTier,
+            })),
+          }
+        : baseCell;
+      return { column, cell };
+    });
+  }, [selectedResult, selectedRowDetail, thread.columns]);
 
   return (
     <div className="w-[360px] shrink-0 border-l bg-card flex flex-col min-h-0 animate-in slide-in-from-right-4 duration-200">
       <Tabs defaultValue="search" className="flex-1 flex flex-col min-h-0">
         <TabsList className="rounded-none border-b bg-transparent h-9 px-2 justify-start gap-1 shrink-0 overflow-x-auto">
-          <TabsTrigger
-            value="search"
-            className="text-[11px] h-7 px-2.5 data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none"
-          >
+          <TabsTrigger value="search" className="text-[11px] h-7 px-2.5 rounded-none">
             Search
           </TabsTrigger>
-          <TabsTrigger
-            value="details"
-            className="text-[11px] h-7 px-2.5 data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none"
-          >
+          <TabsTrigger value="details" className="text-[11px] h-7 px-2.5 rounded-none">
             Details
           </TabsTrigger>
-          <TabsTrigger
-            value="sources"
-            className="text-[11px] h-7 px-2.5 data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none"
-          >
+          <TabsTrigger value="sources" className="text-[11px] h-7 px-2.5 rounded-none">
             Sources
-            {selectedResult ? ` (${selectedResult.sourcesVisited.length})` : ""}
+            {selectedRowDetail ? ` (${selectedRowDetail.sources.length})` : ""}
           </TabsTrigger>
-          <TabsTrigger
-            value="internals"
-            className="text-[11px] h-7 px-2.5 data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none"
-          >
-            Internals
+          <TabsTrigger value="run" className="text-[11px] h-7 px-2.5 rounded-none">
+            Run
           </TabsTrigger>
         </TabsList>
 
@@ -409,21 +311,25 @@ export function WorkspaceSidebar({
                 Criteria ({thread.criteria.length})
               </label>
               <div className="space-y-1.5">
-                {thread.criteria.map((c) => (
+                {thread.criteria.map((criterion) => (
                   <div
-                    key={c.id}
+                    key={criterion.id}
                     className="flex items-start gap-2 text-[11px] px-2 py-1.5 rounded-md border group"
-                    style={{ borderLeftColor: c.color, borderLeftWidth: 3 }}
+                    style={{ borderLeftColor: criterion.color, borderLeftWidth: 3 }}
                   >
                     <div className="flex-1 min-w-0 leading-snug">
-                      <div>{c.label}</div>
+                      <div>{criterion.label}</div>
                       <div className="text-[9px] uppercase tracking-wider text-muted-foreground mt-0.5">
-                        {c.kind === "hard_filter" ? "Hard filter" : "Soft signal"}
+                        {criterion.kind === "hard_filter"
+                          ? "Hard filter"
+                          : criterion.kind === "heuristic"
+                            ? "Heuristic"
+                            : "Soft signal"}
                       </div>
                     </div>
                     <button
                       type="button"
-                      onClick={() => onRemoveCriterion(c.id)}
+                      onClick={() => onRemoveCriterion(criterion.id)}
                       className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
                     >
                       <X className="h-3 w-3 text-muted-foreground hover:text-destructive" />
@@ -453,13 +359,13 @@ export function WorkspaceSidebar({
 
             <div className="space-y-2">
               <label className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Output Columns
+                Output columns
               </label>
               <div className="flex flex-wrap gap-1">
-                {thread.columns.map((e) => (
-                  <Badge key={e.id} variant="secondary" className="gap-1 text-[10px] font-normal">
-                    {e.label}
-                    <button type="button" onClick={() => onRemoveEnrichment(e.id)}>
+                {thread.columns.map((column) => (
+                  <Badge key={column.id} variant="secondary" className="gap-1 text-[10px] font-normal">
+                    {column.label}
+                    <button type="button" onClick={() => onRemoveEnrichment(column.id)}>
                       <X className="h-2.5 w-2.5 hover:text-destructive" />
                     </button>
                   </Badge>
@@ -499,9 +405,9 @@ export function WorkspaceSidebar({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="15">15</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
                     <SelectItem value="25">25</SelectItem>
-                    <SelectItem value="50">50</SelectItem>
-                    <SelectItem value="100">100</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -509,31 +415,29 @@ export function WorkspaceSidebar({
               <p className="text-[10px] text-muted-foreground font-mono">
                 {acceptedCount} accepted · {analyzed} / {target} analyzed
               </p>
+              {runIsActive ? (
+                <p className="text-[10px] text-muted-foreground leading-snug">
+                  <span className="font-mono text-foreground/90">{formatClock(elapsedLiveMs)}</span>
+                  {" elapsed"}
+                  {run?.stage && run.stage !== "idle" ? (
+                    <>
+                      {" · stage "}
+                      <span className="font-mono">{run.stage}</span>
+                    </>
+                  ) : null}
+                  <br />
+                  {elapsedLiveMs < SERVER_RUN_BUDGET_MS ? (
+                    <>
+                      Hard stop in up to{" "}
+                      <span className="font-mono">{formatClock(budgetRemainingMs)}</span> (server cap). Typical
+                      runs finish in 2–6 minutes.
+                    </>
+                  ) : (
+                    <>Past the usual server time budget — if this looks stuck, refresh or start a new run.</>
+                  )}
+                </p>
+              ) : null}
             </div>
-
-            {thread.latestRun && (
-              <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-                <div className="flex items-center justify-between text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                  <span>Execution</span>
-                  <span className="font-mono normal-case">{thread.latestRun.stage}</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-[10px]">
-                  <Metric label="Search" value={String(thread.metrics?.searchCalls ?? 0)} />
-                  <Metric label="Fetch" value={String(thread.metrics?.fetchCalls ?? 0)} />
-                  <Metric label="LLM" value={String(thread.metrics?.llmCalls ?? 0)} />
-                  <Metric label="Cache hit" value={`${cacheHitRate}%`} />
-                  <Metric label="Cost" value={formatUsd(thread.metrics?.estimatedCostUsd)} />
-                  <Metric label="Elapsed" value={formatDuration(thread.metrics?.elapsedMs)} />
-                  <Metric label="Accepted" value={String(acceptedCount)} />
-                  <Metric label="Rejected" value={String(rejectedCount)} />
-                  <Metric label="Unresolved" value={String(unresolvedCount)} />
-                  <Metric
-                    label="Rows"
-                    value={`${thread.latestRun.progress.rowsCreated}/${thread.latestRun.progress.totalRows}`}
-                  />
-                </div>
-              </div>
-            )}
           </div>
         </TabsContent>
 
@@ -542,8 +446,13 @@ export function WorkspaceSidebar({
             <div className="p-6 text-center space-y-2">
               <SearchIcon className="h-8 w-8 mx-auto text-muted-foreground/40" />
               <p className="text-[11px] text-muted-foreground leading-relaxed">
-                Select a row in the table to inspect grounded criteria checks, explicit null states, and cell-level evidence.
+                Select a row to inspect grounded criteria checks, null states, and evidence-backed fields.
               </p>
+            </div>
+          ) : selectedRowLoading ? (
+            <div className="p-6 text-center space-y-2">
+              <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
+              <p className="text-[11px] text-muted-foreground">Loading row details…</p>
             </div>
           ) : (
             <div className="flex flex-col">
@@ -551,7 +460,7 @@ export function WorkspaceSidebar({
                 <div className="min-w-0">
                   <h3 className="font-semibold text-xs truncate">{selectedResult.name}</h3>
                   <a
-                    href={`https://${selectedResult.url}`}
+                    href={selectedResult.canonicalUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[10px] text-primary hover:underline inline-flex items-center gap-0.5 truncate max-w-full"
@@ -560,17 +469,103 @@ export function WorkspaceSidebar({
                     <ExternalLink className="h-2.5 w-2.5 shrink-0" />
                   </a>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 text-[10px] shrink-0"
-                  onClick={onClearSelection}
-                >
+                <Button variant="ghost" size="sm" className="h-7 text-[10px] shrink-0" onClick={onClearSelection}>
                   Clear
                 </Button>
               </div>
               <div className="p-3 space-y-3">
-                <DetailsEvaluations thread={thread} result={selectedResult} />
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
+                    Criteria
+                  </span>
+                  <span className="text-[10px] text-muted-foreground ml-auto font-mono">
+                    {(selectedRowDetail?.evaluations.filter((evaluation) => evaluation.verdict === "pass").length ?? 0)}/
+                    {selectedRowDetail?.evaluations.length ?? 0} passed
+                  </span>
+                </div>
+
+                {(selectedRowDetail?.evaluations ?? []).map((evaluation) => {
+                  const criterion = thread.criteria.find((entry) => entry.id === evaluation.criterionId);
+                  const sources = sourcesForEvidence(selectedRowDetail, evaluation.primaryEvidenceId);
+                  return (
+                    <div key={evaluation.id} className="space-y-1.5 rounded border bg-background/70 p-2">
+                      <div className="flex items-start gap-2">
+                        <div className="mt-0.5 shrink-0">
+                          {evaluation.verdict === "pass" ? (
+                            <div className="h-4 w-4 rounded-full bg-success/15 flex items-center justify-center">
+                              <Check className="h-2.5 w-2.5 text-success" />
+                            </div>
+                          ) : (
+                            <div className="h-4 w-4 rounded-full bg-muted flex items-center justify-center">
+                              <span className="h-2 w-2 rounded-full bg-muted-foreground/50" />
+                            </div>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[11px] font-medium leading-tight">
+                            {criterion?.label ?? evaluation.criterionId}
+                          </div>
+                          <div className="mt-1 text-[10px] text-muted-foreground leading-relaxed">
+                            {evaluation.summary}
+                          </div>
+                          {sources.length > 0 && (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {sources.map((source) => (
+                                <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer">
+                                  <Badge variant="outline" className="text-[9px] gap-1 max-w-[220px]">
+                                    <span className="truncate">{source.title}</span>
+                                  </Badge>
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <Separator />
+
+                <div className="space-y-2">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
+                    Cells
+                  </span>
+                  <div className="space-y-2">
+                    {detailCells.map(({ column, cell }) => {
+                      const summary = summarizeCellState(cell);
+                      return (
+                        <div key={column.id} className="rounded border bg-background/70 p-2 space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] text-muted-foreground">{column.label}</span>
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <Badge variant="outline" className="text-[9px] uppercase tracking-wider">
+                                {summary.label}
+                              </Badge>
+                              <span className={`text-[11px] truncate text-right ${summary.tone}`}>
+                                {summary.value}
+                              </span>
+                            </div>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground leading-relaxed">
+                            {summary.detail}
+                          </p>
+                          {cell?.sources.length ? (
+                            <div className="flex flex-wrap gap-1">
+                              {cell.sources.map((source) => (
+                                <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer">
+                                  <Badge variant="secondary" className="text-[9px] gap-1 max-w-[220px]">
+                                    <span className="truncate">{source.title}</span>
+                                  </Badge>
+                                </a>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -581,8 +576,13 @@ export function WorkspaceSidebar({
             <div className="p-6 text-center space-y-2">
               <Globe className="h-8 w-8 mx-auto text-muted-foreground/40" />
               <p className="text-[11px] text-muted-foreground leading-relaxed">
-                Select a row to see which source documents were fetched for that entity.
+                Select a row to inspect the source documents that fed the row detail.
               </p>
+            </div>
+          ) : selectedRowLoading ? (
+            <div className="p-6 text-center space-y-2">
+              <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
+              <p className="text-[11px] text-muted-foreground">Loading sources…</p>
             </div>
           ) : (
             <div className="p-3 space-y-1">
@@ -592,37 +592,33 @@ export function WorkspaceSidebar({
                   onClick={() => setExpandedSources(!expandedSources)}
                   className="text-[10px] text-muted-foreground hover:text-foreground flex items-center gap-0.5"
                 >
-                  {expandedSources ? (
-                    <ChevronDown className="h-3 w-3" />
-                  ) : (
-                    <ChevronRight className="h-3 w-3" />
-                  )}
-                  {selectedResult.sourcesVisited.length} sources visited
+                  {expandedSources ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                  {selectedRowDetail?.sources.length ?? 0} sources visited
                 </button>
               </div>
               {expandedSources &&
-                selectedResult.sourcesVisited.map((src, i) => (
+                (selectedRowDetail?.sources ?? []).map((source) => (
                   <a
-                    key={i}
-                    href={src.url}
+                    key={source.id}
+                    href={source.url}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex items-start gap-2 p-2 rounded-md hover:bg-muted/50 transition-colors group"
                   >
                     <div className="mt-0.5 shrink-0">
-                      {src.favicon ? (
-                        <img src={src.favicon} alt="" className="h-3.5 w-3.5 rounded-sm" />
+                      {source.favicon ? (
+                        <img src={source.favicon} alt="" className="h-3.5 w-3.5 rounded-sm" />
                       ) : (
                         <Globe className="h-3.5 w-3.5 text-muted-foreground" />
                       )}
                     </div>
                     <div className="min-w-0 space-y-0.5 flex-1">
                       <p className="text-[11px] font-medium truncate group-hover:text-primary transition-colors">
-                        {src.title}
+                        {source.title}
                       </p>
-                      <p className="text-[10px] text-muted-foreground truncate">{src.url}</p>
+                      <p className="text-[10px] text-muted-foreground truncate">{source.url}</p>
                       <p className="text-[10px] text-muted-foreground italic line-clamp-2">
-                        {src.snippet}
+                        {source.snippet}
                       </p>
                     </div>
                   </a>
@@ -631,310 +627,86 @@ export function WorkspaceSidebar({
           )}
         </TabsContent>
 
-        <TabsContent value="internals" className="mt-0 flex-1 min-h-0 overflow-y-auto">
+        <TabsContent value="run" className="mt-0 flex-1 min-h-0 overflow-y-auto">
           <div className="p-3 space-y-4">
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <div className="flex items-center gap-1.5">
-                <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                  Product-critical metrics
-                </span>
+            <div
+              data-testid="run-execution-summary"
+              className="space-y-2 rounded-md border bg-muted/20 p-2.5"
+            >
+              <div className="flex items-center justify-between text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
+                <span>Execution</span>
+                <span className="font-mono normal-case">{thread.latestRun?.stage ?? "idle"}</span>
               </div>
               <div className="grid grid-cols-2 gap-2 text-[10px]">
                 <Metric label="Stage" value={thread.latestRun?.stage ?? "idle"} />
-                <Metric label="Elapsed" value={formatDuration(thread.metrics?.elapsedMs)} />
+                <Metric
+                  label="Elapsed"
+                  value={
+                    runIsActive && run?.startedAt
+                      ? formatClock(Date.now() - run.startedAt)
+                      : formatDuration(thread.metrics?.elapsedMs)
+                  }
+                />
+                <Metric label="Rows discovered" value={String(thread.latestRun?.progress.rowsCreated ?? 0)} />
+                <Metric label="Rows accepted" value={String(acceptedCount)} />
                 <Metric label="Search calls" value={String(thread.metrics?.searchCalls ?? 0)} />
                 <Metric label="Fetch calls" value={String(thread.metrics?.fetchCalls ?? 0)} />
                 <Metric label="LLM calls" value={String(thread.metrics?.llmCalls ?? 0)} />
-                <Metric label="Cache hit rate" value={`${cacheHitRate}%`} />
-                <Metric label="Rows discovered" value={String(thread.latestRun?.progress.rowsCreated ?? 0)} />
-                <Metric label="Rows accepted" value={String(acceptedCount)} />
-                <Metric label="Cells resolved" value={String(thread.latestRun?.progress.cellsResolved ?? 0)} />
-                <Metric label="Estimated cost" value={formatUsd(thread.metrics?.estimatedCostUsd)} />
+                <Metric label="Cache hit" value={`${cacheHitRate}%`} />
+                <Metric label="Cost" value={formatUsd(thread.metrics?.estimatedCostUsd)} />
+                <Metric label="Unresolved" value={String(unresolvedCount)} />
+                <Metric label="Rejected" value={String(rejectedCount)} />
+                <Metric
+                  label="Rows"
+                  value={`${thread.latestRun?.progress.rowsCreated ?? 0}/${thread.latestRun?.progress.totalRows ?? 0}`}
+                />
               </div>
             </div>
 
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Durable checkpoints
-              </span>
-              <div className="space-y-1.5">
-                {CHECKPOINTS.map((checkpoint) => {
-                  const reached = checkpointReached(thread, checkpoint);
-                  return (
-                    <div key={checkpoint} className="flex items-center gap-2 text-[11px]">
-                      <div
-                        className={`h-4 w-4 rounded-full flex items-center justify-center ${
-                          reached ? "bg-success/15" : "bg-muted"
-                        }`}
-                      >
-                        {reached ? (
-                          <Check className="h-2.5 w-2.5 text-success" />
-                        ) : (
-                          <span className="h-2 w-2 rounded-full bg-muted-foreground/40" />
-                        )}
-                      </div>
-                      <span className={reached ? "text-foreground" : "text-muted-foreground"}>
-                        {checkpoint}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Reward proxies
-              </span>
-              <div className="grid gap-2 grid-cols-2">
-                {rewardSignals.map((reward) => (
-                  <div key={reward.label} className="rounded border bg-background/80 px-2 py-1.5">
-                    <div className="text-[9px] uppercase tracking-wider text-muted-foreground">
-                      {reward.label}
-                    </div>
-                    <div className="font-mono text-[11px] mt-0.5">{reward.value}</div>
-                    {reward.hint && (
-                      <div className="text-[10px] text-muted-foreground mt-1 leading-relaxed">
-                        {reward.hint}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <p className="text-[10px] text-muted-foreground leading-relaxed">
-                These are runtime proxies, not true offline eval metrics like labeled precision/recall/F1.
-              </p>
-            </div>
-
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Actors in play
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-                {actorSummary.map(({ actor, count }) => (
-                  <Badge key={actor} variant="outline" className="text-[10px] gap-1">
-                    {actor}
-                    <span className="font-mono text-[9px] text-muted-foreground">{count}</span>
-                  </Badge>
-                ))}
-              </div>
-            </div>
-
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <div className="flex items-center gap-1.5">
-                <Wrench className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                  Tool surface
-                </span>
-              </div>
-              <div className="space-y-2">
-                {toolCalls.length === 0 && (
-                  <p className="text-[10px] text-muted-foreground">
-                    Start a run to populate the concrete tool ledger.
+            {selectedResult && (
+              <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
+                <div className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
+                  Selected row lineage
+                </div>
+                <div className="grid gap-2 text-[10px]">
+                  <Metric label="Origin class" value={selectedResult.lineage.sourceOriginClass} />
+                  <Metric
+                    label="Suggested by"
+                    value={String(selectedResult.lineage.suggestedBySourceIds.length)}
+                  />
+                  <Metric
+                    label="Grounded by"
+                    value={String(selectedResult.lineage.groundedBySourceIds.length)}
+                  />
+                  <Metric label="Status" value={selectedResult.status} />
+                </div>
+                {selectedResult.statusReasonSummary ? (
+                  <p className="text-[10px] text-muted-foreground leading-relaxed">
+                    {selectedResult.statusReasonSummary}
                   </p>
-                )}
-                {toolCalls.map((tool) => {
-                  const schema = TOOL_SCHEMAS[tool.name];
-                  return (
-                    <div key={tool.name} className="rounded border bg-background/80 p-2 space-y-1.5">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <Badge variant="secondary" className="font-mono text-[10px]">
-                          {tool.name}
-                        </Badge>
-                        <span className="text-[10px] text-muted-foreground">{tool.count} calls</span>
-                        <span className="text-[10px] text-muted-foreground">
-                          avg {formatDuration(Math.round(tool.avgLatencyMs))}
-                        </span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {formatUsd(tool.totalCostUsd)}
-                        </span>
-                        {tool.cacheHits > 0 && (
-                          <Badge variant="outline" className="text-[9px] uppercase tracking-wider">
-                            {tool.cacheHits} cache hits
-                          </Badge>
-                        )}
-                      </div>
-                      <p className="text-[11px] text-muted-foreground leading-relaxed">
-                        {schema?.description ?? tool.summary}
-                      </p>
-                      {schema && (
-                        <div className="grid gap-2 sm:grid-cols-2">
-                          <MiniSchema label="Args" value={schema.args} />
-                          <MiniSchema label="Returns" value={schema.returns} />
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
+                ) : null}
               </div>
-            </div>
+            )}
 
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Provider ledger
-              </span>
-              <div className="space-y-1">
-                {(thread.metrics?.providerBreakdown ?? []).map((metric) => (
-                  <div
-                    key={`${metric.providerName}:${metric.operation}`}
-                    className="flex items-center justify-between rounded bg-background/80 px-2 py-1.5 text-[10px] font-mono gap-2"
-                  >
-                    <span className="truncate">
-                      {metric.providerName}:{metric.operation}
-                    </span>
-                    <span className="shrink-0">{metric.requestCount}</span>
-                  </div>
-                ))}
+            {debugHref && (
+              <div className="rounded-md border bg-muted/20 p-2.5 space-y-2">
+                <div className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
+                  Advanced debugging
+                </div>
+                <p className="text-[10px] text-muted-foreground leading-relaxed">
+                  Open the separate debug workspace for trace inspection, provider ledger details, raw payloads, and function-level execution logs.
+                </p>
+                <Button asChild variant="outline" size="sm" className="h-8 text-[11px]">
+                  <a href={debugHref} target="_blank" rel="noreferrer">
+                    Open debug workspace
+                    <ExternalLink className="h-3 w-3 ml-1" />
+                  </a>
+                </Button>
               </div>
-            </div>
-
-            <div className="space-y-2 rounded-md border bg-muted/20 p-2.5">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground">
-                Recent reasoning summaries
-              </span>
-              <div className="space-y-2">
-                {reasoningTrail.map((step) => (
-                  <div key={step.id} className="rounded border bg-background/80 p-2">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge variant="outline" className="text-[9px] uppercase tracking-wider">
-                        {step.actor}
-                      </Badge>
-                      <span className="text-[11px] font-medium">{step.title}</span>
-                    </div>
-                    <p className="mt-1 text-[10px] text-muted-foreground leading-relaxed">
-                      {step.reasoning}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            </div>
+            )}
           </div>
         </TabsContent>
       </Tabs>
     </div>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded border bg-background/80 px-2 py-1.5">
-      <div className="text-muted-foreground uppercase tracking-wider">{label}</div>
-      <div className="font-mono text-foreground mt-0.5">{value}</div>
-    </div>
-  );
-}
-
-function MiniSchema({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded border bg-muted/20 px-2 py-1.5">
-      <div className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</div>
-      <div className="mt-1 text-[10px] font-mono text-foreground/90">{value}</div>
-    </div>
-  );
-}
-
-function DetailsEvaluations({ thread, result }: { thread: Thread; result: SearchResult }) {
-  const passedCount = result.evaluations.filter((e) => e.verdict === "pass").length;
-
-  return (
-    <>
-      <div className="flex items-center gap-2">
-        <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-          Criteria
-        </span>
-        <span className="text-[10px] text-muted-foreground ml-auto font-mono">
-          {passedCount}/{result.evaluations.length} passed
-        </span>
-      </div>
-
-      {result.evaluations.map((ev, i) => (
-        <div key={i} className="space-y-1">
-          <div className="flex items-start gap-2">
-            <div className="mt-0.5 shrink-0">
-              {ev.verdict === "pass" ? (
-                <div className="h-4 w-4 rounded-full bg-success/15 flex items-center justify-center">
-                  <Check className="h-2.5 w-2.5 text-success" />
-                </div>
-              ) : ev.verdict === "fail" ? (
-                <div className="h-4 w-4 rounded-full bg-destructive/15 flex items-center justify-center">
-                  <X className="h-2.5 w-2.5 text-destructive" />
-                </div>
-              ) : (
-                <div className="h-4 w-4 rounded-full bg-amber-500/15 flex items-center justify-center">
-                  <AlertTriangle className="h-2.5 w-2.5 text-amber-600" />
-                </div>
-              )}
-            </div>
-            <div className="space-y-1 min-w-0 flex-1">
-              <p className="text-[11px] font-medium leading-tight">{ev.rule}</p>
-              <p className="text-[10px] italic text-muted-foreground leading-relaxed">{ev.summary}</p>
-              <div className="flex flex-wrap gap-1">
-                {ev.sources.map((src, j) => (
-                  <a key={j} href={src.url} target="_blank" rel="noopener noreferrer">
-                    <Badge
-                      variant="outline"
-                      className="text-[9px] gap-0.5 hover:bg-muted cursor-pointer h-4 px-1 max-w-[220px]"
-                    >
-                      {src.favicon && <img src={src.favicon} alt="" className="h-2.5 w-2.5 shrink-0" />}
-                      <span className="truncate">{src.title}</span>
-                    </Badge>
-                  </a>
-                ))}
-              </div>
-            </div>
-          </div>
-          {i < result.evaluations.length - 1 && <Separator className="my-1" />}
-        </div>
-      ))}
-
-      {thread.columns.length > 0 && (
-        <>
-          <Separator />
-          <div className="space-y-1.5">
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-medium">
-              Cells
-            </span>
-            <div className="space-y-2">
-              {thread.columns.map((column) => {
-                const cell = result.cells[column.key];
-                const summary = summarizeCellState(cell);
-
-                return (
-                  <div key={column.id} className="rounded border bg-background/70 p-2 space-y-1.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[11px] text-muted-foreground shrink-0">{column.label}</span>
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <Badge variant="outline" className="text-[9px] uppercase tracking-wider">
-                          {summary.label}
-                        </Badge>
-                        <span className={`text-[11px] truncate text-right ${summary.tone}`}>
-                          {summary.value}
-                        </span>
-                      </div>
-                    </div>
-                    <p className="text-[10px] text-muted-foreground leading-relaxed">
-                      {summary.detail}
-                    </p>
-                    {cell?.sources && cell.sources.length > 0 && (
-                      <div className="flex flex-wrap gap-1">
-                        {cell.sources.map((source) => (
-                          <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer">
-                            <Badge variant="secondary" className="text-[9px] gap-1 max-w-[220px]">
-                              {source.favicon && <img src={source.favicon} alt="" className="h-2.5 w-2.5 shrink-0" />}
-                              <span className="truncate">{source.title}</span>
-                            </Badge>
-                          </a>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </>
-      )}
-    </>
   );
 }

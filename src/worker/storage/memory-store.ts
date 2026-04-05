@@ -11,15 +11,27 @@ import type {
   ResultCell,
   ResultRow,
   RowDetailsResponse,
+  RunDebugSummary,
   RunMetrics,
   RunProgress,
   RunResultsResponse,
+  RunTraceResponse,
   ThreadSnapshot,
   UsageRecord,
   UsageSummary,
   SourceDocument,
   Evidence,
 } from "../../lib/contracts";
+import { isRowInFlight, summarizeProductCounts } from "../../lib/runtime-policy";
+
+const CHECKPOINTS = [
+  "plan persisted",
+  "candidate rows created",
+  "sources fetched",
+  "cells extracted",
+  "criteria evaluated",
+  "final ranking committed",
+] as const;
 
 type RunRecord = {
   run: ResearchRun;
@@ -77,6 +89,14 @@ export class MemoryResearchStore {
   private readonly runs = new Map<string, RunRecord>();
   private readonly threadOrder: string[] = [];
 
+  private deleteRunsForThread(threadId: string): void {
+    for (const [runId, record] of this.runs.entries()) {
+      if (record.run.threadId === threadId) {
+        this.runs.delete(runId);
+      }
+    }
+  }
+
   listThreadSnapshots(): ThreadSnapshot[] {
     return this.threadOrder
       .map((threadId) => this.getThreadSnapshot(threadId))
@@ -102,10 +122,34 @@ export class MemoryResearchStore {
     return record ? clone(record) : null;
   }
 
+  /** Drop oldest threads (and their latest run record) when over limit. Does not clear preview/search caches. */
+  pruneOldestThreadsIfOver(maxThreads: number): void {
+    if (maxThreads <= 0) return;
+    while (this.threadOrder.length > maxThreads) {
+      const removeId = this.threadOrder.pop();
+      if (!removeId) break;
+      this.deleteRunsForThread(removeId);
+      this.threads.delete(removeId);
+    }
+  }
+
   createThread(record: ThreadRecord): ThreadSnapshot {
     this.threads.set(record.thread.id, clone(record));
     this.threadOrder.unshift(record.thread.id);
     return this.getThreadSnapshot(record.thread.id)!;
+  }
+
+  /** Removes the thread and all run records associated with it. */
+  deleteThread(threadId: string): boolean {
+    const record = this.threads.get(threadId);
+    if (!record) return false;
+    this.deleteRunsForThread(threadId);
+    this.threads.delete(threadId);
+    const idx = this.threadOrder.indexOf(threadId);
+    if (idx >= 0) {
+      this.threadOrder.splice(idx, 1);
+    }
+    return true;
   }
 
   updateThread(
@@ -184,6 +228,51 @@ export class MemoryResearchStore {
     const record = this.runs.get(runId);
     if (!record) return [];
     return clone(record.events).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  getDebugSummary(runId: string): RunDebugSummary | null {
+    const run = this.getRun(runId);
+    if (!run) return null;
+    const events = this.listEvents(runId);
+    const reached = new Set(
+      events
+        .map((event) => event.payloadJson.checkpoint)
+        .filter((value): value is string => typeof value === "string"),
+    );
+    const stageCounts = events.reduce<RunDebugSummary["traceSummary"]["stageCounts"]>((counts, event) => {
+      counts[event.stage] = (counts[event.stage] ?? 0) + 1;
+      return counts;
+    }, {});
+
+    return {
+      run,
+      checkpoints: CHECKPOINTS.map((label) => ({
+        label,
+        reached: reached.has(label),
+      })),
+      providerBreakdown: clone(run.metrics.providerBreakdown),
+      traceSummary: {
+        totalEvents: events.length,
+        stageCounts,
+      },
+      recentEvents: events.slice(-10),
+    };
+  }
+
+  getTrace(runId: string, page = 1, pageSize = 50): RunTraceResponse | null {
+    const run = this.getRun(runId);
+    if (!run) return null;
+    const events = this.listEvents(runId);
+    const safePage = Math.max(1, page);
+    const safePageSize = Math.max(1, Math.min(200, pageSize));
+    const startIndex = (safePage - 1) * safePageSize;
+    return {
+      runId,
+      page: safePage,
+      pageSize: safePageSize,
+      total: events.length,
+      events: events.slice(startIndex, startIndex + safePageSize),
+    };
   }
 
   addUsage(runId: string, usage: UsageRecord): void {
@@ -373,7 +462,9 @@ export class MemoryResearchStore {
     if (!thread) return null;
     const rows = this.listRows(runId).filter(
       (row) => row.duplicateOfRowId === null
-        && (includeRejected || row.processingState === "pending" || row.status !== "rejected"),
+        && (includeRejected
+          || isRowInFlight(row)
+          || row.status !== "rejected"),
     );
     const rowIds = new Set(rows.map((row) => row.id));
     const cells = this.listCells(runId).filter((cell) => rowIds.has(cell.rowId));
@@ -446,18 +537,17 @@ export class MemoryResearchStore {
     }
     if (run.status === "running") {
       thread.thread.phase = "running";
-      const rows = [...(this.runs.get(run.id)?.rows.values() ?? [])];
-      const accepted = rows.filter((row) => row.status === "accepted").length;
-      const pending = rows.filter((row) => row.processingState === "pending").length;
-      thread.thread.statusSummary = `${accepted} accepted · ${pending} in-flight`;
+      const rows = [...(this.runs.get(run.id)?.rows.values() ?? [])].filter((row) => row.duplicateOfRowId === null);
+      const summary = summarizeProductCounts(rows);
+      thread.thread.statusSummary = `${summary.accepted} accepted · ${summary.inFlightCount} in-flight`;
       return;
     }
     if (run.status === "complete") {
-      const rows = [...(this.runs.get(run.id)?.rows.values() ?? [])];
-      const accepted = rows.filter((row) => row.status === "accepted").length;
-      const uncertain = rows.filter((row) => row.status === "uncertain").length;
+      const rows = [...(this.runs.get(run.id)?.rows.values() ?? [])].filter((row) => row.duplicateOfRowId === null);
+      const summary = summarizeProductCounts(rows);
+      const unresolved = summary.uncertain + summary.conflict;
       thread.thread.phase = "complete";
-      thread.thread.statusSummary = `${accepted} accepted · ${uncertain} uncertain`;
+      thread.thread.statusSummary = `${summary.accepted} accepted · ${unresolved} unresolved`;
       return;
     }
     if (run.status === "failed") {

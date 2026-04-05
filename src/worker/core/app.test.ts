@@ -328,6 +328,58 @@ describe("Worker API vertical slice", () => {
     }
   });
 
+  it("honors the configured provider timeout for live previews", async () => {
+    const originalFetch = globalThis.fetch;
+    const geminiPayload = (json: unknown) => ({
+      candidates: [{ content: { parts: [{ text: JSON.stringify(json) }] } }],
+    });
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("generativelanguage.googleapis.com") || url.includes("aiplatform.googleapis.com")) {
+        return await new Promise<Response>((resolve) => {
+          setTimeout(() => {
+            resolve(new Response(JSON.stringify(geminiPayload({
+              entity_type: "company",
+              hard_filters: ["Is a real company"],
+              soft_signals: ["Has grounded evidence"],
+              columns: [
+                { key: "website", label: "Website", kind: "identity", value_type: "url" },
+              ],
+              search_queries: ["slow preview timeout query"],
+              budgets: { search_budget: 1, fetch_budget: 3, verification_budget: 1 },
+              notes: "slow mock plan",
+            })), { status: 200 }));
+          }, 2600);
+        });
+      }
+      return new Response("Not mocked", { status: 404 });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      const env = {
+        AGENTIC_RUNTIME_MODE: "live",
+        BRAVE_API_KEY: "test-brave",
+        GEMINI_API_KEY: "test-gemini",
+        PROVIDER_TIMEOUT_MS: "4000",
+      };
+      const startedAt = Date.now();
+      const preview = await apiJson<{
+        criteria: Array<{ label: string }>;
+        columns: Array<{ label: string }>;
+      }>("POST", "/api/v1/query-plans/preview", {
+        query: "slow preview timeout query",
+        targetResults: 5,
+      }, env);
+
+      expect(preview.criteria).toHaveLength(2);
+      expect(preview.columns).toHaveLength(1);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(2500);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("prunes wrong YC cohort pages without poisoning same-host sibling sources", async () => {
     const originalFetch = globalThis.fetch;
     const geminiPayload = (json: unknown) => ({

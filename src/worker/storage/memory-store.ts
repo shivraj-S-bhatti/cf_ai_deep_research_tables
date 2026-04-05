@@ -89,6 +89,14 @@ export class MemoryResearchStore {
   private readonly runs = new Map<string, RunRecord>();
   private readonly threadOrder: string[] = [];
 
+  private deleteRunsForThread(threadId: string): void {
+    for (const [runId, record] of this.runs.entries()) {
+      if (record.run.threadId === threadId) {
+        this.runs.delete(runId);
+      }
+    }
+  }
+
   listThreadSnapshots(): ThreadSnapshot[] {
     return this.threadOrder
       .map((threadId) => this.getThreadSnapshot(threadId))
@@ -120,10 +128,7 @@ export class MemoryResearchStore {
     while (this.threadOrder.length > maxThreads) {
       const removeId = this.threadOrder.pop();
       if (!removeId) break;
-      const record = this.threads.get(removeId);
-      if (record?.thread.latestRunId) {
-        this.runs.delete(record.thread.latestRunId);
-      }
+      this.deleteRunsForThread(removeId);
       this.threads.delete(removeId);
     }
   }
@@ -134,13 +139,11 @@ export class MemoryResearchStore {
     return this.getThreadSnapshot(record.thread.id)!;
   }
 
-  /** Removes the thread and its latest run record (if any). */
+  /** Removes the thread and all run records associated with it. */
   deleteThread(threadId: string): boolean {
     const record = this.threads.get(threadId);
     if (!record) return false;
-    if (record.thread.latestRunId) {
-      this.runs.delete(record.thread.latestRunId);
-    }
+    this.deleteRunsForThread(threadId);
     this.threads.delete(threadId);
     const idx = this.threadOrder.indexOf(threadId);
     if (idx >= 0) {

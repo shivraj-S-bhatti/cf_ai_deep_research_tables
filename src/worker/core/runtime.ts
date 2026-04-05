@@ -25,6 +25,11 @@ import type {
 import { buildThreadBundle, previewQuery, rebuildThreadBundle } from "../domain/planner";
 import { findScenario } from "../fixtures/scenarios";
 import {
+  allocateExtractionBatch,
+  createExtractionBudget,
+  hasExtractionBudgetRemaining,
+} from "./extraction-budget";
+import {
   hasLiveProviders,
   resolveRuntimeConfig,
   shouldUseLiveProviders,
@@ -270,9 +275,7 @@ export class AgenticSearchRuntime {
     const cached = this.cache.preview.get(cacheKey);
     if (cached) return structuredClone(cached);
     const response = shouldUseLiveProviders(this.config)
-      ? await planWithGemini(this.config, input, {
-          timeoutMs: Math.min(this.config.requestTimeoutMs, 2500),
-        }).then((result) => result.data)
+      ? await this.buildLivePreview(input)
       : previewQuery(input);
     this.cache.preview.set(cacheKey, structuredClone(response));
     return response;
@@ -445,6 +448,13 @@ export class AgenticSearchRuntime {
         this.inflightRuns.delete(runId);
       });
     this.inflightRuns.set(runId, promise);
+  }
+
+  private async buildLivePreview(input: PreviewRequest): Promise<PreviewResponse> {
+    const providerResult = await planWithGemini(this.config, input, {
+      timeoutMs: this.config.requestTimeoutMs,
+    });
+    return providerResult.data;
   }
 
   private async executeRun(runId: string): Promise<void> {
@@ -946,6 +956,7 @@ export class AgenticSearchRuntime {
     const discoveredRowIdByUrl = new Map<string, string>();
     const prunedSourceUrls = new Set<string>();
     const prunedSourceSummaries = new Map<string, string>();
+    const extractionBudget = createExtractionBudget(this.config.maxLlmExtractionsPerRun);
 
     await this.runStage(runId, "planning", async () => {
       this.store.updateRun(runId, (current) => ({
@@ -1342,6 +1353,39 @@ export class AgenticSearchRuntime {
       return extracted;
     };
 
+    const logExtractionBudgetSkip = (skippedCount: number, context: string): void => {
+      if (skippedCount <= 0) return;
+      this.store.addActivity(
+        runId,
+        stageEvent(
+          runId,
+          "extraction",
+          "skipped",
+          `Skipped ${skippedCount} source${skippedCount === 1 ? "" : "s"} because the extraction budget was exhausted (${context}).`,
+          {
+            actor: actorForStage("extraction"),
+            title: "Extraction budget guard",
+            reasoning:
+              "The live runtime caps LLM extraction calls per run so refinement cannot silently increase latency or cost beyond configured guardrails.",
+            rewards: [
+              { label: "remaining_budget", value: String(extractionBudget.remainingCalls) },
+              { label: "skipped_sources", value: String(skippedCount) },
+            ],
+          },
+        ),
+      );
+    };
+
+    const extractWithinBudget = async (
+      docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
+      context: string,
+    ): Promise<ExtractedEntityRow[]> => {
+      const { allowedItems: allowedDocs, skippedCount } = allocateExtractionBatch(extractionBudget, docs);
+      logExtractionBudgetSkip(skippedCount, context);
+      if (allowedDocs.length === 0) return [];
+      return extractFromFetched(allowedDocs);
+    };
+
     const upsertMergedRows = (
       mergedRows: ExtractedEntityRow[],
       docs: Array<{ result: BraveWebResult; parsed: Awaited<ReturnType<typeof fetchAndParseDocument>> }>,
@@ -1484,7 +1528,7 @@ export class AgenticSearchRuntime {
     };
 
     await this.runStage(runId, "extraction", async () => {
-      const extracted = await extractFromFetched(fetchedDocs.slice(0, this.config.maxLlmExtractionsPerRun));
+      const extracted = await extractWithinBudget(fetchedDocs, "initial extraction");
       const merged = dedupeAndMerge(extracted);
       upsertMergedRows(merged, fetchedDocs);
 
@@ -1540,6 +1584,24 @@ export class AgenticSearchRuntime {
     for (let iteration = 1; iteration <= this.config.maxSupervisorIterations; iteration += 1) {
       if (this.shouldStop(runId)) return;
       if (this.failRunIfWallClockExceeded(runId)) return;
+      if (!hasExtractionBudgetRemaining(extractionBudget)) {
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "refinement",
+            "skipped",
+            "Supervisor stopped because the extraction budget is exhausted.",
+            {
+              actor: "Supervisor",
+              title: "Refinement budget guard",
+              reasoning:
+                "Further discovery would only fetch more sources without the budget required to extract grounded rows from them.",
+            },
+          ),
+        );
+        break;
+      }
 
       this.store.updateRun(runId, (current) => ({
         ...current,
@@ -1677,7 +1739,7 @@ export class AgenticSearchRuntime {
         continue;
       }
       fetchedDocs.push(...newFetched);
-      const extracted = await extractFromFetched(newFetched);
+      const extracted = await extractWithinBudget(newFetched, `supervisor iteration ${iteration}`);
       const merged = dedupeAndMerge(extracted);
       upsertMergedRows(merged, fetchedDocs);
 

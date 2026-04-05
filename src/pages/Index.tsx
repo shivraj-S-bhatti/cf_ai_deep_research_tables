@@ -73,6 +73,7 @@ const Index = () => {
   const [draftRetryNonce, setDraftRetryNonce] = useState(0);
   const pendingActionRef = useRef<(() => Promise<void>) | null>(null);
   const startedDraftRef = useRef<string | null>(null);
+  const routeHydrationAttemptRef = useRef<string | null>(null);
   const routeMode = location.pathname === "/" ? "home" : location.pathname === "/threads/new" ? "draft" : "thread";
   const draftQuery = useMemo(
     () => new URLSearchParams(location.search).get("query")?.trim() ?? "",
@@ -109,10 +110,25 @@ const Index = () => {
 
   useEffect(() => {
     if (routeMode !== "thread" || !threadsLoaded || !params.threadId) return;
-    if (!threads.some((thread) => thread.id === params.threadId)) {
-      navigate("/", { replace: true });
+    if (threads.some((thread) => thread.id === params.threadId)) {
+      routeHydrationAttemptRef.current = null;
+      return;
     }
-  }, [navigate, params.threadId, routeMode, threads, threadsLoaded]);
+    if (routeHydrationAttemptRef.current === params.threadId) return;
+    routeHydrationAttemptRef.current = params.threadId;
+    void hydrateThread(params.threadId)
+      .then((thread) => {
+        if (thread) {
+          routeHydrationAttemptRef.current = null;
+          return;
+        }
+        routeHydrationAttemptRef.current = null;
+      })
+      .catch(() => {
+        routeHydrationAttemptRef.current = null;
+        navigate("/", { replace: true });
+      });
+  }, [hydrateThread, navigate, params.threadId, routeMode, threads, threadsLoaded]);
 
   const displayed = useMemo(() => {
     if (!activeThread) return [];
@@ -140,10 +156,10 @@ const Index = () => {
 
     let canceled = false;
     void createThread(draftQuery)
-      .then((thread) => {
-        if (canceled || !thread) return;
+      .then((threadId) => {
+        if (canceled || !threadId) return;
         setThreadsPanelOpen(false);
-        navigate(`/threads/${thread.id}`, { replace: true });
+        navigate(`/threads/${threadId}`, { replace: true });
       })
       .catch((error) => {
         if (canceled) return;

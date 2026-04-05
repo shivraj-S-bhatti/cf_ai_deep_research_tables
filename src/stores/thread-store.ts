@@ -266,13 +266,13 @@ export function useThreadStore() {
           query,
           targetResults: 10,
         });
-        const thread = await hydrateThread(response.threadId);
+        void hydrateThread(response.threadId);
         void refreshQueryPlan(response.threadId, query).catch((error) => {
           toast.error("Could not build preview", {
             description: error instanceof Error ? error.message : "Unexpected planner failure",
           });
         });
-        return thread;
+        return response.threadId;
       } finally {
         setCreatingPreviewThread(false);
       }

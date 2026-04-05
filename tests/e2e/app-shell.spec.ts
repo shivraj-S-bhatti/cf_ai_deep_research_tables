@@ -41,6 +41,19 @@ test("walks from preview into progressive results", async ({ page }) => {
   });
   await expect(page.getByText("Unmatched candidates")).toBeVisible({ timeout: 10000 });
 
+  const threadsToggle = page.getByRole("button", { name: "Show research threads" });
+  await expect(threadsToggle).toBeVisible();
+  await threadsToggle.click();
+  await expect(page.getByText("New Research")).toBeVisible();
+  await expect(page.getByText("YC W24 healthcare startups")).toBeVisible();
+  await expect(page.getByText("Sprout Labs")).toBeVisible();
+  await page.getByRole("button", { name: "Close threads panel" }).click();
+
+  await expect(page.getByText("Sprout Labs")).toBeVisible();
+  await page.getByRole("button", { name: "Show research threads" }).click();
+  await expect(page.getByText("New Research")).toBeVisible();
+  await page.getByRole("button", { name: "Close threads panel" }).click();
+
   await page.screenshot({ path: join(shotDir, "02-results-table.png"), fullPage: true });
 
   await page.getByRole("tab", { name: "Run" }).click();

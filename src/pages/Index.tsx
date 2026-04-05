@@ -299,7 +299,7 @@ const Index = () => {
             >
               <ThreadList
                 threads={threads}
-                activeThreadId={showInitial ? null : activeThreadId}
+                activeThreadId={shellMode === "home" ? null : activeThreadId}
                 onSelectThread={(id) => {
                   setActiveThreadId(id);
                   setShowNewSearch(false);

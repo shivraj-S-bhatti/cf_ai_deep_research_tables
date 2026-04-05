@@ -1,5 +1,6 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
+import { AppErrorBoundary } from "@/components/AppErrorBoundary";
 import Index from "./pages/Index.tsx";
 import DebugRun from "./pages/DebugRun.tsx";
 import NotFound from "./pages/NotFound.tsx";
@@ -7,13 +8,15 @@ import NotFound from "./pages/NotFound.tsx";
 const App = () => (
   <>
     <Sonner />
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Index />} />
-        <Route path="/threads/:threadId/debug" element={<DebugRun />} />
-        <Route path="*" element={<NotFound />} />
-      </Routes>
-    </BrowserRouter>
+    <AppErrorBoundary>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<Index />} />
+          <Route path="/threads/:threadId/debug" element={<DebugRun />} />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </BrowserRouter>
+    </AppErrorBoundary>
   </>
 );
 

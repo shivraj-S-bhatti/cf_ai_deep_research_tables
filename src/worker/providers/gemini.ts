@@ -641,6 +641,7 @@ export async function extractDocumentWithGemini(
       "Return JSON only.",
       "Prefer lower confidence for opinionated claims.",
       "Do not invent URLs or ratings.",
+      "Rows from forum/community sources should usually stay uncertain unless the source is itself the entity page.",
       "Return {\"entities\": [...]}",
     ].join("\n")
     : sourceClass === "roundup" || sourceClass === "directory"
@@ -648,12 +649,16 @@ export async function extractDocumentWithGemini(
         "You extract multiple entities from roundup/list pages.",
         "Return JSON only with an entities array.",
         "Each entity must be grounded in the provided text.",
+        "These pages are candidate generators, not final entity pages.",
+        "Do not invent company/profile URLs. Only emit canonical_url when the exact URL appears in the provided text.",
+        "Default row_status to uncertain for list or directory pages.",
         "If no valid entities are present, return {\"entities\": []}.",
       ].join("\n")
       : [
         "You extract one grounded entity from an entity-specific page.",
         "Return JSON only with an entities array (0 or 1 entity preferred).",
         "Do not return page/site names as entities.",
+        "Do not invent URLs. Only emit canonical_url when it is explicit in the provided text or page metadata.",
       ].join("\n");
 
   const user = [

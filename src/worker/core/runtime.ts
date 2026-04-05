@@ -30,6 +30,14 @@ import {
   hasExtractionBudgetRemaining,
 } from "./extraction-budget";
 import {
+  collectFollowUpUrls,
+  computeFetchBatchSize,
+  coerceRowStatusForSource,
+  isGroundingSourceClass,
+  selectDiscoveryBatch,
+  shouldStopExploration,
+} from "./live-run-policy";
+import {
   hasLiveProviders,
   resolveRuntimeConfig,
   shouldUseLiveProviders,
@@ -956,7 +964,86 @@ export class AgenticSearchRuntime {
     const discoveredRowIdByUrl = new Map<string, string>();
     const prunedSourceUrls = new Set<string>();
     const prunedSourceSummaries = new Map<string, string>();
+    const followUpUrlQueue: string[] = [];
+    const followUpSeenUrls = new Set<string>();
+    const consumedFollowUpUrls = new Set<string>();
     const extractionBudget = createExtractionBudget(this.config.maxLlmExtractionsPerRun);
+    const hasDiscoveredUrl = (url: string): boolean =>
+      discovered.some((entry) => this.normalizeUrl(entry.url) === url);
+    const enqueueDiscoveredCandidate = (candidate: BraveWebResult): string | null => {
+      const normalizedUrl = this.normalizeUrl(candidate.url);
+      if (failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) return null;
+      if (hasDiscoveredUrl(normalizedUrl)) return null;
+      discovered.push({
+        ...candidate,
+        url: normalizedUrl,
+      });
+      return normalizedUrl;
+    };
+    const enqueueFollowUpCandidate = (candidate: BraveWebResult): void => {
+      const normalizedUrl = enqueueDiscoveredCandidate(candidate);
+      if (!normalizedUrl || followUpSeenUrls.has(normalizedUrl)) return;
+      followUpSeenUrls.add(normalizedUrl);
+      followUpUrlQueue.push(normalizedUrl);
+    };
+    const activeUniqueRows = (): ResultRow[] =>
+      this.store
+        .listRows(runId)
+        .filter(
+          (row) =>
+            row.duplicateOfRowId === null
+            && row.status !== "rejected"
+            && (row.sourceCount > 0 || row.processingState !== "pending"),
+        );
+    const selectNextFetchUrls = (limit: number): string[] => {
+      if (limit <= 0) return [];
+      const selected = new Set<string>();
+      const nextUrls: string[] = [];
+      const canUseUrl = (url: string): boolean =>
+        !selected.has(url)
+        && !prunedSourceUrls.has(url)
+        && !failedUrls.has(url)
+        && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
+
+      for (const url of selectQueuedFollowUpUrls(limit, false)) {
+        if (!canUseUrl(url)) continue;
+        selected.add(url);
+        nextUrls.push(url);
+        if (nextUrls.length >= limit) return nextUrls;
+      }
+
+      const rankedFallback = selectDiscoveryBatch(
+        thread.thread.queryRaw,
+        discovered.filter((candidate) => canUseUrl(this.normalizeUrl(candidate.url))),
+        limit - nextUrls.length,
+      );
+      for (const candidate of rankedFallback) {
+        const normalizedUrl = this.normalizeUrl(candidate.url);
+        if (!canUseUrl(normalizedUrl)) continue;
+        selected.add(normalizedUrl);
+        nextUrls.push(normalizedUrl);
+        if (nextUrls.length >= limit) break;
+      }
+
+      return nextUrls;
+    };
+    const selectQueuedFollowUpUrls = (limit: number, consume = false): string[] => {
+      if (limit <= 0) return [];
+      const nextUrls = followUpUrlQueue
+        .filter((url) => {
+          if (consumedFollowUpUrls.has(url)) return false;
+          return !prunedSourceUrls.has(url)
+            && !failedUrls.has(url)
+            && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
+        })
+        .slice(0, limit);
+      if (consume) {
+        for (const url of nextUrls) {
+          consumedFollowUpUrls.add(url);
+        }
+      }
+      return nextUrls;
+    };
 
     await this.runStage(runId, "planning", async () => {
       this.store.updateRun(runId, (current) => ({
@@ -990,7 +1077,11 @@ export class AgenticSearchRuntime {
 
     await this.runStage(runId, "discovery", async () => {
       const seenUrls = new Set<string>();
-      let discoveryBudget = Math.min(this.config.maxSourcesPerRun, Math.max(thread.thread.targetResults + 4, 6));
+      const searchResultCount = Math.min(
+        this.config.maxSourcesPerRun,
+        Math.max(this.config.searchResultsPerQuery, thread.thread.targetResults * 2),
+      );
+      let discoveryBudget = Math.min(this.config.maxSourcesPerRun, Math.max(thread.thread.targetResults * 3, 8));
       for (const query of thread.plan.searchQueries) {
         if (discoveryBudget <= 0) break;
         this.assertRunActive(runId);
@@ -1006,7 +1097,7 @@ export class AgenticSearchRuntime {
           ?? await searchBraveWeb(
             this.config.braveApiKey!,
             query,
-            this.config.searchResultsPerQuery,
+            searchResultCount,
             this.requestControlForRun(runId),
           );
         const searchLatency = now() - searchStartedAt;
@@ -1067,11 +1158,8 @@ export class AgenticSearchRuntime {
           if (failedUrls.has(normalizedUrl) || prunedSourceUrls.has(normalizedUrl)) continue;
           if (seenUrls.has(normalizedUrl)) continue;
           seenUrls.add(normalizedUrl);
+          if (!enqueueDiscoveredCandidate(result)) continue;
           discoveryBudget -= 1;
-          discovered.push({
-            ...result,
-            url: normalizedUrl,
-          });
           const provisionalRowId = makeId("row");
           discoveredRowIdByUrl.set(normalizedUrl, provisionalRowId);
           this.store.upsertRow(runId, {
@@ -1156,6 +1244,29 @@ export class AgenticSearchRuntime {
             },
             this.normalizeUrl(parsed.finalUrl),
           );
+          const finalNorm = this.normalizeUrl(parsed.finalUrl);
+          const alreadyFetchedFinalUrl =
+            fetchedDocs.some((entry) => this.normalizeUrl(entry.parsed.finalUrl) === finalNorm)
+            || nextFetched.some((entry) => this.normalizeUrl(entry.parsed.finalUrl) === finalNorm);
+          if (alreadyFetchedFinalUrl) {
+            failedUrls.add(normalizedUrl);
+            this.store.addActivity(
+              runId,
+              stageEvent(
+                runId,
+                "fetch",
+                "skipped",
+                `Skipped redirected duplicate source: ${parsed.finalUrl}`,
+                {
+                  actor: actorForStage("fetch"),
+                  title: "Source already fetched",
+                  checkpoint: "sources fetched",
+                  sourceUrl: finalNorm,
+                },
+              ),
+            );
+            continue;
+          }
           if (pruneDecision.eligibility === "out_of_scope_hard") {
             if (pruneDecision.pruneKey) {
               prunedSourceUrls.add(pruneDecision.pruneKey);
@@ -1201,7 +1312,6 @@ export class AgenticSearchRuntime {
 
           nextFetched.push({ result, parsed });
 
-          const finalNorm = this.normalizeUrl(parsed.finalUrl);
           if (provisionalRowId) {
             discoveredRowIdByUrl.set(finalNorm, provisionalRowId);
           }
@@ -1257,7 +1367,14 @@ export class AgenticSearchRuntime {
     };
 
     await this.runStage(runId, "fetch", async () => {
-      const fetched = await fetchByUrls(discovered.slice(0, this.config.maxSourcesPerRun).map((result) => result.url));
+      const initialFetchLimit = computeFetchBatchSize({
+        iteration: 0,
+        targetResults: thread.thread.targetResults,
+        currentRows: activeUniqueRows().length,
+        remainingExtractionCalls: extractionBudget.remainingCalls,
+        maxSourcesPerRun: this.config.maxSourcesPerRun,
+      });
+      const fetched = await fetchByUrls(selectNextFetchUrls(initialFetchLimit));
       fetchedDocs.push(...fetched);
     });
     if (this.shouldStop(runId)) return;
@@ -1431,6 +1548,8 @@ export class AgenticSearchRuntime {
             : null,
         };
         const existing = this.store.getRow(runId, rowId);
+        const groundsRow = isGroundingSourceClass(merged.sourceClass);
+        const nextStatus = coerceRowStatusForSource(merged.sourceClass, merged.rowStatus);
         const terminalProcessing =
           existing?.processingState === "verifying"
           || existing?.processingState === "finalized"
@@ -1438,14 +1557,20 @@ export class AgenticSearchRuntime {
         const nextProcessingState = terminalProcessing
           ? (existing?.processingState ?? "pending")
           : "refining";
+        const suggestedBySourceIds = [
+          ...new Set([...(existing?.lineage.suggestedBySourceIds ?? []), sourceDoc.id]),
+        ];
+        const groundedBySourceIds = groundsRow
+          ? [...new Set([...(existing?.lineage.groundedBySourceIds ?? []), sourceDoc.id])]
+          : [...(existing?.lineage.groundedBySourceIds ?? [])];
 
         this.store.upsertRow(runId, {
           id: rowId,
           runId,
           canonicalName: merged.canonicalName,
-          canonicalUrl: this.ensureHttpUrl(merged.canonicalUrl),
+          canonicalUrl: existing?.canonicalUrl ?? sourceDoc.url,
           entityType: thread.plan.entityType,
-          status: merged.rowStatus,
+          status: nextStatus,
           statusReasonCode: null,
           statusReasonSummary: null,
           processingState: nextProcessingState,
@@ -1454,10 +1579,8 @@ export class AgenticSearchRuntime {
           sourceCount: Math.max(existing?.sourceCount ?? 0, 1),
           duplicateOfRowId: existing?.duplicateOfRowId ?? null,
           lineage: {
-            suggestedBySourceIds: existing?.lineage.suggestedBySourceIds?.length
-              ? existing.lineage.suggestedBySourceIds
-              : [sourceDoc.id],
-            groundedBySourceIds: existing?.lineage.groundedBySourceIds ?? [],
+            suggestedBySourceIds,
+            groundedBySourceIds,
             sourceOriginClass: classifySourceOrigin(sourceDoc.url, sourceDoc.title),
           },
         });
@@ -1513,6 +1636,36 @@ export class AgenticSearchRuntime {
             primaryEvidenceId: evidence?.id ?? null,
           });
         }
+
+        const followUpUrls = collectFollowUpUrls(merged);
+        for (const followUpUrl of followUpUrls) {
+          enqueueFollowUpCandidate({
+            title: merged.canonicalName,
+            url: followUpUrl,
+            description: merged.rowSummary,
+          });
+        }
+
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "extraction",
+            "completed",
+            `${groundsRow ? "Grounded" : "Queued"} row ${merged.canonicalName} from ${sourceDoc.domain}`,
+            {
+              actor: actorForStage("extraction"),
+              title: groundsRow ? "Row grounded" : "Row candidate queued",
+              checkpoint: groundsRow ? "row grounded" : "row candidate queued",
+              sourceUrl: sourceDoc.url,
+              sourceClass: merged.sourceClass,
+              rowName: merged.canonicalName,
+              rowUrl: existing?.canonicalUrl ?? sourceDoc.url,
+              followUpUrls,
+              grounded: groundsRow,
+            },
+          ),
+        );
       }
       const totalRows = this.store.listRows(runId).filter((row) => !row.duplicateOfRowId).length;
       this.store.updateRun(runId, (current) => ({
@@ -1547,6 +1700,41 @@ export class AgenticSearchRuntime {
             },
           ),
         );
+      }
+
+      const immediateFollowUpLimit = computeFetchBatchSize({
+        iteration: 1,
+        targetResults: thread.thread.targetResults,
+        currentRows: activeUniqueRows().length,
+        remainingExtractionCalls: extractionBudget.remainingCalls,
+        maxSourcesPerRun: this.config.maxSourcesPerRun,
+        preferFollowUps: true,
+      });
+      const immediateFollowUps = selectQueuedFollowUpUrls(immediateFollowUpLimit, true);
+      if (immediateFollowUps.length > 0) {
+        const followUpFetched = await fetchByUrls(immediateFollowUps);
+        if (followUpFetched.length > 0) {
+          fetchedDocs.push(...followUpFetched);
+          const followUpExtracted = await extractWithinBudget(followUpFetched, "immediate follow-up extraction");
+          const followUpMerged = dedupeAndMerge(followUpExtracted);
+          upsertMergedRows(followUpMerged, fetchedDocs);
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "refinement",
+              "completed",
+              `Chased ${followUpFetched.length} follow-up source${followUpFetched.length === 1 ? "" : "s"} immediately after list extraction.`,
+              {
+                actor: "Supervisor",
+                title: "Immediate follow-up fetch",
+                reasoning:
+                  "Entity/profile URLs extracted from list pages are higher-value than another broad search step, so the runtime follows a small batch immediately.",
+                sourceUrls: immediateFollowUps,
+              },
+            ),
+          );
+        }
       }
     });
     if (this.shouldStop(runId)) return;
@@ -1613,9 +1801,35 @@ export class AgenticSearchRuntime {
         },
       }));
 
-      const activeRows = this.store
-        .listRows(runId)
-        .filter((row) => row.duplicateOfRowId === null && row.status !== "rejected");
+      const activeRows = activeUniqueRows();
+      const groundedRowCount = activeRows.filter((row) => row.lineage.groundedBySourceIds.length > 0).length;
+      const hasPendingFollowUps = followUpUrlQueue.some((url) => {
+        if (consumedFollowUpUrls.has(url)) return false;
+        return !prunedSourceUrls.has(url)
+          && !failedUrls.has(url)
+          && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
+      });
+      if (
+        shouldStopExploration(activeRows.length, thread.thread.targetResults)
+        && (groundedRowCount >= thread.thread.targetResults || !hasPendingFollowUps)
+      ) {
+        this.store.addActivity(
+          runId,
+          stageEvent(
+            runId,
+            "refinement",
+            "completed",
+            `Stopped refinement after reaching the target row count (${activeRows.length}/${thread.thread.targetResults}).`,
+            {
+              actor: "Supervisor",
+              title: "Target row count reached",
+              reasoning:
+                "The loop is intentionally shallow per iteration. Once the candidate row target is reached, the run moves on to verification and ranking instead of spending more extraction budget.",
+            },
+          ),
+        );
+        break;
+      }
       const summaries = thread.columns.map((column) => {
         let filled = 0;
         let confidence = 0;
@@ -1634,14 +1848,7 @@ export class AgenticSearchRuntime {
         };
       });
 
-      const unfetchedUrls = discovered
-        .map((result) => this.normalizeUrl(result.url))
-        .filter((url) => {
-          return !prunedSourceUrls.has(url);
-        })
-        .filter((url) => !failedUrls.has(url))
-        .filter((url) => !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url))
-        .slice(0, 10);
+      const unfetchedUrls = selectNextFetchUrls(10);
 
       let decision: Awaited<ReturnType<typeof supervisorDecide>>["data"] = {
         action: "done",
@@ -1713,14 +1920,16 @@ export class AgenticSearchRuntime {
             const nextResults = await searchBraveWeb(
               this.config.braveApiKey!,
               { id: makeId("sq"), text: queryText },
-              this.config.searchResultsPerQuery,
+              Math.min(
+                this.config.maxSourcesPerRun,
+                Math.max(this.config.searchResultsPerQuery, thread.thread.targetResults * 2),
+              ),
               this.requestControlForRun(runId),
             );
             for (const result of nextResults) {
               const normalized = this.normalizeUrl(result.url);
               if (failedUrls.has(normalized) || prunedSourceUrls.has(normalized)) continue;
-              if (discovered.some((entry) => this.normalizeUrl(entry.url) === normalized)) continue;
-              discovered.push({ ...result, url: normalized });
+              enqueueDiscoveredCandidate(result);
             }
           }
         } catch {
@@ -1728,12 +1937,31 @@ export class AgenticSearchRuntime {
         }
       }
 
+      const refinementFetchLimit = computeFetchBatchSize({
+        iteration,
+        targetResults: thread.thread.targetResults,
+        currentRows: activeRows.length,
+        remainingExtractionCalls: extractionBudget.remainingCalls,
+        maxSourcesPerRun: this.config.maxSourcesPerRun,
+        preferFollowUps: followUpUrlQueue.some((url) => {
+          if (consumedFollowUpUrls.has(url)) return false;
+          return !prunedSourceUrls.has(url)
+            && !failedUrls.has(url)
+            && !fetchedDocs.some((entry) => this.normalizeUrl(entry.result.url) === url);
+        }),
+      });
+
       const targetUrls = (decision.urls.length > 0 ? decision.urls : unfetchedUrls)
         .map((url) => this.normalizeUrl(url))
         .filter((url) => {
           return !prunedSourceUrls.has(url);
         })
-        .slice(0, 4);
+        .slice(0, refinementFetchLimit);
+      for (const targetUrl of targetUrls) {
+        if (followUpSeenUrls.has(targetUrl)) {
+          consumedFollowUpUrls.add(targetUrl);
+        }
+      }
       const newFetched = await fetchByUrls(targetUrls);
       if (newFetched.length === 0) {
         continue;
@@ -1767,6 +1995,7 @@ export class AgenticSearchRuntime {
 
       for (const row of this.store.listRows(runId).filter((candidateRow) => {
         if (candidateRow.duplicateOfRowId) return false;
+        if (candidateRow.lineage.groundedBySourceIds.length === 0) return false;
         const details = this.store.getRowDetails(runId, candidateRow.id);
         const hasWeakCriterion = details?.evaluations.some(
           (evaluation) => evaluation.verdict === "uncertain" || evaluation.verdict === "conflict",

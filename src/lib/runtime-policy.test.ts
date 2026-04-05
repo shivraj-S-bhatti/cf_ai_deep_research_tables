@@ -99,6 +99,22 @@ describe("runtime policy", () => {
     expect(eligible.pruneKey).toBeNull();
   });
 
+  it("hard-prunes YC year mismatches even when the source omits an explicit cohort token", () => {
+    const decision = classifySourceScopeDecision(
+      "YC W24 healthcare startups",
+      {
+        title: "Healthcare startups funded by YC in 2026",
+        snippet: "Browse the latest healthcare companies from 2026.",
+      },
+      "https://www.ycombinator.com/companies/industry/healthcare-services",
+    );
+
+    expect(decision.eligibility).toBe("out_of_scope_hard");
+    expect(decision.pruneKey).toBe("https://www.ycombinator.com/companies/industry/healthcare-services");
+    expect(decision.reasonSummary).toContain("2024");
+    expect(decision.reasonSummary).toContain("2026");
+  });
+
   it("keeps low-confidence hard fails uncertain", () => {
     const status = deriveFinalStatus(
       makeRow(),
@@ -111,12 +127,35 @@ describe("runtime policy", () => {
 
   it("rejects only strong hard-filter failures", () => {
     const status = deriveFinalStatus(
-      makeRow(),
+      makeRow({
+        lineage: {
+          suggestedBySourceIds: ["src-1"],
+          groundedBySourceIds: ["src-1"],
+          sourceOriginClass: "official",
+        },
+      }),
       [makeEvaluation({ verdict: "fail", confidence: 0.92 })],
       makeCriteria(),
     );
 
     expect(status).toBe("rejected");
+  });
+
+  it("keeps rows uncertain when no grounding source exists yet", () => {
+    const status = deriveFinalStatus(
+      makeRow({
+        status: "accepted",
+        lineage: {
+          suggestedBySourceIds: ["src-1"],
+          groundedBySourceIds: [],
+          sourceOriginClass: "directory",
+        },
+      }),
+      [makeEvaluation({ verdict: "pass", confidence: 0.95 })],
+      makeCriteria(),
+    );
+
+    expect(status).toBe("uncertain");
   });
 
   it("downgrades document-like rows to uncertain instead of rejecting them", () => {

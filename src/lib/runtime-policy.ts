@@ -39,6 +39,7 @@ export type ProductCountSummary = {
 
 const TERMINAL_PROCESSING_STATES = new Set<ProcessingState>(["finalized", "failed"]);
 const COHORT_PATTERN = /\b(?:w|s|f)\s?\d{2}\b|\b(?:winter|spring|summer|fall)\s?\d{2,4}\b/gi;
+const YEAR_PATTERN = /\b20\d{2}\b/g;
 
 function normalizeCohortToken(token: string): string | null {
   const normalized = token.toLowerCase().replace(/\s+/g, "");
@@ -73,6 +74,17 @@ function extractCohortTokens(text: string): string[] {
   }
 
   return normalized;
+}
+
+function extractYearTokens(text: string): string[] {
+  const matches = text.match(YEAR_PATTERN) ?? [];
+  return [...new Set(matches)];
+}
+
+function cohortTokenToYear(token: string): string | null {
+  const normalized = normalizeCohortToken(token);
+  if (!normalized) return null;
+  return `20${normalized.slice(-2)}`;
 }
 
 function looksLikeDocumentInsteadOfEntity(row: Pick<ResultRow, "entityType" | "canonicalName" | "canonicalUrl" | "lineage">): boolean {
@@ -119,7 +131,19 @@ export function classifySourceScopeDecision(
 
   const sourceText = `${normalizedSourceUrl} ${sourceMeta.title} ${sourceMeta.snippet}`.toLowerCase();
   const sourceCohorts = extractCohortTokens(sourceText);
+  const requestedYears = requestedCohorts
+    .map(cohortTokenToYear)
+    .filter((value): value is string => Boolean(value));
+  const sourceYears = extractYearTokens(sourceText);
   if (sourceCohorts.length === 0) {
+    if (requestedYears.length > 0 && sourceYears.length > 0 && !sourceYears.some((year) => requestedYears.includes(year))) {
+      return {
+        eligibility: "out_of_scope_hard",
+        pruneKey: normalizedSourceUrl,
+        reasonCode: "source_scope_pruned",
+        reasonSummary: `Source year mismatch: requested ${requestedYears.join(", ")}, found ${sourceYears.slice(0, 3).join(", ")}.`,
+      };
+    }
     return {
       eligibility: "eligible",
       pruneKey: null,
@@ -159,6 +183,11 @@ export function deriveFinalStatus(
     criteria.filter((criterion) => criterion.kind === "hard_filter").map((criterion) => criterion.id),
   );
   const hardEvaluations = evaluations.filter((evaluation) => hardCriteriaIds.has(evaluation.criterionId));
+  const hasGrounding = row.lineage.groundedBySourceIds.length > 0;
+
+  if (!hasGrounding && row.status !== "rejected") {
+    return "uncertain";
+  }
 
   if (hardEvaluations.length === 0) {
     return row.status === "rejected" ? "rejected" : "uncertain";

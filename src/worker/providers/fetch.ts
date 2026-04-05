@@ -121,6 +121,22 @@ export function classifySource(doc: Pick<ParsedDocument, "finalUrl" | "title" | 
     }
   })();
 
+  if (domain === "ycombinator.com" || domain.endsWith(".ycombinator.com")) {
+    if (/^\/companies\/[^/]+$/.test(path)) {
+      const slug = path.split("/").pop() ?? "";
+      if (/^(?:w|s|f)\d{2}$/i.test(slug)) return "directory";
+      return "entity_page";
+    }
+    if (
+      path.startsWith("/companies/industry/")
+      || path.startsWith("/companies/location/")
+      || path === "/companies"
+      || path.startsWith("/companies?")
+    ) {
+      return "directory";
+    }
+  }
+
   if (hasDomain(domain, FORUM_DOMAINS)) return "forum";
   if (hasDomain(domain, DIRECTORY_DOMAINS)) return "directory";
   if (hasDomain(domain, ROUNDUP_DOMAINS)) return "roundup";
@@ -143,7 +159,9 @@ export function classifySource(doc: Pick<ParsedDocument, "finalUrl" | "title" | 
     || /\bbest\b.*\b(?:spots?|places?|shops?|restaurants?|joints?|projects?|startups?|companies|repos?|repositories|llms?)\b/.test(titleLower);
   const hasListBody = ((doc.text || "").slice(0, 4000).match(/(?:^|\n)\s*\d+[.)]\s+/g) || []).length >= 4;
   const hasManyGithubLinks = (textLower.match(/https?:\/\/github\.com\/[^\s)\]"']+/g) || []).length >= 6;
+  const hasDirectoryPath = /\/(directory|industry|category|location)\//.test(path);
 
+  if (hasDirectoryPath) return "directory";
   if (hasListTitle || hasListBody || hasManyGithubLinks) return "roundup";
   return "entity_page";
 }

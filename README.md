@@ -51,16 +51,16 @@ stateDiagram-v2
     [*] --> Plan : query_raw
     Plan --> Search : entityType + checks + columns + searchQueries
     Search --> Fetch : urls[]
-    Fetch --> Class : page body
-    Class --> Pull : sourceClass
+    Fetch --> Classify : page body
+    Classify --> Pull : sourceClass
     Pull --> Fold : mentions[]
     Fold --> Weigh : canonical rows
     Weigh --> Rank : rowStatus per row
     Rank --> Export : scored rows
     Export --> [*]
 
-    Weigh --> Fetch : table gaps → re-fetch
-    Weigh --> Search : table gaps → re-search
+    Weigh --> Fetch : table gaps -> re-fetch
+    Weigh --> Search : table gaps -> re-search
 ```
 
 `sourceClass`: `roundup` · `entity_page` · `official` · `directory` · `forum`
@@ -69,11 +69,13 @@ stateDiagram-v2
 
 ## Three Objects
 
-|  | What | Not |
-|---|---|---|
-| **page** | Fetched doc. Has `sourceClass`. | Not a row. |
-| **mention** | One candidate pulled from one page. | May share name with mentions from other pages. |
-| **row** | Merged canonical thing. Cells from best mention per key. | Not a page. |
+The system only makes sense if these three objects stay separate:
+
+| Object | What it is | Role | What it is not |
+|---|---|---|---|
+| **page** | One fetched source document with raw text, metadata, and a `sourceClass`. Examples: roundup, official site, directory, review, forum thread. | Retrieval and evidence unit. Pages are what we search, fetch, classify, cache, and cite. | Not a result row. A useful page may mention many entities. |
+| **mention** | One candidate entity pulled from one page. A single page can yield zero, one, or many mentions. | Extraction unit. Mentions hold page-local cells, checks, confidence, and evidence snippets before any cross-source merge happens. | Not canonical. The same real thing may appear as many mentions across many pages. |
+| **row** | The merged canonical entity built from one or more mentions judged to refer to the same thing. | Output unit. Rows are what get ranked, filtered, exported, and shown in the final table, with cells linked back to source evidence. | Not a page, and not limited to one source once merge succeeds. |
 
 ---
 

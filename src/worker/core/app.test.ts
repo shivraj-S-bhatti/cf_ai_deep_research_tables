@@ -386,6 +386,7 @@ describe("Worker API vertical slice", () => {
       candidates: [{ content: { parts: [{ text: JSON.stringify(json) }] } }],
     });
     const extractRequests: string[] = [];
+    let supervisorCalls = 0;
     const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       if (url.includes("api.search.brave.com")) {
@@ -414,6 +415,16 @@ describe("Worker API vertical slice", () => {
               title: "Y Combinator Spring 2026 batch",
               description: "Healthcare companies from Spring 2026.",
               content: "Spring 2026 batch companies. Healthcare startups and biotech companies. This page is clearly about the Spring 2026 cohort and not the requested Winter 2024 cohort.",
+            },
+          }), { status: 200 });
+        }
+        if (url.includes("verahealth.example.com")) {
+          return new Response(JSON.stringify({
+            data: {
+              url: "https://verahealth.example.com",
+              title: "Vera Health",
+              description: "Clinical decision-support platform for providers.",
+              content: "Vera Health is a healthcare startup in YC W24. Website: https://verahealth.example.com. Clinical decision-support platform for providers.",
             },
           }), { status: 200 });
         }
@@ -449,6 +460,58 @@ describe("Worker API vertical slice", () => {
         }
         if (systemText.toLowerCase().includes("extract")) {
           extractRequests.push(bodyText);
+          if (bodyText.includes("Source URL: https://verahealth.example.com")) {
+            return new Response(JSON.stringify(geminiPayload({
+              entities: [
+                {
+                  canonical_name: "Vera Health",
+                  canonical_url: "https://verahealth.example.com",
+                  row_status: "accepted",
+                  score: 0.93,
+                  row_summary: "Company website confirms the product and batch.",
+                  cells: [
+                    { key: "website", value_text: "https://verahealth.example.com", state: "filled", confidence: 0.96, reason_code: null, evidence_text: "https://verahealth.example.com" },
+                    { key: "description", value_text: "Healthcare startup in YC W24.", state: "filled", confidence: 0.88, reason_code: null, evidence_text: "Vera Health is a healthcare startup in YC W24." },
+                  ],
+                  criteria: [
+                    {
+                      label: "Entity appears relevant to \"YC W24 healthcare startups\"",
+                      verdict: "pass",
+                      summary: "The company website confirms the W24 healthcare startup.",
+                      confidence: 0.96,
+                      evidence_text: "Vera Health is a healthcare startup in YC W24.",
+                    },
+                  ],
+                },
+              ],
+            })), { status: 200 });
+          }
+          if (bodyText.includes("Source URL: https://verahealth.example.com/")) {
+            return new Response(JSON.stringify(geminiPayload({
+              entities: [
+                {
+                  canonical_name: "Vera Health",
+                  canonical_url: "https://verahealth.example.com",
+                  row_status: "accepted",
+                  score: 0.93,
+                  row_summary: "Company website confirms the product and batch.",
+                  cells: [
+                    { key: "website", value_text: "https://verahealth.example.com", state: "filled", confidence: 0.96, reason_code: null, evidence_text: "https://verahealth.example.com" },
+                    { key: "description", value_text: "Healthcare startup in YC W24.", state: "filled", confidence: 0.88, reason_code: null, evidence_text: "Vera Health is a healthcare startup in YC W24." },
+                  ],
+                  criteria: [
+                    {
+                      label: "Entity appears relevant to \"YC W24 healthcare startups\"",
+                      verdict: "pass",
+                      summary: "The company website confirms the W24 healthcare startup.",
+                      confidence: 0.96,
+                      evidence_text: "Vera Health is a healthcare startup in YC W24.",
+                    },
+                  ],
+                },
+              ],
+            })), { status: 200 });
+          }
           return new Response(JSON.stringify(geminiPayload({
             entities: [
               {
@@ -475,6 +538,16 @@ describe("Worker API vertical slice", () => {
           })), { status: 200 });
         }
         if (systemText.toLowerCase().includes("research supervisor")) {
+          supervisorCalls += 1;
+          if (supervisorCalls === 1) {
+            return new Response(JSON.stringify(geminiPayload({
+              action: "fetch_more",
+              queries: [],
+              urls: [],
+              focus_columns: ["Website", "Description"],
+              reasoning: "Follow the extracted company page before deciding.",
+            })), { status: 200 });
+          }
           return new Response(JSON.stringify(geminiPayload({
             action: "done",
             queries: [],
@@ -556,6 +629,7 @@ describe("Worker API vertical slice", () => {
         expect.arrayContaining([
           expect.objectContaining({
             canonicalName: "Vera Health",
+            canonicalUrl: "https://www.ycombinator.com/companies/w24",
             status: "accepted",
             processingState: "finalized",
           }),
@@ -571,6 +645,13 @@ describe("Worker API vertical slice", () => {
       const prunedRow = finalResults.rows.find((row) => row.statusReasonCode === "source_scope_pruned");
       expect(prunedRow?.statusReasonSummary).toContain("W24");
       expect(prunedRow?.statusReasonSummary).toContain("S26");
+      expect(
+        extractRequests.some(
+          (request) =>
+            request.includes("Source URL: https://verahealth.example.com")
+            || request.includes("Source URL: https://verahealth.example.com/"),
+        ),
+      ).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }

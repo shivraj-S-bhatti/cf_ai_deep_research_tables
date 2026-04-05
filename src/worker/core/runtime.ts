@@ -1104,6 +1104,12 @@ export class AgenticSearchRuntime {
     const rowIdByName = new Map<string, string>();
 
     const compactSourcePayload = (payload: Record<string, unknown>) => payload;
+    const extractionTimeoutForSourceClass = (sourceClass: FetchedDoc["parsed"]["sourceClass"]): number => {
+      if (sourceClass === "entity_page" || sourceClass === "official_site") {
+        return Math.min(this.config.requestTimeoutMs, 12_000);
+      }
+      return Math.min(this.config.requestTimeoutMs, 8_000);
+    };
     const visibleGroundedRows = (): ResultRow[] =>
       this.store.listRows(runId).filter(
         (row) =>
@@ -1697,84 +1703,111 @@ export class AgenticSearchRuntime {
             }),
           ),
         );
-        const providerResult = await extractDocumentWithGemini(
-          this.config,
-          {
-            query: thread.thread.queryRaw,
-            entityType: thread.plan.entityType,
-            criteria: thread.criteria.map((criterion) => ({
-              label: criterion.label,
-              kind: criterion.kind,
-            })),
-            columns: thread.columns.map((column) => ({
-              key: column.key,
-              label: column.label,
-              kind: column.kind,
-              valueType: column.valueType,
-            })),
-            url: entry.parsed.finalUrl,
-            title: entry.parsed.title || entry.result.title,
-            snippet: entry.parsed.description || entry.result.description,
-            bodyText: entry.parsed.text,
-          },
-          entry.parsed.sourceClass,
-          executionControl.requestControl(),
-        );
-        this.assertRunActive(runId);
-        const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
-          backend: providerResult.meta.backend,
-          model: providerResult.meta.model,
-          sourceClass: entry.parsed.sourceClass,
-          url: entry.parsed.finalUrl,
-        });
-        this.store.addUsage(runId, usage);
-
-        const kept = providerResult.data.filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl));
-        for (const row of kept) {
-          extracted.push({
-            ...row,
-            sourceUrl: entry.parsed.finalUrl,
+        try {
+          const providerResult = await extractDocumentWithGemini(
+            this.config,
+            {
+              query: thread.thread.queryRaw,
+              entityType: thread.plan.entityType,
+              criteria: thread.criteria.map((criterion) => ({
+                label: criterion.label,
+                kind: criterion.kind,
+              })),
+              columns: thread.columns.map((column) => ({
+                key: column.key,
+                label: column.label,
+                kind: column.kind,
+                valueType: column.valueType,
+              })),
+              url: entry.parsed.finalUrl,
+              title: entry.parsed.title || entry.result.title,
+              snippet: entry.parsed.description || entry.result.description,
+              bodyText: entry.parsed.text,
+            },
+            entry.parsed.sourceClass,
+            executionControl.requestControl(extractionTimeoutForSourceClass(entry.parsed.sourceClass)),
+          );
+          this.assertRunActive(runId);
+          const usage = usageRecord(runId, "llm", "gemini", "extract_candidate", 1, now() - startedAt, false, 0, 0, {
+            backend: providerResult.meta.backend,
+            model: providerResult.meta.model,
             sourceClass: entry.parsed.sourceClass,
+            url: entry.parsed.finalUrl,
           });
-        }
+          this.store.addUsage(runId, usage);
 
-        this.store.addActivity(
-          runId,
-          stageEvent(
-            runId,
-            "extraction",
-            "completed",
-            `${entry.parsed.sourceClass}: ${kept.length} ${kept.length === 1 ? "entity" : "entities"}`,
-            compactSourcePayload({
-              actor: entry.parsed.sourceClass === "entity_page" || entry.parsed.sourceClass === "official_site"
-                ? "corroboration"
-                : "anchor_extraction",
-              title: "Structured extraction",
+          const kept = providerResult.data.filter((row) => !isJunkExtraction(row, entry.parsed.finalUrl));
+          for (const row of kept) {
+            extracted.push({
+              ...row,
               sourceUrl: entry.parsed.finalUrl,
               sourceClass: entry.parsed.sourceClass,
-              keptCount: kept.length,
-              toolCalls: [
-                this.toolCallFromUsage(usage, "Extract anchors or grounded fields from the fetched page.", {
-                  input: this.stringifyForTrace({
-                    query: thread.thread.queryRaw,
-                    url: entry.parsed.finalUrl,
-                    sourceClass: entry.parsed.sourceClass,
-                    title: entry.parsed.title || entry.result.title,
+            });
+          }
+
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "extraction",
+              "completed",
+              `${entry.parsed.sourceClass}: ${kept.length} ${kept.length === 1 ? "entity" : "entities"}`,
+              compactSourcePayload({
+                actor: entry.parsed.sourceClass === "entity_page" || entry.parsed.sourceClass === "official_site"
+                  ? "corroboration"
+                  : "anchor_extraction",
+                title: "Structured extraction",
+                sourceUrl: entry.parsed.finalUrl,
+                sourceClass: entry.parsed.sourceClass,
+                keptCount: kept.length,
+                toolCalls: [
+                  this.toolCallFromUsage(usage, "Extract anchors or grounded fields from the fetched page.", {
+                    input: this.stringifyForTrace({
+                      query: thread.thread.queryRaw,
+                      url: entry.parsed.finalUrl,
+                      sourceClass: entry.parsed.sourceClass,
+                      title: entry.parsed.title || entry.result.title,
+                    }),
+                    output: this.stringifyForTrace(
+                      kept.map((row) => ({
+                        canonicalName: row.canonicalName,
+                        candidateWebsite: row.candidateWebsite,
+                        followUpUrls: row.followUpUrls,
+                        cellCount: row.cells.length,
+                        criteriaCount: row.criteria.length,
+                      })),
+                    ),
                   }),
-                  output: this.stringifyForTrace(
-                    kept.map((row) => ({
-                      canonicalName: row.canonicalName,
-                      candidateWebsite: row.candidateWebsite,
-                      followUpUrls: row.followUpUrls,
-                      cellCount: row.cells.length,
-                      criteriaCount: row.criteria.length,
-                    })),
-                  ),
-                }),
-              ],
-            }),
-          ),
-        );
+                ],
+              }),
+            ),
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Structured extraction failed.";
+          if (this.shouldStop(runId)) {
+            throw error;
+          }
+          this.store.addActivity(
+            runId,
+            stageEvent(
+              runId,
+              "extraction",
+              "failed",
+              `Structured extraction failed for ${entry.parsed.finalUrl}: ${message}`,
+              compactSourcePayload({
+                actor: entry.parsed.sourceClass === "entity_page" || entry.parsed.sourceClass === "official_site"
+                  ? "corroboration"
+                  : "anchor_extraction",
+                title: "Structured extraction failed",
+                sourceUrl: entry.parsed.finalUrl,
+                sourceClass: entry.parsed.sourceClass,
+                error: message,
+                recoverable: true,
+              }),
+            ),
+          );
+          continue;
+        }
       }
       return extracted;
     };

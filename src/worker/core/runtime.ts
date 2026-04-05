@@ -42,6 +42,7 @@ import {
   shouldStopExploration,
 } from "./live-run-policy";
 import {
+  hasLivePreviewProvider,
   hasLiveProviders,
   resolveRuntimeConfig,
   shouldUseLiveProviders,
@@ -54,6 +55,7 @@ import {
   planWithGemini,
   isJunkExtraction,
 } from "../providers/gemini";
+import { planWithGroq } from "../providers/groq";
 import { fetchAndParseDocument } from "../providers/fetch";
 import { dedupeAndMerge, normalizeName, type ExtractedEntityRow } from "../domain/dedup";
 import { estimateOperationCost } from "../providers/price-catalog";
@@ -355,7 +357,7 @@ export class AgenticSearchRuntime {
     const cacheKey = `${input.query.trim().toLowerCase()}:${input.targetResults}`;
     const cached = this.cache.preview.get(cacheKey);
     if (cached) return structuredClone(cached);
-    const response = shouldUseLiveProviders(this.config)
+    const response = this.config.mode !== "fixture" && hasLivePreviewProvider(this.config)
       ? await this.buildLivePreview(input)
       : previewQuery(input);
     this.cache.preview.set(cacheKey, structuredClone(response));
@@ -594,9 +596,13 @@ export class AgenticSearchRuntime {
   }
 
   private async buildLivePreview(input: PreviewRequest): Promise<PreviewResponse> {
-    const providerResult = await planWithGemini(this.config, input, {
-      timeoutMs: this.config.requestTimeoutMs,
-    });
+    const requestControl = {
+      timeoutMs: this.config.previewPlannerTimeoutMs,
+    };
+    const maxAttempts = this.config.previewPlannerMaxAttempts;
+    const providerResult = this.config.previewPlannerProvider === "groq"
+      ? await planWithGroq(this.config, input, requestControl, { maxAttempts })
+      : await planWithGemini(this.config, input, requestControl, { maxAttempts });
     return providerResult.data;
   }
 

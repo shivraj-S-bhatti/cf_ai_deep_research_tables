@@ -24,8 +24,13 @@ export type WorkerEnv = {
   LLM_PROVIDER_PRIMARY?: string;
   BRAVE_API_KEY?: string;
   GEMINI_API_KEY?: string;
+  GROQ_API_KEY?: string;
   VERTEX_AI_API_KEY?: string;
   GEMINI_BACKEND?: string;
+  PREVIEW_PLANNER_PROVIDER?: string;
+  PREVIEW_PLANNER_MODEL?: string;
+  PREVIEW_PLANNER_TIMEOUT_MS?: string;
+  PREVIEW_PLANNER_MAX_ATTEMPTS?: string;
   GEMINI_PLANNER_MODEL?: string;
   GEMINI_EXTRACTOR_MODEL?: string;
   GEMINI_VERIFIER_MODEL?: string;

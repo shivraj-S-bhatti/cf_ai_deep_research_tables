@@ -150,6 +150,37 @@ This does not shorten provider latency directly, but it makes the latency legibl
 - Preview creation is no longer blocked on the planner before navigation.
 - One slow provider call no longer forces the whole discovery/fetch/extraction batch to remain fully serial.
 
+## Devlog Entry — 2026-04-05 (Preview planner split: provider-specific fast path)
+
+### Symptom
+
+- Draft preview creation was no longer blocking navigation, but the preview planner itself was still flaky and slow.
+- The preview endpoint could time out after 20 seconds and surface `Preview build failed`, even though preview planning is a much smaller task than extraction or verification.
+
+### Root cause
+
+- The planner path was sharing the generic Gemini timeout/retry budget.
+- The configured planner model was not actually being honored; planner routing hardcoded `gemini-2.5-flash`.
+- Preview planning is latency-sensitive and should not inherit the same retry behavior as extraction.
+
+### Change
+
+- Added a dedicated preview planner configuration surface:
+  - provider
+  - model
+  - timeout
+  - max attempts
+- Fixed the model-selection bug so the configured planner model is respected.
+- Added a preview-only Groq path so we can test a lower-latency planner without changing extraction or verification providers.
+
+### Why this shape
+
+- Preview planning is structurally different from extraction:
+  - smaller prompt
+  - lower stakes
+  - much tighter latency tolerance
+- The right tradeoff is to let preview fail fast and retry cheaply, while the main run keeps its heavier provider policy.
+
 ## Devlog Entry — 2026-04-05 (Client thread store: `listThreads` vs `activeThreadId`)
 
 ### Symptom

@@ -600,6 +600,110 @@ describe("Worker API vertical slice", () => {
     }
   });
 
+  it("uses the configured Gemini planner model for live previews", async () => {
+    const originalFetch = globalThis.fetch;
+    const geminiPayload = (json: unknown) => ({
+      candidates: [{ content: { parts: [{ text: JSON.stringify(json) }] } }],
+    });
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("gemini-2.5-flash-lite")) {
+        return new Response(JSON.stringify(geminiPayload({
+          entity_type: "project",
+          hard_filters: ["Project is open source"],
+          soft_signals: ["Project is an LLM"],
+          columns: [
+            { key: "name", label: "Project Name", kind: "identity", value_type: "string" },
+          ],
+          search_queries: ["open source llm projects"],
+          budgets: { search_budget: 1, fetch_budget: 3, verification_budget: 1 },
+          notes: "lite mock plan",
+        })), { status: 200 });
+      }
+      return new Response("unexpected model", { status: 404 });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      const env = {
+        AGENTIC_RUNTIME_MODE: "live",
+        BRAVE_API_KEY: "test-brave",
+        GEMINI_API_KEY: "test-gemini",
+        GEMINI_PLANNER_MODEL: "gemini-2.5-flash-lite",
+        PREVIEW_PLANNER_PROVIDER: "gemini",
+        PREVIEW_PLANNER_TIMEOUT_MS: "4000",
+        PREVIEW_PLANNER_MAX_ATTEMPTS: "1",
+      };
+      const preview = await apiJson<{
+        entityType: string;
+      }>("POST", "/api/v1/query-plans/preview", {
+        query: "open source llm projects",
+        targetResults: 5,
+      }, env);
+
+      expect(preview.entityType).toBe("project");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("supports Groq as the preview planner provider", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("api.groq.com/openai/v1/chat/completions")) {
+        return new Response(JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  entity_type: "project",
+                  hard_filters: ["Project is open source"],
+                  soft_signals: ["Project is an LLM"],
+                  columns: [
+                    { key: "name", label: "Project Name", kind: "identity", value_type: "string" },
+                    { key: "url", label: "Project URL", kind: "identity", value_type: "url" },
+                  ],
+                  search_queries: ["open source llm projects with 1k stars"],
+                  budgets: { search_budget: 2, fetch_budget: 4, verification_budget: 1 },
+                  notes: "groq mock plan",
+                }),
+              },
+            },
+          ],
+        }), { status: 200 });
+      }
+      return new Response("Not mocked", { status: 404 });
+    });
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    try {
+      const env = {
+        AGENTIC_RUNTIME_MODE: "live",
+        BRAVE_API_KEY: "test-brave",
+        GROQ_API_KEY: "test-groq",
+        PREVIEW_PLANNER_PROVIDER: "groq",
+        PREVIEW_PLANNER_MODEL: "openai/gpt-oss-20b",
+        PREVIEW_PLANNER_TIMEOUT_MS: "4000",
+        PREVIEW_PLANNER_MAX_ATTEMPTS: "1",
+      };
+      const preview = await apiJson<{
+        entityType: string;
+        criteria: Array<{ label: string }>;
+      }>("POST", "/api/v1/query-plans/preview", {
+        query: "Open source LLM projects with >1k stars",
+        targetResults: 10,
+      }, env);
+
+      expect(preview.entityType).toBe("project");
+      expect(preview.criteria[0]?.label).toBe("Project is open source");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("prunes wrong YC cohort pages without poisoning same-host sibling sources", async () => {
     const originalFetch = globalThis.fetch;
     const geminiPayload = (json: unknown) => ({

@@ -82,6 +82,12 @@
 - Thread creation must be cheap and route the user into a real preview shell immediately; live planner hydration happens after navigation, not before it.
 - Home/workspace navigation is route-driven, not derived from “some thread exists in memory”.
 - Do not silently synthesize a preview during thread bootstrap; the default fallback for thread creation is an empty draft plan, not a heuristic plan.
+- Treat preview planning as a separate latency-sensitive provider path from extraction/verification:
+  - dedicated provider selection
+  - dedicated model selection
+  - shorter timeout budget
+  - fewer retries than the main LLM path
+- The configured preview planner model must actually be honored; do not hardcode Gemini model ids in planner routing.
 - Keep hot-path trace payloads compact and machine-readable; do not emit large narrative reasoning blobs by default.
 - Allow parallelism across threads, but serialize stateful work within one thread owner so results/debug/cancel stay coherent.
 - Allow bounded parallel outbound provider work inside one thread owner where it materially reduces latency:

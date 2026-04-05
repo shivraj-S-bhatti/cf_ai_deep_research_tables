@@ -107,6 +107,10 @@ type GeminiOperation =
   | "verifier"
   | "rewriter";
 
+type GeminiRequestOptions = {
+  maxAttempts?: number;
+};
+
 export type GeminiProviderMeta = {
   backend: GeminiBackend;
   model: string;
@@ -284,7 +288,8 @@ function resolveModelForBackend(
   backend: GeminiBackend,
 ): string {
   if (operation === "planner") {
-    return "gemini-2.5-flash";
+    if (backend === "vertex_express" && config.vertexPlannerModel) return config.vertexPlannerModel;
+    return config.plannerModel;
   }
   if (backend === "vertex_express") {
     if (operation === "extractor_roundup" && config.vertexExtractorModel) return config.vertexExtractorModel;
@@ -369,16 +374,18 @@ async function generateStructuredJson<T>(
   system: string,
   user: string,
   control?: RequestControl,
+  options?: GeminiRequestOptions,
 ): Promise<GeminiProviderResult<T>> {
   const backends = resolveBackendOrder(config);
   let lastError: Error | null = null;
+  const maxAttempts = Math.max(1, options?.maxAttempts ?? 6);
 
   for (const backend of backends) {
     const primaryModel = resolveModelForBackend(config, operation, backend);
     const apiKey = apiKeyForBackend(config, backend);
     for (const model of modelChain(primaryModel)) {
       const endpoint = buildEndpoint(backend, apiKey, model);
-      for (let attempt = 0; attempt < 6; attempt += 1) {
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         const { signal, cleanup } = createRequestSignal(control);
         try {
           const response = await fetch(endpoint, {
@@ -413,7 +420,7 @@ async function generateStructuredJson<T>(
               model,
               parseRetryDelayMs(message),
             );
-            if (response.status === 429 || response.status === 503) {
+            if ((response.status === 429 || response.status === 503) && attempt < maxAttempts - 1) {
               const retryMs = requestError.retryDelayMs ?? Math.min(90000, 8000 + attempt * 14000);
               await delayWithSignal(retryMs, signal);
               continue;
@@ -431,7 +438,7 @@ async function generateStructuredJson<T>(
           if (isAbortLikeError(lastError)) {
             throw lastError;
           }
-          if (attempt < 5) {
+          if (attempt < maxAttempts - 1) {
             await delayWithSignal(3000 + attempt * 2000, signal);
             continue;
           }
@@ -536,11 +543,7 @@ export function fallbackPreview(input: LivePlannerInput): PreviewResponse {
   };
 }
 
-export async function planWithGemini(
-  config: RuntimeConfig,
-  input: LivePlannerInput,
-  control?: RequestControl,
-): Promise<GeminiProviderResult<LivePlannerOutput>> {
+export function buildPlannerPrompt(input: LivePlannerInput): { system: string; user: string } {
   const system = [
     "You are planning a grounded entity discovery run.",
     "Return JSON only.",
@@ -565,8 +568,10 @@ export async function planWithGemini(
   "notes": "brief note"
 }`,
   ].join("\n");
+  return { system, user };
+}
 
-  const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", system, user, control);
+export function plannerJsonToPreview(input: LivePlannerInput, json: PlannerJson): PreviewResponse {
   const preview: PreviewResponse = {
     entityType: json.entity_type ?? heuristicEntityType(input.query),
     criteria: [
@@ -618,6 +623,32 @@ export async function planWithGemini(
   if (preview.criteria.length === 0) {
     throw new Error("Planner returned no criteria.");
   }
+
+  preview.columns = preview.columns
+    .filter((column) => typeof column.label === "string" && typeof column.key === "string")
+    .slice(0, 6)
+    .map((column, index) => ({ ...column, orderIndex: index }));
+
+  if (preview.columns.length === 0) {
+    throw new Error("Planner returned no columns.");
+  }
+
+  if (preview.searchQueries.length === 0) {
+    preview.searchQueries = [normalizeSearchQuery(input.query, 0)];
+  }
+
+  return preview;
+}
+
+export async function planWithGemini(
+  config: RuntimeConfig,
+  input: LivePlannerInput,
+  control?: RequestControl,
+  options?: GeminiRequestOptions,
+): Promise<GeminiProviderResult<LivePlannerOutput>> {
+  const { system, user } = buildPlannerPrompt(input);
+  const { data: json, meta } = await generateStructuredJson<PlannerJson>(config, "planner", system, user, control, options);
+  const preview = plannerJsonToPreview(input, json);
   if (preview.columns.length === 0) {
     throw new Error("Planner returned no output columns.");
   }

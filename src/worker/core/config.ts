@@ -2,14 +2,20 @@ import type { SearchQuery, PreviewResponse } from "../../lib/contracts";
 
 export type RuntimeMode = "fixture" | "hybrid" | "live";
 export type GeminiBackend = "google_ai" | "vertex_express";
+export type PreviewPlannerProvider = "gemini" | "groq";
 
 export type RuntimeConfig = {
   mode: RuntimeMode;
   braveApiKey: string | null;
   geminiApiKey: string | null;
+  groqApiKey: string | null;
   vertexApiKey: string | null;
   jinaApiKey: string | null;
   geminiBackend: GeminiBackend;
+  previewPlannerProvider: PreviewPlannerProvider;
+  previewPlannerModel: string;
+  previewPlannerTimeoutMs: number;
+  previewPlannerMaxAttempts: number;
   plannerModel: string;
   extractorModel: string;
   extractorRoundupModel: string;
@@ -63,18 +69,28 @@ function readBoolean(env: RuntimeEnvLike, key: string, fallback: boolean): boole
 export function resolveRuntimeConfig(env?: RuntimeEnvLike): RuntimeConfig {
   const braveApiKey = readValue(env, "BRAVE_API_KEY");
   const geminiApiKey = readValue(env, "GEMINI_API_KEY");
+  const groqApiKey = readValue(env, "GROQ_API_KEY");
   const vertexApiKey = readValue(env, "VERTEX_AI_API_KEY");
   const jinaApiKey = readValue(env, "JINA_API_KEY");
   const requestedMode = (readValue(env, "AGENTIC_RUNTIME_MODE") ?? "hybrid") as RuntimeMode;
   const geminiBackend = (readValue(env, "GEMINI_BACKEND") ?? "google_ai") as GeminiBackend;
+  const previewPlannerProvider = (readValue(env, "PREVIEW_PLANNER_PROVIDER") ?? "gemini") as PreviewPlannerProvider;
+  const previewPlannerModel =
+    readValue(env, "PREVIEW_PLANNER_MODEL")
+    ?? (previewPlannerProvider === "groq" ? "openai/gpt-oss-20b" : "gemini-2.5-flash");
 
   return {
     mode: requestedMode,
     braveApiKey,
     geminiApiKey,
+    groqApiKey,
     vertexApiKey,
     jinaApiKey,
     geminiBackend,
+    previewPlannerProvider,
+    previewPlannerModel,
+    previewPlannerTimeoutMs: readNumber(env, "PREVIEW_PLANNER_TIMEOUT_MS", 12000),
+    previewPlannerMaxAttempts: readNumber(env, "PREVIEW_PLANNER_MAX_ATTEMPTS", 1),
     plannerModel: readValue(env, "GEMINI_PLANNER_MODEL") ?? "gemini-2.5-flash",
     extractorModel: readValue(env, "GEMINI_EXTRACTOR_MODEL") ?? "gemini-2.5-flash-lite",
     extractorRoundupModel: readValue(env, "GEMINI_EXTRACTOR_ROUNDUP_MODEL") ?? "gemini-2.5-flash",
@@ -102,6 +118,13 @@ export function resolveRuntimeConfig(env?: RuntimeEnvLike): RuntimeConfig {
 
 export function hasLiveProviders(config: RuntimeConfig): boolean {
   return Boolean(config.braveApiKey && (config.geminiApiKey || config.vertexApiKey));
+}
+
+export function hasLivePreviewProvider(config: RuntimeConfig): boolean {
+  if (config.previewPlannerProvider === "groq") {
+    return Boolean(config.groqApiKey);
+  }
+  return Boolean(config.geminiApiKey || config.vertexApiKey);
 }
 
 export function shouldUseLiveProviders(config: RuntimeConfig): boolean {

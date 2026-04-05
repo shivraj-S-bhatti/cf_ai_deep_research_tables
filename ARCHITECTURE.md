@@ -117,7 +117,13 @@ Current behavior:
 
 ### Current Provider Path
 
-- Preview can come from fixtures or Gemini-backed planning depending on runtime mode and keys.
+- Preview can come from fixtures or a dedicated live preview-planner path depending on runtime mode and keys.
+- Live preview planning is treated separately from extraction and verification:
+  - dedicated provider selection
+  - dedicated model selection
+  - shorter timeout
+  - fewer retries
+- The preview planner can target Groq independently without changing the extraction/verification provider path.
 - Thread creation itself no longer depends on preview generation. The server can create a draft thread with an empty plan, then the client hydrates the preview asynchronously.
 - Discovery uses Brave in live mode and fixtures otherwise.
 - Fetch uses direct HTTP fetch + parse.

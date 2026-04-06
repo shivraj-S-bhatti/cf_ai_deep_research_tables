@@ -5,6 +5,17 @@ Brave search · Gemini planning/extraction · Cloudflare Worker
 
 ---
 
+## Cloudflare AI Assignment Fit
+
+- **LLM**: Gemini powers query planning, extraction, verification, and query rewriting.
+- **Workflow / coordination**: the runtime is designed around a Worker entrypoint plus per-thread coordination, with the current repo moving from an in-memory local path toward Cloudflare-owned thread execution.
+- **User input**: the app exposes a web UI where users enter a research query, edit criteria, add output columns, and inspect results.
+- **Memory / state**: the current local path uses in-memory state for iteration speed; the intended Cloudflare shape uses Durable Objects for thread ownership and D1/KV for persistent state and cache.
+
+The repo includes both the product shell and the runtime logic we used to test and refactor the search pipeline.
+
+---
+
 ## Runtime Infra
 
 ```mermaid
@@ -186,5 +197,6 @@ Copy `.env.local.example` → `.env.local` for live Brave + Gemini keys.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [OPENAPI.yaml](OPENAPI.yaml)
+- [PROMPTS.md](PROMPTS.md)
 - [Submission draft](knowledge/submission/assignment-submission-draft.md)
 - [Notebooks](knowledge/notebooks)
